@@ -128,9 +128,7 @@ def _install_fake_modules(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
         num_logical_experts = getattr(layer.moe_config, "num_logical_experts", None)
         if num_logical_experts is not None:
             return int(num_logical_experts)
-        return int(
-            num_experts - global_redundant_expert_num - num_shared_experts
-        )
+        return int(num_experts - global_redundant_expert_num - num_shared_experts)
 
     methods_base_mod.get_moe_num_logical_experts = get_moe_num_logical_experts
     w8a8_mod = types.ModuleType("vllm_ascend.quantization.methods.w8a8_dynamic")

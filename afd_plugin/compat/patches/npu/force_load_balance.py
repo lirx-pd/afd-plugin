@@ -438,6 +438,7 @@ def apply(
         final_hidden_states += zero_expert_result
     return final_hidden_states
 
+
 AscendW8A8DynamicFusedMoEMethod.__init__ = __init__
 AscendW8A8DynamicFusedMoEMethod.apply = apply
 

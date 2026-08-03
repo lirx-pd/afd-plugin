@@ -16,8 +16,8 @@ is limited to `FULL_DECODE_ONLY`.
 
 ## Prerequisites
 
-- An Ascend PyTorch, vLLM, and vLLM Ascend environment compatible with the
-  versions pinned by this repository.
+- vLLM `0.26.0` and an Ascend PyTorch/vLLM-Ascend environment based on source
+  commit [`80d8c194f`](https://github.com/vllm-project/vllm-ascend/commit/80d8c194f7584b17fe08065ea99a130916f6b0e7).
 - The AFD Ascend custom operators must be built and available at runtime.
 - HCCL connectivity for the data path and Gloo connectivity for DP metadata.
 - Identical model hidden size, model dtype, AFD topology, rendezvous address,
@@ -122,7 +122,7 @@ Pass AFD configuration through vLLM's `--additional-config` option under the
 | `port` | `int` | `1239` | AFD rendezvous port in `1..65535`. It is separate from the vLLM HTTP service ports. |
 | `num_attention_ranks` | `int` | `1` | Total number of Attention worker ranks. Must be positive. |
 | `num_ffn_ranks` | `int` | `1` | Total number of FFN worker ranks. Must be positive. |
-| `afd_role_rank` | `int` | `0` | Base rank within the selected role. The worker normally derives each local role rank from its DP/PCP/TP placement. |
+| `afd_role_rank` | `int` | `0` | Base rank within the selected role. The v0.26 NPU worker derives each local role rank from its DP/TP placement; PCP is not supported by model runner v1. |
 | `compute_gate_on_attention` | `bool` | `false` | Controls whether the MoE gate is computed on the Attention side or the FFN side. Currently only `false` is supported. |
 | `connector_extra_config` | `dict` | `{}` | CAMP2P-specific settings such as role-specific core counts and `quant_mode`. Unknown fields are rejected. |
 | `async` / `async_dp` | `bool` | `false` | Must remain `false` for the current synchronous; Ascend async mode requires `CAMAsyncAFDConnector`. |

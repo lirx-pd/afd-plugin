@@ -8,12 +8,21 @@ through CAM async dispatch/combine operators.
 This guide describes the supported deployment shape, configuration contract,
 rank mapping, data flow, startup requirements, and current limitations. The
 [DeepSeek-V3.2 recipe](../../recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md)
-contains the complete validated multi-node launch commands.
+contains the historical multi-node launch commands and measurements.
+
+> [!WARNING]
+> The vLLM 0.26 upgrade did not revalidate CAM async. The linked PCP8 recipe and
+> its measurements were produced with the former vLLM/vLLM-Ascend 0.19.1
+> environment. vLLM-Ascend 0.26 removes PCP from model runner v1, so those
+> commands are retained as historical experiment records, not as a supported
+> v0.26 deployment recipe. Current v0.26 support claims cover the synchronous
+> `CAMP2pAFDConnector` path.
 
 ## When to use this connector
 
-Use `CAMAsyncAFDConnector` for the currently supported asynchronous Ascend NPU
-prefill path when all of the following are true:
+The retained implementation describes an asynchronous Ascend NPU prefill path
+with the following constraints. These are code-level constraints, not a v0.26
+hardware support claim:
 
 - CAM operator packages are installed on every node;
 - Attention performs MoE gating before dispatch to FFN ranks;
@@ -195,10 +204,10 @@ current async MoE metadata path does not support it.
 
 ## Requirements
 
-The checked-in recipe has been verified with:
+The historical checked-in recipe was verified with:
 
 - Ascend 910C;
-- `quay.io/ascend/vllm-ascend:v0.19.1rc1-a3-openeuler`;
+- `quay.io/ascend/vllm-ascend:v0.19.1rc1-a3-openeuler` (legacy only);
 - the included `CAM_ascend910_93_openEuler_aarch64.run` installer;
 - `umdk_cam_op_lib-208.1.0b1-cp311-cp311-linux_aarch64.whl`.
 

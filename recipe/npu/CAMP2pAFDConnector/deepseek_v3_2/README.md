@@ -9,15 +9,15 @@ and FFN workers.
 ## Image and model requirements
 
 - Hardware: Ascend NPU, Atlas 900 A3 SuperPoD, 16 dies per node.
-- Image: `quay.io/ascend/vllm-ascend:v0.19.1rc1-a3-openeuler`.
+- Runtime: vLLM `0.26.0` with vLLM-Ascend source commit `80d8c194f`.
 - Model: DeepSeek-V3.2 with W8A8 weights.
 - AFD Plugin: install this repository in the container.
 
-```bash
-docker pull quay.io/ascend/vllm-ascend:v0.19.1rc1-a3-openeuler
-cd /path/to/afd-plugin
-pip install -e . --no-build-isolation -v
-```
+Prepare the matching A3/openEuler environment using the
+[vLLM-Ascend installation guide at `80d8c194f`](https://github.com/vllm-project/vllm-ascend/blob/80d8c194f7584b17fe08065ea99a130916f6b0e7/docs/source/installation.md),
+then install this repository with `pip install -e . --no-build-isolation -v`.
+The former `v0.19.1rc1-a3-openeuler` image is not a supported runtime for this
+v0.26 recipe.
 
 ## Topologies
 

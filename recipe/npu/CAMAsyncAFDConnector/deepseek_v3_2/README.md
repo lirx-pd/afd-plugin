@@ -1,7 +1,13 @@
 # CAMAsyncAFDConnector For DeepSeek-V3.2 Recipe
 
-This recipe describes how to run DeepSeek-V3.2 with the AFD CAM async
-connector on Ascend NPU.
+> [!WARNING]
+> This is a historical vLLM/vLLM-Ascend 0.19.1 PCP8 experiment. CAM async was
+> not revalidated by the vLLM 0.26 upgrade, and vLLM-Ascend 0.26 removes PCP
+> support from model runner v1. Keep these commands and measurements for
+> provenance; do not treat them as a supported v0.26 deployment recipe.
+
+This recipe records how DeepSeek-V3.2 was run with the AFD CAM async connector
+on Ascend NPU in the legacy environment.
 
 For the connector's complete configuration contract, rank derivation, data
 flow, native DBO distinction, and limitations, see the

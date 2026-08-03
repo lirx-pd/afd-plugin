@@ -17,14 +17,14 @@ validation_paths:
   - "tests/unit/**"
   - "tests/e2e/**"
 upstream_refs:
-  - "vLLM"
-  - "vLLM-Ascend environment evidence recorded in the NPU guides"
+  - "vLLM 0.26.0"
+  - "vLLM-Ascend commit 80d8c194f and environment evidence recorded in the NPU guides"
 verified_platform_refs:
   - "CUDA: tests/e2e tests marked gpu; no canonical image is recorded"
   - "Ascend E2E environment recorded in the installation and NPU guides"
 related_issues:
   - "#129"
-last_reviewed: 2026-07-20
+last_reviewed: 2026-08-03
 ---
 
 # AFD module design

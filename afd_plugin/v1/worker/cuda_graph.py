@@ -108,7 +108,7 @@ def make_ffn_graph_key(
     ffn_size: int | None = None,
     fallback: int = 1,
 ) -> tuple[tuple[int, tuple]]:
-    """Extract the AFD FFN graph hashable key from DP metadata."""
+    """Extract an FFN graph key, using CAMP2P aggregation when sizes are given."""
 
     key_parts: list[tuple[int, tuple]] = []
     for stage_idx, metadata in sorted(dp_metadata_list.items()):
@@ -192,10 +192,9 @@ def _aggregate_ffn_values_tuple(
         expanded = tuple(values[i // tp_size] for i in range(attention_size))
     if len(expanded) < attention_size:
         return tuple(max(1, int(fallback)) for _ in range(ffn_size))
-    group_size = attention_size // ffn_size
+    # CAMP2P maps Attention rank a to FFN rank a % ffn_size.
     return tuple(
-        max(1, sum(expanded[idx * group_size : (idx + 1) * group_size]))
-        for idx in range(ffn_size)
+        max(1, sum(expanded[idx:attention_size:ffn_size])) for idx in range(ffn_size)
     )
 
 

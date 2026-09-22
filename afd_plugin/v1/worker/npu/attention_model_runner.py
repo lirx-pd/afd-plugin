@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 from contextlib import AbstractContextManager, nullcontext
 from functools import partial
 from typing import Any
@@ -99,12 +100,14 @@ from afd_plugin.model_executor.npu.async_cam_ubatching import (
     AsyncMoeStage,
     plan_async_moe_stages,
 )
+from afd_plugin.v1.worker.adaptive_dbo import make_adaptive_dbo_context
 from afd_plugin.v1.worker.attention_metadata import (
     _forward_context_num_tokens,
     _full_cudagraph_padded_tokens,
     _resolve_world_ranks,
     build_ubatch_dp_metadata_list,
 )
+from afd_plugin.v1.worker.npu.adaptive_dbo import AdaptiveDBORuntime
 from afd_plugin.v1.worker.npu.npu_ubatch_wrapper import AscendUBatchWrapper
 from afd_plugin.v1.worker.npu.ubatch_utils import (
     check_enable_ubatch,
@@ -119,6 +122,7 @@ logger = init_logger(__name__)
 # Async CAM extends that list, and stage ``ubid`` uses builder
 # ``ASYNC_MOE_STAGE_METADATA_BUILDER_OFFSET + ubid``.
 ASYNC_MOE_STAGE_METADATA_BUILDER_OFFSET = 1
+ADAPTIVE_CONTEXT_BUCKET_SIZE = 256
 
 
 class AFDNPUAttentionModelRunner(NPUModelRunner):
@@ -164,6 +168,14 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         self._afd_transaction_counter = 0
         self._afd_async_moe_ubatch_metadata: AsyncMoeUbatchMetadata | None = None
         self._afd_live_execution = False
+        self._adaptive_dbo = (
+            AdaptiveDBORuntime(
+                afd_config.adaptive_dbo_max_step_ms,
+                afd_config.adaptive_dbo_probe_interval,
+            )
+            if afd_config.adaptive_dbo
+            else None
+        )
         self.ubatch_slices = None
         self.prof = create_afd_npu_profiler("attention")
 
@@ -188,6 +200,8 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         self._afd_live_execution = True
         try:
             result = super().execute_model(scheduler_output, intermediate_tensors)
+            if self._adaptive_dbo is not None:
+                self._adaptive_dbo.finish()
         finally:
             self._afd_live_execution = False
             self._afd_is_graph_replaying = previous_is_graph_replaying
@@ -855,23 +869,31 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        with torch.inference_mode():
-            return self._dummy_run_inference_mode(
-                num_tokens,
-                with_prefill=with_prefill,
-                cudagraph_runtime_mode=cudagraph_runtime_mode,
-                force_attention=force_attention,
-                uniform_decode=uniform_decode,
-                is_profile=is_profile,
-                create_mixed_batch=create_mixed_batch,
-                allow_microbatching=allow_microbatching,
-                skip_eplb=skip_eplb,
-                remove_lora=remove_lora,
-                is_graph_capturing=is_graph_capturing,
-                num_active_loras=num_active_loras,
-                profile_seq_lens=profile_seq_lens,
-                profile_cpp=profile_cpp,
-            )
+        # Idle DP ranks may run dummy work inside execute_model;
+        # exclude it from adaptive learning.
+        previous_live = self._afd_live_execution
+        if self._adaptive_dbo is not None:
+            self._afd_live_execution = False
+        try:
+            with torch.inference_mode():
+                return self._dummy_run_inference_mode(
+                    num_tokens,
+                    with_prefill=with_prefill,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    force_attention=force_attention,
+                    uniform_decode=uniform_decode,
+                    is_profile=is_profile,
+                    create_mixed_batch=create_mixed_batch,
+                    allow_microbatching=allow_microbatching,
+                    skip_eplb=skip_eplb,
+                    remove_lora=remove_lora,
+                    is_graph_capturing=is_graph_capturing,
+                    num_active_loras=num_active_loras,
+                    profile_seq_lens=profile_seq_lens,
+                    profile_cpp=profile_cpp,
+                )
+        finally:
+            self._afd_live_execution = previous_live
 
     def _dummy_run_inference_mode(
         self,
@@ -1733,6 +1755,147 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             synced_cudagraph_mode,
         )
 
+    def _sync_adaptive_dbo_metadata_across_dp(
+        self,
+        num_tokens_unpadded: int,
+        num_tokens_padded: int | None = None,
+        uniform_decode: bool = False,
+        is_draft_model: bool = False,
+        cudagraph_mode: CUDAGraphMode | None = None,
+        allow_dp_padding: bool = False,
+        allow_microbatching: bool = True,
+        live: bool = False,
+        decode: bool = False,
+        context_length: int = 0,
+        num_reqs: int = 0,
+        max_query_len: int = 0,
+    ) -> tuple[bool, int, torch.Tensor | None, CUDAGraphMode]:
+        if cudagraph_mode is None:
+            cudagraph_mode = CUDAGraphMode.NONE
+        if num_tokens_padded is None:
+            num_tokens_padded = num_tokens_unpadded
+
+        adaptive = self._adaptive_dbo
+        assert adaptive is not None
+        sync_dp = self.dp_size > 1 and self.connector.control_plane is not None
+        sample_step, elapsed_us = adaptive.completed_sample()
+        values = (
+            num_tokens_unpadded,
+            num_tokens_padded,
+            cudagraph_mode.value,
+            uniform_decode,
+            allow_microbatching,
+            allow_dp_padding or is_draft_model,
+            live,
+            decode,
+            context_length,
+            sample_step,
+            elapsed_us,
+            adaptive.policy.max_step_ms,
+            adaptive.policy.probe_interval,
+            num_reqs,
+            max_query_len,
+        )
+        packed = torch.zeros(
+            len(values), self.dp_size if sync_dp else 1, device="cpu", dtype=torch.int64
+        )
+        packed[:, self.dp_rank if sync_dp else 0] = torch.tensor(values)
+        if sync_dp:
+            dist.all_reduce(packed, group=get_dp_group().cpu_group)
+        (
+            real,
+            padded,
+            modes,
+            uniform,
+            allowed,
+            padding,
+            live_ranks,
+            decode_ranks,
+            contexts,
+            sample_steps,
+            durations,
+            limits,
+            intervals,
+            requests,
+            query_lengths,
+        ) = packed
+        if not torch.all(limits == limits[0]) or not torch.all(
+            intervals == intervals[0]
+        ):
+            raise ValueError("adaptive DBO settings must match across Attention ranks")
+
+        max_tokens = int(padded.max().item())
+        should_ubatch = bool(allowed.all()) and check_enable_ubatch(
+            int(real.min().item()),
+            max_tokens,
+            uniform_decode=bool(uniform.all()),
+            vllm_config=self.vllm_config,
+        )
+        synced_mode = CUDAGraphMode(int(modes.min().item()))
+        # Eager/partial attention uses unpadded ubatch slices. Unequal real
+        # counts would produce different tail payloads despite uniform DP sizes.
+        if synced_mode != CUDAGraphMode.FULL and not bool(torch.all(real == real[0])):
+            should_ubatch = False
+        eligible = should_ubatch
+        real_tokens = real.tolist()
+        request_counts = requests.tolist()
+        query_sizes = query_lengths.tolist()
+        sample_step_values = sample_steps.tolist()
+        elapsed_values = durations.tolist()
+        context_lengths = contexts.tolist()
+        live_step = bool(live_ranks.all())
+        context = make_adaptive_dbo_context(
+            decode=bool(decode_ranks.all()),
+            real_tokens=real_tokens,
+            padded_tokens=max_tokens,
+            context_bucket=max(context_lengths) // ADAPTIVE_CONTEXT_BUCKET_SIZE,
+            execution_mode=synced_mode.value,
+            requests=request_counts,
+            query_lengths=query_sizes,
+            eligible=eligible,
+        )
+        should_ubatch = adaptive.select(
+            context,
+            should_ubatch,
+            live_step,
+            sample_step_values,
+            elapsed_values,
+            workload=(
+                *real_tokens,
+                max_tokens,
+                *context_lengths,
+                *request_counts,
+                *query_sizes,
+            ),
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Adaptive DBO step=%d D=%d real=%s padded=%d reason=%s "
+                "sample_steps=%s elapsed_us=%s eligible=%s live=%s context=%s",
+                adaptive.step,
+                2 if should_ubatch else 1,
+                real_tokens,
+                max_tokens,
+                adaptive.policy.reason,
+                sample_step_values,
+                elapsed_values,
+                eligible,
+                live_step,
+                context,
+            )
+
+        if self.dp_size == 1:
+            num_tokens_after_padding = None
+        elif sync_dp and not should_ubatch and not bool(padding.any()):
+            num_tokens_after_padding = padded.to(dtype=torch.int32)
+        else:
+            num_tokens_after_padding = torch.full(
+                (self.dp_size,), max_tokens, dtype=torch.int32
+            )
+        # Start timing after DP synchronization, before ubatch preparation.
+        adaptive.begin()
+        return should_ubatch, max_tokens, num_tokens_after_padding, synced_mode
+
     # Upstream source: vllm-ascend commit 80d8c194f,
     # NPUModelRunner._determine_batch_execution_and_padding.
     # Patch reason: upstream intentionally leaves NPU microbatching disabled and
@@ -1811,9 +1974,40 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 "of tensor parallel size"
             )
 
-        should_ubatch, num_tokens_across_dp = False, None
         # ### PATCH START: AFD DP metadata synchronization
-        if self.vllm_config.parallel_config.data_parallel_size > 1:
+        should_ubatch, num_tokens_across_dp = False, None
+        if self._adaptive_dbo is not None:
+            semantic_decode, context_length = False, 0
+            if self._afd_live_execution and num_reqs:
+                computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                semantic_decode = bool(
+                    np.all(computed >= self.input_batch.num_prompt_tokens[:num_reqs])
+                )
+                context_length = int(computed.max())
+            # Adaptive CAMP fan-in requires equal A-rank transport blocks in D1 too.
+            camp_fan_in = (
+                self.afd_config.num_attention_ranks > self.afd_config.num_ffn_ranks
+            )
+            should_ubatch, _, num_tokens_across_dp, synced_cudagraph_mode = (
+                self._sync_adaptive_dbo_metadata_across_dp(
+                    num_tokens_unpadded=num_tokens,
+                    num_tokens_padded=num_tokens_padded,
+                    uniform_decode=uniform_decode,
+                    cudagraph_mode=cudagraph_mode,
+                    allow_dp_padding=camp_fan_in
+                    or (cudagraph_mode != CUDAGraphMode.NONE)
+                    or enable_sp(self.vllm_config)
+                    or oproj_tp_enable()
+                    or embedding_tp_enable(),
+                    allow_microbatching=allow_microbatching or self._afd_live_execution,
+                    live=self._afd_live_execution,
+                    decode=semantic_decode,
+                    context_length=context_length,
+                    num_reqs=num_reqs,
+                    max_query_len=max_num_scheduled_tokens,
+                )
+            )
+        elif self.vllm_config.parallel_config.data_parallel_size > 1:
             should_ubatch, _, num_tokens_across_dp, synced_cudagraph_mode = (
                 self._sync_afd_metadata_across_dp(
                     num_tokens_unpadded=num_tokens,
@@ -1826,14 +2020,6 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     or embedding_tp_enable(),
                 )
             )
-            if num_tokens_across_dp is not None:
-                dp_rank = self.parallel_config.data_parallel_rank
-                num_tokens_padded = int(num_tokens_across_dp[dp_rank].item())
-                cudagraph_mode, batch_descriptor = dispatch_cudagraph(
-                    num_tokens_padded,
-                    valid_modes={synced_cudagraph_mode},
-                )
-                assert batch_descriptor.num_tokens == num_tokens_padded
         else:
             should_ubatch = check_enable_ubatch(
                 num_tokens,
@@ -1841,6 +2027,14 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 uniform_decode=uniform_decode,
                 vllm_config=self.vllm_config,
             )
+        if num_tokens_across_dp is not None:
+            dp_rank = self.parallel_config.data_parallel_rank
+            num_tokens_padded = int(num_tokens_across_dp[dp_rank].item())
+            cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+                num_tokens_padded,
+                valid_modes={synced_cudagraph_mode},
+            )
+            assert batch_descriptor.num_tokens == num_tokens_padded
         # ### PATCH END: AFD DP metadata synchronization
         # ### PATCH START: AFD live NPU microbatching
         if not (allow_microbatching or self._afd_live_execution):

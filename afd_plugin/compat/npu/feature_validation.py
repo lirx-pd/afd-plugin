@@ -28,6 +28,30 @@ def fail_if_unsupported_npu_afd_features(
     """Fail fast for NPU AFD settings that are not currently supported."""
 
     afd_config = afd_config or parse_afd_config(vllm_config)
+    if afd_config.adaptive_dbo:
+        parallel_config = vllm_config.parallel_config
+        if vllm_config.use_v2_model_runner:
+            raise RuntimeError("adaptive_dbo requires ModelRunner V1")
+        if (
+            parallel_config.tensor_parallel_size,
+            parallel_config.pipeline_parallel_size,
+            parallel_config.prefill_context_parallel_size,
+            parallel_config.decode_context_parallel_size,
+        ) != (1, 1, 1, 1):
+            raise RuntimeError("adaptive_dbo requires TP=PP=PCP=DCP=1")
+        if not (
+            parallel_config.enable_dbo
+            and parallel_config.use_ubatching
+            and parallel_config.num_ubatches == 2
+        ):
+            raise RuntimeError("adaptive_dbo requires DBO with exactly two ubatches")
+        if not vllm_config.model_config.enforce_eager:
+            raise RuntimeError("adaptive_dbo requires enforce_eager=True")
+        if vllm_config.speculative_config is not None:
+            raise RuntimeError("adaptive_dbo does not support speculative decoding")
+        if vllm_config.scheduler_config.async_scheduling:
+            raise RuntimeError("adaptive_dbo does not support async_scheduling")
+
     from afd_plugin.connectors.factory import AFDConnectorFactory
 
     extra_info = AFDConnectorFactory.parse_connector_extra_info(

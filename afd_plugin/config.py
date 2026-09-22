@@ -62,6 +62,9 @@ class AFDConfig:
     num_ffn_ranks: int = 1
     # Whether Attention computes MoE gate outputs before sending to FFN.
     compute_gate_on_attention: bool = False
+    adaptive_dbo: bool = False
+    adaptive_dbo_max_step_ms: int = 0  # Zero disables the absolute latency limit.
+    adaptive_dbo_probe_interval: int = 128
 
     @property
     def afd_connector(self) -> str:
@@ -140,6 +143,8 @@ def _normalize_mapping(
         "port",
         "num_attention_ranks",
         "num_ffn_ranks",
+        "adaptive_dbo_max_step_ms",
+        "adaptive_dbo_probe_interval",
     ):
         if field_name in normalized:
             normalized[field_name] = _coerce_int(
@@ -147,11 +152,11 @@ def _normalize_mapping(
                 field_name=field_name,
             )
 
-    if "compute_gate_on_attention" in normalized:
-        normalized["compute_gate_on_attention"] = _coerce_bool(
-            normalized["compute_gate_on_attention"],
-            field_name="compute_gate_on_attention",
-        )
+    for field_name in ("compute_gate_on_attention", "adaptive_dbo"):
+        if field_name in normalized:
+            normalized[field_name] = _coerce_bool(
+                normalized[field_name], field_name=field_name
+            )
 
     return normalized, connector_extra_config or {}
 
@@ -328,6 +333,13 @@ def validate_afd_config(
         raise ValueError(
             f"num_ffn_ranks must be positive, got {config.num_ffn_ranks}",
         )
+    if config.adaptive_dbo:
+        if config.adaptive_dbo_max_step_ms < 0:
+            raise ValueError("adaptive_dbo_max_step_ms must be non-negative")
+        if config.adaptive_dbo_probe_interval < 1:
+            raise ValueError("adaptive_dbo_probe_interval must be positive")
+        if config.connector != CAMP2P_CONNECTOR or config.async_dp:
+            raise ValueError("adaptive_dbo requires synchronous CAMP2pAFDConnector")
 
 
 __all__ = [

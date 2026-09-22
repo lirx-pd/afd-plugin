@@ -11,6 +11,7 @@ import threading
 from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from types import MethodType, ModuleType, SimpleNamespace
 
 import pytest
@@ -324,11 +325,16 @@ def test_npu_v1_runner_signatures_match_pinned_ascend():
 
 def _new_attention_runner():
     _require_npu_runtime()
+    from afd_plugin.config import AFDConfig
     from afd_plugin.v1.worker.npu.attention_model_runner import (
         AFDNPUAttentionModelRunner,
     )
 
-    return object.__new__(AFDNPUAttentionModelRunner)
+    runner = object.__new__(AFDNPUAttentionModelRunner)
+    runner._adaptive_dbo = None
+    runner._afd_live_execution = False
+    runner.afd_config = AFDConfig()
+    return runner
 
 
 def test_npu_attention_live_execution_scope_restores_on_success_and_error(
@@ -376,9 +382,17 @@ def test_npu_attention_live_execution_scope_restores_on_success_and_error(
     assert runner._afd_live_execution is False
 
 
-def test_npu_attention_non_live_execution_disables_microbatching(monkeypatch):
+@pytest.mark.parametrize("dp_size", [1, 2])
+@pytest.mark.parametrize("adaptive", [False, True])
+@pytest.mark.parametrize(
+    "fan_in, embedding_tp", [(True, False), (False, False), (False, True)]
+)
+def test_npu_attention_execution_routes_by_adaptive_flag(
+    monkeypatch, dp_size, adaptive, fan_in, embedding_tp
+):
     _require_npu_runtime()
     import numpy as np
+    import torch
     from vllm.config import CUDAGraphMode
     from vllm.forward_context import BatchDescriptor
 
@@ -386,17 +400,48 @@ def test_npu_attention_non_live_execution_disables_microbatching(monkeypatch):
 
     runner = _new_attention_runner()
     runner._afd_live_execution = False
+    runner.dp_size = dp_size
+    runner.dp_rank = 0
+    runner.parallel_config = SimpleNamespace(data_parallel_rank=0)
+    # Static CAMP fan-in retains the original padding request.
+    runner.afd_config = replace(
+        runner.afd_config, num_attention_ranks=2, num_ffn_ranks=1 if fan_in else 2
+    )
+    sync_calls = []
+
+    def static_sync(**kwargs):
+        assert not adaptive
+        sync_calls.append(kwargs)
+        assert kwargs["allow_dp_padding"] is embedding_tp
+        assert "live" not in kwargs
+        return True, 4, torch.tensor([4] * dp_size), CUDAGraphMode.NONE
+
+    def adaptive_sync(**kwargs):
+        assert adaptive
+        sync_calls.append(kwargs)
+        assert kwargs["allow_dp_padding"] is (fan_in or embedding_tp)
+        assert kwargs["live"] is runner._afd_live_execution
+        assert kwargs["decode"] is runner._afd_live_execution
+        counts = torch.tensor([4] * dp_size) if dp_size > 1 else None
+        return True, 4, counts, CUDAGraphMode.NONE
+
+    runner._sync_afd_metadata_across_dp = static_sync
+    runner._sync_adaptive_dbo_metadata_across_dp = adaptive_sync
     runner._pad_for_sequence_parallelism = lambda num_tokens: num_tokens
     runner.input_batch = SimpleNamespace(
         num_computed_tokens_cpu=np.ones(4, dtype=np.int32),
         lora_id_to_lora_request={},
     )
+    if adaptive:
+        runner._adaptive_dbo = object()
+        runner.input_batch.num_prompt_tokens = np.ones(4, dtype=np.int32)
     runner.speculative_config = None
     runner.uniform_decode_query_len = 1
     runner.model_config = SimpleNamespace(is_encoder_decoder=False)
     runner.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(
-            data_parallel_size=1,
+            data_parallel_size=dp_size,
+            data_parallel_rank=0,
             tensor_parallel_size=1,
         ),
         observability_config=SimpleNamespace(cudagraph_metrics=False),
@@ -408,6 +453,10 @@ def test_npu_attention_non_live_execution_disables_microbatching(monkeypatch):
         ),
     )
     monkeypatch.setattr(attention_model_runner, "enable_sp", lambda _config: False)
+    monkeypatch.setattr(attention_model_runner, "oproj_tp_enable", lambda: False)
+    monkeypatch.setattr(
+        attention_model_runner, "embedding_tp_enable", lambda: embedding_tp
+    )
     monkeypatch.setattr(
         attention_model_runner,
         "check_enable_ubatch",
@@ -434,6 +483,7 @@ def test_npu_attention_non_live_execution_disables_microbatching(monkeypatch):
         allow_microbatching=False,
     )
     assert result[2] is True
+    assert len(sync_calls) == (2 if adaptive or dp_size > 1 else 0)
 
 
 def _new_ffn_runner():
@@ -1751,6 +1801,44 @@ def test_npu_ffn_runner_graph_key_uses_ffn_aggregated_token_counts():
     )
 
 
+@pytest.mark.parametrize(
+    ("counts", "expected"),
+    [([2, 3, 5, 7], (5, 12)), ([4, 8], (8, 16))],
+)
+def test_static_camp2p_preserves_connector_context_and_graph_counts(counts, expected):
+    _require_npu_runtime()
+    import torch
+
+    from afd_plugin.connectors.npu.camp2p import _num_tokens_for_ffn_rank
+    from afd_plugin.v1.worker.npu.ffn_model_runner import _ffn_token_counts_across_ranks
+
+    runner = _new_ffn_runner()
+    runner.connector = _FakeFFNConnector(attn_size=4, ffn_size=2)
+    runner.max_num_tokens = 32
+    metadata = {
+        0: SimpleNamespace(num_tokens_across_dp_cpu=torch.tensor(counts)),
+    }
+
+    assert runner._make_graph_key(metadata) == ((0, expected),)
+    assert _ffn_token_counts_across_ranks(
+        runner.connector, metadata, 0, fallback=32
+    ).tolist() == list(expected)
+    assert (
+        tuple(
+            _num_tokens_for_ffn_rank(
+                metadata,
+                0,
+                ffn_rank=rank,
+                attention_size=4,
+                ffn_size=2,
+                fallback=32,
+            )
+            for rank in range(2)
+        )
+        == expected
+    )
+
+
 def test_npu_ffn_runner_falls_back_to_eager_on_acl_graph_miss(monkeypatch):
     _patch_ffn_forward_context(monkeypatch)
     runner = _new_ffn_runner()
@@ -2234,6 +2322,68 @@ def test_npu_feature_validation_rejects_unsupported_switches():
             fail_if_unsupported_npu_afd_features(
                 _vllm_config(extra_config=extra_config),
             )
+
+
+def _adaptive_dbo_config():
+    config = _vllm_config(
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        pipeline_parallel_size=1,
+    )
+    config.additional_config["afd"].update(
+        adaptive_dbo=True,
+        adaptive_dbo_max_step_ms=20,
+    )
+    config.use_v2_model_runner = False
+    config.scheduler_config = SimpleNamespace(async_scheduling=False)
+    return config
+
+
+def test_npu_feature_validation_allows_adaptive_dbo_eager_v1():
+    fail_if_unsupported_npu_afd_features(_adaptive_dbo_config())
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("tensor_parallel_size", 2, "TP=PP=PCP=DCP=1"),
+        ("pipeline_parallel_size", 2, "TP=PP=PCP=DCP=1"),
+        ("prefill_context_parallel_size", 2, "TP=PP=PCP=DCP=1"),
+        ("decode_context_parallel_size", 2, "TP=PP=PCP=DCP=1"),
+        ("enable_dbo", False, "DBO with exactly two ubatches"),
+        ("use_ubatching", False, "DBO with exactly two ubatches"),
+        ("num_ubatches", 3, "DBO with exactly two ubatches"),
+    ],
+)
+def test_npu_feature_validation_rejects_adaptive_dbo_parallel_modes(
+    field, value, message
+):
+    config = _adaptive_dbo_config()
+    setattr(config.parallel_config, field, value)
+    with pytest.raises(RuntimeError, match=message):
+        fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize(
+    ("eager", "v2", "speculative", "async_scheduling", "message"),
+    [
+        (False, False, None, False, "enforce_eager=True"),
+        (True, True, None, False, "ModelRunner V1"),
+        (True, False, object(), False, "speculative decoding"),
+        (True, False, None, True, "async_scheduling"),
+    ],
+)
+def test_npu_feature_validation_rejects_adaptive_dbo_execution_modes(
+    eager, v2, speculative, async_scheduling, message
+):
+    config = _adaptive_dbo_config()
+    config.model_config.enforce_eager = eager
+    config.use_v2_model_runner = v2
+    config.speculative_config = speculative
+    config.scheduler_config.async_scheduling = async_scheduling
+    with pytest.raises(RuntimeError, match=message):
+        fail_if_unsupported_npu_afd_features(config)
 
 
 def test_npu_feature_validation_uses_selected_connector_extra_info_parser():
@@ -2731,6 +2881,7 @@ def test_npu_attention_runner_constructor_does_not_initialize_connector(monkeypa
         staticmethod(
             lambda _vllm_config: SimpleNamespace(
                 connector="CAMP2pAFDConnector",
+                adaptive_dbo=False,
             )
         ),
     )

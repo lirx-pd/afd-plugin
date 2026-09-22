@@ -49,7 +49,7 @@ The connector creates these communication groups:
 
 ## DBO and ubatching
 
-DBO is configured with vLLM CLI flags, not inside the `afd` object:
+DBO capability and static thresholds are configured with vLLM CLI flags:
 
 | Parameter | CAMP2p behavior |
 | --- | --- |
@@ -75,6 +75,73 @@ Example DBO settings:
 --dbo-prefill-token-threshold 12 \
 --ubatch-size 2
 ```
+
+### Experimental adaptive DBO
+
+Adaptive DBO is disabled by default. It chooses one or two stages within the
+existing DBO capability; static token thresholds remain eligibility checks.
+Enable it in the existing `additional_config.afd` object on every Attention
+rank, with the same settings on all Attention ranks. Enable or disable it
+uniformly: static and adaptive execution use different DP metadata layouts.
+
+```json
+{
+  "adaptive_dbo": true,
+  "adaptive_dbo_probe_interval": 128
+}
+```
+
+No latency calibration is required. The default `adaptive_dbo_max_step_ms=0`
+disables the absolute latency limit; selection still requires measured D2 gains.
+Optionally set a positive integer limit in milliseconds when a deployment has
+a known forward/logits budget. Retain `--enable-dbo --ubatch-size 2` on both A and F.
+This first implementation requires synchronous CAMP2p, ModelRunner V1,
+`--enforce-eager`, TP=PP=PCP=DCP=1, and no speculative decoding or async
+scheduling. Adaptive ACL graphs are rejected at startup.
+
+The policy starts with one ABBA round. It accepts D2 early when both D2 samples
+beat both D1 samples by at least 10%, or stops early for a clear lack of gain.
+Ambiguous results get one additional round. The final comparison requires a 5%
+median gain plus a noise margin of half the larger within-action timing range.
+These are conservative heuristics, not statistical confidence guarantees.
+Each phase (decode or prefill/mixed) shares at most eight probe timings and four
+D2 attempts across buckets per 128 eligible decisions by default. The budget
+window is `max(adaptive_dbo_probe_interval, 8)`; exhausted budgets stop further
+exploration. Settled D2 decisions continue for their remaining residence.
+Residence/cooldown counts decisions for that context, with no timing by default.
+At most 32 bucketed contexts are retained. An active comparison stops if raw
+workload coordinates drift more than 1% from its first sample.
+
+Each rank reuses two NPU events. Timing starts after DP synchronization and
+includes ubatch preparation, forward/logits and waits for FFN results, excluding
+later sampling and scheduler bookkeeping. One in-flight sample is retained until
+all ranks acknowledge it through the existing DP metadata collective; no device
+synchronization or extra collective is added. Unknown contexts use D1 while
+waiting. The policy uses the slowest rank's duration. With a positive absolute
+limit, settled steps also request timing when no sample is in flight; exceeding
+the limit returns that context to D1, and a D1 observation at 90% of the limit
+prevents exploration. This is an online proxy, not a client TTFT/TPOT or deadline
+guarantee. Warmup and dummy steps are excluded.
+Each Attention rank consumes the same DP metadata and runs the same deterministic
+policy; FFN workers continue to consume the existing stage metadata. Debug logs
+include the step, selected D, real/padded token counts and decision reason.
+
+With adaptive DBO enabled, CAMP fan-in uses equal padded A-rank blocks.
+Eager/partial D2 requires equal real token counts across Attention ranks because
+its tail slices are unpadded. An uneven batch such as 80/48 therefore uses D1
+with 80/80 transport sizes. Equal per-stage counts let adaptive execution reuse
+the existing connector and FFN token aggregation without changing their mapping.
+
+With adaptive DBO disabled, the original DP synchronization, static thresholds,
+padding, FFN execution, graph keys and logging are retained. Adaptive-only range
+and runtime checks run only when enabled. Explicitly provided configuration
+values still follow the standard field type conversion. FFN logging is unchanged;
+adaptive decisions are reported by the Attention logger.
+
+Adaptive DBO has unit/contract coverage; multi-rank CAMP execution and matched
+streaming performance still require supported 910C/950 hardware and model
+weights. Graph adaptation, scheduler budgets and expert locality remain separate
+gated stages.
 
 ### Two-ubatch pipeline
 

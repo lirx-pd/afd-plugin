@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -225,3 +228,56 @@ def test_compute_hash_changes_for_graph_affecting_fields():
     ffn = AFDConfig(role="ffn")
 
     assert attention.compute_hash() != ffn.compute_hash()
+
+
+def test_adaptive_dbo_is_opt_in_and_coerces_settings():
+    assert not AFDConfig().adaptive_dbo
+    config = afd_config_from_mapping(
+        {
+            "connector": "CAMP2pAFDConnector",
+            "adaptive_dbo": "true",
+            "adaptive_dbo_max_step_ms": "20",
+            "adaptive_dbo_probe_interval": "64",
+        }
+    )
+    assert config.adaptive_dbo
+    assert config.adaptive_dbo_max_step_ms == 20
+    assert config.adaptive_dbo_probe_interval == 64
+
+
+@pytest.mark.parametrize(
+    "settings, message",
+    [
+        ({"adaptive_dbo_max_step_ms": -1}, "must be non-negative"),
+        ({"adaptive_dbo_probe_interval": 0}, "must be positive"),
+        ({"connector": "P2pNcclAFDConnector"}, "synchronous CAMP2p"),
+        ({"connector": "CAMAsyncAFDConnector", "async_dp": True}, "synchronous CAMP2p"),
+    ],
+)
+def test_adaptive_dbo_rejects_invalid_config(settings, message):
+    with pytest.raises(ValueError, match=message):
+        afd_config_from_mapping(
+            {
+                "connector": "CAMP2pAFDConnector",
+                "adaptive_dbo": True,
+                "adaptive_dbo_max_step_ms": 20,
+                **settings,
+            }
+        )
+
+
+def test_adaptive_dbo_allows_unspecified_latency_limit():
+    config = afd_config_from_mapping(
+        {"connector": "CAMP2pAFDConnector", "adaptive_dbo": True}
+    )
+    assert config.adaptive_dbo_max_step_ms == 0
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [{}, {"adaptive_dbo_max_step_ms": -1, "adaptive_dbo_probe_interval": 0}],
+)
+def test_disabled_adaptive_dbo_keeps_static_config_and_hash(settings):
+    config = afd_config_from_mapping({"adaptive_dbo": False, **settings})
+    assert not config.adaptive_dbo
+    assert config.compute_hash() == AFDConfig().compute_hash()

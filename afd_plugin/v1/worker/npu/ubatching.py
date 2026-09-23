@@ -35,6 +35,8 @@ class AscendUBatchContext:
         self.current_stream = compute_stream
 
     def __enter__(self):
+        # Bind before stream queries and before the barrier permits graph capture.
+        torch.npu.set_device(self.compute_stream.device)
         _THREAD_ID_TO_CONTEXT[threading.get_ident()] = self.id
         _CURRENT_CONTEXTS[self.id] = self
         self.ready_barrier.wait()

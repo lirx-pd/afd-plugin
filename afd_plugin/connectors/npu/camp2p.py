@@ -522,19 +522,28 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         Raises:
             RuntimeError: If the communication groups are not ready.
             ValueError: If the number of tokens in ``hidden_states`` does not
-                match ``context.metadata`` outside a ``torch.compile`` trace, or
-                if a supplied ``input_ids`` tensor is malformed.
+                match ``context.metadata`` or the synchronized physical count
+                outside a ``torch.compile`` trace, or if a supplied
+                ``input_ids`` tensor is malformed.
         """
         if not self._initialized:
             raise RuntimeError("CAMP2P connector is not initialized")
         metadata = context.metadata
-        if not torch.compiler.is_compiling() and not metadata.validate_tensor_shape(
-            tuple(hidden_states.shape),
-        ):
-            raise ValueError(
-                f"hidden_states shape {hidden_states.shape!r} does not match "
-                f"CAMP2P metadata token count {metadata.total_tokens}",
-            )
+        if not torch.compiler.is_compiling():
+            if not metadata.validate_tensor_shape(tuple(hidden_states.shape)):
+                raise ValueError(
+                    f"hidden_states shape {hidden_states.shape!r} does not match "
+                    f"CAMP2P metadata token count {metadata.total_tokens}",
+                )
+            if self.attn_size > self.ffn_size:
+                dp_metadata = self.dp_metadata_list[metadata.stage_idx]
+                expected_tokens = int(dp_metadata.num_tokens_across_dp_cpu[0])
+                if metadata.total_tokens != expected_tokens:
+                    raise ValueError(
+                        f"CAMP2P Attention token count {metadata.total_tokens} "
+                        f"does not match stage {metadata.stage_idx} synchronized "
+                        f"physical token count {expected_tokens}",
+                    )
         input_ids = cast(torch.Tensor | None, kwargs.get("input_ids"))
         expert_ids: torch.Tensor | None = None
         expert_scales: torch.Tensor | None = None
@@ -782,6 +791,15 @@ class CAMP2pAFDControlPlane(AFDControlPlane):
         payload: AFDControlPayload,
     ) -> None:
         connector = self.connector
+        if connector.attn_size > connector.ffn_size:
+            for stage_idx, metadata in payload.dp_metadata_list.items():
+                counts = metadata.num_tokens_across_dp_cpu.flatten().tolist()
+                if len(set(counts)) != 1:
+                    raise ValueError(
+                        "CAMP2P requires equal physical token counts across "
+                        f"Attention DP ranks for stage {stage_idx}, got {counts}. "
+                        "Pad the model inputs before publishing DP metadata."
+                    )
         connector.dp_metadata_list = payload.dp_metadata_list
         connector.is_graph_capturing = payload.is_graph_capturing
         connector.is_warmup = payload.is_warmup

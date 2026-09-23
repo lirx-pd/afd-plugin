@@ -15,6 +15,8 @@ pytest.importorskip("torch_npu")
 from afd_plugin.config import AFDConfig
 from afd_plugin.connectors import (
     AFDConnectorFactory,
+    AFDControlPayload,
+    AFDDPMetadata,
     AFDTransferContext,
     AFDTransferMetadata,
     AFDTransferState,
@@ -105,6 +107,82 @@ def test_camp2p_topology_matches_original_rank_layout():
     )
     assert not attn2.participates_in_p2p_group
     assert (ffn1.world_rank, ffn1.p2p_rank) == (1, 1)
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_camp2p_control_plane_rejects_unequal_stage_without_updating_state(role):
+    torch = pytest.importorskip("torch")
+    connector = AFDConnectorFactory.create_connector(
+        0,
+        0,
+        _vllm_config(),
+        AFDConfig(
+            connector="CAMP2pAFDConnector",
+            role=role,
+            num_attention_ranks=2,
+            num_ffn_ranks=1,
+        ),
+    )
+    previous = AFDControlPayload(
+        dp_metadata_list={0: AFDDPMetadata(torch.tensor([8, 8]))},
+        is_graph_capturing=False,
+        is_warmup=False,
+    )
+    connector.control_plane.update_state_from_dp_metadata(previous)
+    invalid = AFDControlPayload(
+        dp_metadata_list={
+            0: AFDDPMetadata(torch.tensor([4, 4])),
+            1: AFDDPMetadata(torch.tensor([6, 8])),
+        },
+        is_graph_capturing=True,
+        is_warmup=True,
+    )
+
+    with pytest.raises(ValueError, match=r"stage 1, got \[6, 8\]"):
+        connector.control_plane.update_state_from_dp_metadata(invalid)
+
+    assert connector.dp_metadata_list is previous.dp_metadata_list
+    assert list(connector.dp_metadata_list) == [0]
+    assert connector.dp_metadata_list[0].num_tokens_across_dp_cpu.tolist() == [8, 8]
+    assert connector.is_graph_capturing is False
+    assert connector.is_warmup is False
+
+
+@pytest.mark.parametrize(
+    ("ffn_size", "stage_counts"),
+    [
+        (1, {0: [8, 8]}),
+        (1, {0: [4, 4], 1: [2, 2]}),
+        (2, {0: [6, 8]}),
+    ],
+)
+def test_camp2p_control_plane_accepts_supported_stage_counts(ffn_size, stage_counts):
+    torch = pytest.importorskip("torch")
+    connector = AFDConnectorFactory.create_connector(
+        0,
+        0,
+        _vllm_config(),
+        AFDConfig(
+            connector="CAMP2pAFDConnector",
+            role="ffn",
+            num_attention_ranks=2,
+            num_ffn_ranks=ffn_size,
+        ),
+    )
+    payload = AFDControlPayload(
+        dp_metadata_list={
+            stage_idx: AFDDPMetadata(torch.tensor(counts))
+            for stage_idx, counts in stage_counts.items()
+        },
+        is_graph_capturing=True,
+        is_warmup=True,
+    )
+
+    connector.control_plane.update_state_from_dp_metadata(payload)
+
+    assert connector.dp_metadata_list is payload.dp_metadata_list
+    assert connector.is_graph_capturing is True
+    assert connector.is_warmup is True
 
 
 def _init_ffn_connector(rank, vllm_config):
@@ -340,6 +418,15 @@ def test_camp2p_send_attn_custom_op_receives_all_hccl_names(monkeypatch):
         seq_len=3,
     )
     context = AFDTransferContext(metadata=metadata)
+    connector.control_plane.update_state_from_dp_metadata(
+        AFDControlPayload(
+            dp_metadata_list={
+                1: AFDDPMetadata(torch.tensor([3] * connector.attn_size)),
+            },
+            is_graph_capturing=False,
+            is_warmup=False,
+        ),
+    )
 
     # The connector stows the CAMP2P transfer state and ubatch index on the
     # forward context; capture that instead of a dedicated helper.
@@ -364,6 +451,67 @@ def test_camp2p_send_attn_custom_op_receives_all_hccl_names(monkeypatch):
     assert captured["args"][1:4] == ("hccl0", "hccl1", "")
     assert captured["args"][4] == 3
     assert forward_context.cam_afdtransfer_state.batch_size == 3
+
+
+@pytest.mark.parametrize("num_tokens", [6, 8])
+def test_camp2p_send_attn_checks_synchronized_physical_count(monkeypatch, num_tokens):
+    torch = pytest.importorskip("torch")
+    connector = CAMP2pAFDConnector(
+        0,
+        0,
+        _vllm_config(num_ubatches=2),
+        AFDConfig(
+            connector="CAMP2pAFDConnector",
+            role="attention",
+            num_attention_ranks=2,
+            num_ffn_ranks=1,
+        ),
+        0,
+    )
+    connector._initialized = True
+    connector.control_plane.update_state_from_dp_metadata(
+        AFDControlPayload(
+            dp_metadata_list={
+                0: AFDDPMetadata(torch.tensor([4, 4])),
+                1: AFDDPMetadata(torch.tensor([8, 8])),
+            },
+            is_graph_capturing=False,
+            is_warmup=False,
+        ),
+    )
+    hidden_states = torch.empty((num_tokens, connector.hidden_size))
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=0,
+            stage_idx=1,
+            seq_len=num_tokens,
+        ),
+    )
+    forward_context = SimpleNamespace()
+    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
+    calls = []
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_camp2p_send_attn_output",
+        lambda *args: calls.append(args),
+        raising=False,
+    )
+
+    if num_tokens == 6:
+        with pytest.raises(
+            ValueError,
+            match=r"token count 6 .* stage 1 synchronized physical token count 8",
+        ):
+            connector.send_attn_output(hidden_states, context)
+        assert calls == []
+        assert vars(forward_context) == {}
+    else:
+        connector.send_attn_output(hidden_states, context)
+        assert len(calls) == 1
+        assert calls[0][0] is hidden_states
+        assert calls[0][4] == 8
+        assert forward_context.cam_afdtransfer_state.batch_size == 8
+        assert forward_context.ubatch_idx == 1
 
 
 def test_camp2p_init_fails_cleanly_without_ascend_runtime(monkeypatch):

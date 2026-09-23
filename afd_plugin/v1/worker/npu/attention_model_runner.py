@@ -76,6 +76,7 @@ from afd_plugin.compat.npu.profiler import (
 )
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
+    CAMP2P_CONNECTOR,
     AFDConfig,
     parse_afd_config,
 )
@@ -1676,12 +1677,16 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             )
 
         parallel_config = self.vllm_config.parallel_config
+        requires_uniform_tokens = (
+            self.afd_config.connector == CAMP2P_CONNECTOR
+            and self.afd_config.num_attention_ranks > self.afd_config.num_ffn_ranks
+        )
         can_skip_dp_sync = should_skip_allreduce_across_dp_group(
             self.vllm_config,
             is_draft_model,
         )
         may_ubatch = bool(parallel_config.enable_dbo and parallel_config.use_ubatching)
-        if can_skip_dp_sync and not may_ubatch:
+        if can_skip_dp_sync and not may_ubatch and not requires_uniform_tokens:
             num_tokens_after_padding = torch.tensor(
                 [num_tokens_padded] * self.dp_size,
                 device="cpu",
@@ -1717,6 +1722,15 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             uniform_decode=uniform_decode,
             vllm_config=self.vllm_config,
         )
+        if requires_uniform_tokens:
+            # CAMP payload offsets require equally sized sender segments.
+            allow_dp_padding = True
+            # Eager ubatch slices end at the real token count, even when the
+            # parent batch is padded. Unequal counts would leave the last CAMP
+            # stage unequal and its replicated DP metadata incorrect.
+            should_ubatch = should_ubatch and bool(
+                torch.all(num_tokens_unpadded_across_dp == min_tokens_across_dp)
+            )
 
         if allow_dp_padding or is_draft_model or should_ubatch:
             num_tokens_after_padding = torch.tensor(

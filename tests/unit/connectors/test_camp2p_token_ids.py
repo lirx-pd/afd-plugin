@@ -103,6 +103,8 @@ def _vllm_stub() -> Iterator[None]:
 with _vllm_stub():
     from afd_plugin.config import AFDConfig
     from afd_plugin.connectors.metadata import (
+        AFDControlPayload,
+        AFDDPMetadata,
         AFDTransferContext,
         AFDTransferMetadata,
     )
@@ -274,6 +276,15 @@ def test_send_attn_output_selects_the_operator_ids_mode(monkeypatch):
         lambda: forward_context,
     )
     connector = _connector(role="attention", rank=0)
+    connector.control_plane.update_state_from_dp_metadata(
+        AFDControlPayload(
+            dp_metadata_list={
+                0: AFDDPMetadata(torch.tensor([3] * connector.attn_size)),
+            },
+            is_graph_capturing=False,
+            is_warmup=False,
+        ),
+    )
     hidden_states = torch.zeros(3, connector.hidden_size)
     context = AFDTransferContext(
         metadata=AFDTransferMetadata.create_attention_metadata(

@@ -62,6 +62,21 @@ Without DBO, CAMP2p uses one batch and one HCCL AFD process group. With DBO
 enabled, the current runtime requires exactly two ubatches and creates one HCCL
 AFD process group for each ubatch.
 
+When multiple Attention ranks feed an FFN rank, each sender must transfer the
+same physical token count within a communication stage. The A2E/E2A kernels
+derive payload offsets and per-sender lengths from equal partitions of the FFN
+batch. For these topologies, the Attention runners synchronize and pad to the
+DP-wide maximum even in eager execution. For example, real counts `[6, 8]` in
+`2A1F` become physical counts `[8, 8]`, and FFN processes 16 rows. Padding does
+not change the number of real scheduled tokens or sampled outputs.
+
+V1 falls back to a single batch when real token counts differ across DP ranks:
+padding the parent batch alone does not equalize eager DBO's last ubatch. Equal
+real counts retain normal DBO eligibility. The control plane rejects unequal
+physical counts before publishing a stage, and eager Attention sends validate
+their actual length against the synchronized count. ModelRunnerV2 applies the
+same eager padding rule; its existing DBO restriction remains in effect.
+
 Attention and FFN processes must use the same DBO enablement, ubatch count, and
 thresholds. Thresholds determine when splitting occurs; choose them together
 with the expected workload and, when using ACL graphs, the configured graph

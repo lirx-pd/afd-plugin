@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from types import MethodType
 
 import torch
@@ -17,6 +18,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker import utils as v2_worker_utils
 from vllm.v1.worker.gpu import cudagraph_utils as v2_cudagraph_utils
+from vllm.v1.worker.gpu import model_runner as v2_model_runner
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
@@ -28,7 +30,7 @@ from afd_plugin.compat.npu.profiler import (
     step_afd_npu_profiler,
     stop_afd_npu_profiler,
 )
-from afd_plugin.config import AFDConfig, parse_afd_config
+from afd_plugin.config import CAMP2P_CONNECTOR, AFDConfig, parse_afd_config
 from afd_plugin.connectors import (
     AFDConnectorBase,
     AFDConnectorFactory,
@@ -42,6 +44,58 @@ from afd_plugin.v1.worker.attention_metadata import (
 from afd_plugin.validation import validate_npu_model_runner_v2_config
 
 _AFD_FULLGRAPH_HOOK_MARKER = "_afd_fullgraph_replay_hook_active"
+
+
+@contextmanager
+def _use_camp2p_eager_dp_padding() -> Iterator[None]:
+    """Pad native V2 eager inputs before CAMP fan-in transfers."""
+
+    original_dispatch = v2_model_runner.dispatch_cg_and_sync_dp
+
+    # Patch reason: native V2 keeps unequal DP token counts in eager mode,
+    # while CAMP fan-in uses a fixed physical length for each sender.
+    # Patch functionality: retain native DP synchronization and pad only its
+    # eager result before native input preparation consumes the descriptor.
+    # Signature: matches vLLM v0.26.0 dispatch_cg_and_sync_dp exactly.
+    # Upstream source: vllm/v1/worker/gpu/dp_utils.py; commit
+    # 568afb3a13806beb53bb2e6bd518269357b237c0.
+    # Delegation exception: execute_model calls a module function rather than
+    # an overridable runner method, so this hook is scoped to one AFD execute.
+    # Removal/upstream plan: use a native connector padding policy hook when
+    # V2 exposes one, or remove this once CAMP supports variable-length senders.
+    def dispatch_cg_and_sync_dp(
+        cudagraph_manager: v2_cudagraph_utils.CudaGraphManager | None,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        dp_size: int,
+        dp_rank: int,
+        need_eager: bool = False,
+        num_active_loras: int = 0,
+    ) -> tuple[v2_cudagraph_utils.BatchExecutionDescriptor, torch.Tensor | None]:
+        descriptor, token_counts = original_dispatch(
+            cudagraph_manager,
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            dp_size,
+            dp_rank,
+            need_eager=need_eager,
+            num_active_loras=num_active_loras,
+        )
+        # ### PATCH START: enforce CAMP's physical sender length.
+        if descriptor.cg_mode == CUDAGraphMode.NONE and token_counts is not None:
+            padded_tokens = int(token_counts.max().item())
+            descriptor = replace(descriptor, num_tokens=padded_tokens)
+            token_counts = torch.full_like(token_counts, padded_tokens)
+        # ### PATCH END: enforce CAMP's physical sender length.
+        return descriptor, token_counts
+
+    try:
+        v2_model_runner.dispatch_cg_and_sync_dp = dispatch_cg_and_sync_dp
+        yield
+    finally:
+        v2_model_runner.dispatch_cg_and_sync_dp = original_dispatch
 
 
 @contextmanager
@@ -330,17 +384,17 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         # ### PATCH END: publish AFD FULL graph warmup/capture control.
 
     # Patch reason: native V2 creates ForwardContext inside execute_model, so
-    # AFD must install its sidecar at that exact context-construction seam.
+    # AFD must install its sidecar there and enforce CAMP's DP padding policy.
     # Patch functionality: delegate all request/input/Attention/KV/sampling/
-    # output work to native V2 while temporarily installing AFD metadata.
+    # output work to native V2 while scoping AFD metadata and CAMP DP padding.
     # Signature: matches vLLM v0.26.0 NPUModelRunnerV2.execute_model exactly.
     # Upstream source: vllm/v1/worker/gpu/model_runner.py,
     # GPUModelRunner.execute_model; commit
     # 568afb3a13806beb53bb2e6bd518269357b237c0.
     # Delegation exception: the upstream method is intentionally not copied;
-    # only this narrow provider/profiler wrapper is AFD-specific.
+    # only these narrow metadata, padding, and profiler hooks are AFD-specific.
     # Removal/upstream plan: delete this wrapper when vLLM exposes a plugin
-    # ForwardContext/set_forward_context sidecar/provider hook.
+    # ForwardContext provider and connector-specific DP padding hooks.
     @torch.inference_mode()
     def execute_model(
         self,
@@ -350,7 +404,7 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        # ### PATCH START: scope AFD metadata provider/replay and profiler step.
+        # ### PATCH START: scope AFD metadata, CAMP padding, replay, and profiler.
         step_afd_npu_profiler(self.prof)
         use_fullgraph_replay_hook = (
             self.vllm_config.compilation_config.cudagraph_mode
@@ -374,9 +428,17 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             if use_fullgraph_replay_hook
             else nullcontext()
         )
+        padding_scope = (
+            _use_camp2p_eager_dp_padding()
+            if self.afd_config.connector == CAMP2P_CONNECTOR
+            and self.afd_config.num_attention_ranks > self.afd_config.num_ffn_ranks
+            and self.dp_size > 1
+            else nullcontext()
+        )
         try:
             with (
                 replay_scope,
+                padding_scope,
                 use_afd_metadata_provider(
                     self.install_afd_metadata_on_forward_context,
                 ),
@@ -395,7 +457,7 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             self._afd_is_graph_capturing = previous_is_graph_capturing
             self._afd_is_graph_replaying = previous_is_graph_replaying
             self._afd_is_profile = previous_is_profile
-        # ### PATCH END: scope AFD metadata provider/replay and profiler step.
+        # ### PATCH END: scope AFD metadata, CAMP padding, replay, and profiler.
 
     # Patch reason: native V2 shutdown does not know about AFD's profiler,
     # connector, or pending metadata sidecar.

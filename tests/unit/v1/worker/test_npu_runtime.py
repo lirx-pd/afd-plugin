@@ -437,6 +437,117 @@ def test_npu_attention_non_live_execution_disables_microbatching(monkeypatch):
     assert result[2] is True
 
 
+@pytest.mark.parametrize(
+    "counts, enable_dbo, skip_sync, ffn_ranks, expected_counts, expected_ubatch",
+    [
+        ([6, 8], False, False, 1, [8, 8], False),
+        ([6, 8], False, True, 1, [8, 8], False),
+        ([6, 8], True, True, 1, [8, 8], False),
+        ([8, 8], True, False, 1, [8, 8], True),
+        ([6, 6], False, False, 1, [6, 6], False),
+        ([6, 8], False, False, 2, [6, 8], False),
+        ([6, 8], False, True, 2, None, False),
+    ],
+)
+def test_npu_camp2p_batch_descriptor_enforces_equal_senders(
+    monkeypatch,
+    counts,
+    enable_dbo,
+    skip_sync,
+    ffn_ranks,
+    expected_counts,
+    expected_ubatch,
+):
+    _require_npu_runtime()
+    import numpy as np
+    import torch
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import BatchDescriptor
+
+    from afd_plugin.v1.worker.npu import attention_model_runner
+    from afd_plugin.v1.worker.npu.ubatch_utils import maybe_create_ubatch_slices
+
+    collective_calls = []
+
+    def all_reduce(packed, group):
+        collective_calls.append(packed.clone())
+        packed.copy_(torch.tensor([counts, counts, [CUDAGraphMode.NONE.value] * 2]))
+
+    monkeypatch.setattr(attention_model_runner.dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(
+        attention_model_runner, "get_dp_group", lambda: SimpleNamespace(cpu_group=None)
+    )
+    monkeypatch.setattr(
+        attention_model_runner,
+        "should_skip_allreduce_across_dp_group",
+        lambda *_args: skip_sync,
+    )
+    monkeypatch.setattr(attention_model_runner, "enable_sp", lambda _config: False)
+    monkeypatch.setattr(attention_model_runner, "oproj_tp_enable", lambda: False)
+    monkeypatch.setattr(attention_model_runner, "embedding_tp_enable", lambda: False)
+
+    for rank, num_tokens in enumerate(counts):
+        runner = _new_attention_runner()
+        runner.vllm_config = _vllm_config(
+            num_attention_ranks=2,
+            num_ffn_ranks=ffn_ranks,
+            data_parallel_size=2,
+            data_parallel_rank=rank,
+            enable_dbo=enable_dbo,
+            use_ubatching=enable_dbo,
+            num_ubatches=2 if enable_dbo else 1,
+        )
+        runner.vllm_config.observability_config = SimpleNamespace(
+            cudagraph_metrics=False
+        )
+        runner.afd_config = runner.parse_config(runner.vllm_config)
+        runner.parallel_config = runner.vllm_config.parallel_config
+        runner.dp_size, runner.dp_rank = 2, rank
+        runner.connector = _RecordingConnector()
+        runner._afd_live_execution = True
+        runner._pad_for_sequence_parallelism = lambda tokens: tokens
+        runner.input_batch = SimpleNamespace(
+            num_computed_tokens_cpu=np.zeros(1, dtype=np.int32),
+            lora_id_to_lora_request={},
+        )
+        runner.speculative_config = None
+        runner.uniform_decode_query_len = 1
+        runner.model_config = SimpleNamespace(is_encoder_decoder=False)
+        runner.cudagraph_dispatcher = SimpleNamespace(
+            dispatch=lambda **kwargs: (
+                CUDAGraphMode.NONE,
+                BatchDescriptor(kwargs["num_tokens"]),
+            )
+        )
+
+        _, descriptor, should_ubatch, dp_counts, _ = (
+            runner._determine_batch_execution_and_padding(
+                num_tokens=num_tokens,
+                num_reqs=1,
+                num_scheduled_tokens_np=np.array([num_tokens], dtype=np.int32),
+                max_num_scheduled_tokens=num_tokens,
+                use_cascade_attn=False,
+            )
+        )
+        expected = expected_counts if expected_counts is not None else [num_tokens] * 2
+        assert dp_counts.tolist() == expected
+        assert descriptor.num_tokens == expected[rank]
+        assert should_ubatch is expected_ubatch
+        slices, _ = maybe_create_ubatch_slices(
+            should_ubatch,
+            np.array([num_tokens], dtype=np.int32),
+            descriptor.num_tokens,
+            1,
+            runner.vllm_config,
+        )
+        if expected_ubatch:
+            assert [ubatch.num_tokens for ubatch in slices] == [4, 4]
+        else:
+            assert slices is None
+
+    assert len(collective_calls) == (0 if expected_counts is None else 2)
+
+
 def _new_ffn_runner():
     _require_npu_runtime()
     from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner

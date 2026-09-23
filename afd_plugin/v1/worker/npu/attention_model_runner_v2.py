@@ -117,7 +117,7 @@ def _use_afd_fullgraph_replay_hook(
     had_instance_override = "run_fullgraph" in manager_state
     previous_instance_override = manager_state.get("run_fullgraph")
     original_run_fullgraph = manager.run_fullgraph
-    manager_state[_AFD_FULLGRAPH_HOOK_MARKER] = True
+    setattr(manager, _AFD_FULLGRAPH_HOOK_MARKER, True)
 
     # Patch reason: native FULL replay bypasses ForwardContext creation, so the
     # execute-scoped AFD provider cannot publish runtime control.
@@ -168,7 +168,7 @@ def _use_afd_fullgraph_replay_hook(
             manager.run_fullgraph = previous_instance_override
         else:
             del manager.run_fullgraph
-        del manager_state[_AFD_FULLGRAPH_HOOK_MARKER]
+        delattr(manager, _AFD_FULLGRAPH_HOOK_MARKER)
 
 
 class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):

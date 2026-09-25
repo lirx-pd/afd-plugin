@@ -330,10 +330,7 @@ def test_deepseek_afd_attention_path_can_compute_gate_before_send():
         "    def compute_ffn_output(",
         1,
     )[0]
-    gate_proxy = source.split("class GateOnlyRemoteMoE", 1)[1].split(
-        "class AFDDeepseekV2RemoteExpertsMoE",
-        1,
-    )[0]
+    gate_runner = Path("afd_plugin/model_executor/npu/remote_moe.py").read_text()
     attention_gate_forward = executor_source.split(
         "def run_attention_gate_afd_forward(",
         1,
@@ -344,10 +341,10 @@ def test_deepseek_afd_attention_path_can_compute_gate_before_send():
     assert "def _forward_attention(" not in source
     assert "return super().forward(" in model_forward
     assert "deepseek_v2_async_cam_forward.run_model_forward(" in model_forward
-    assert "compute_gate_topk(" in gate_proxy
-    assert "topk_weights=topk_weights" in gate_proxy
-    assert "topk_ids=topk_ids" in gate_proxy
-    assert "router_logits=router_logits" in gate_proxy
+    assert "compute_gate_topk(" in gate_runner
+    assert "topk_weights=topk_weights" in gate_runner
+    assert "topk_ids=topk_ids" in gate_runner
+    assert "router_logits=router_logits" in gate_runner
     assert "layer.compute_attn_output(" in attention_gate_forward
     assert "pending_ffn_recv" in attention_gate_forward
     assert "topk_weights" in attention_gate_forward
@@ -356,9 +353,7 @@ def test_deepseek_afd_attention_path_can_compute_gate_before_send():
 
 def test_deepseek_afd_attention_gate_can_force_balanced_topk_ids():
     source = Path("afd_plugin/model_executor/models/deepseek_v2.py").read_text()
-    gate_source = Path(
-        "afd_plugin/model_executor/models/npu/deepseek_v2_attention_gate.py",
-    ).read_text()
+    gate_source = Path("afd_plugin/model_executor/npu/remote_moe.py").read_text()
     module_imports = source.split("logger = init_logger(__name__)", 1)[0]
     compute_attn_output = source.split("    def compute_attn_output(", 1)[1].split(
         "    def compute_ffn_output(",
@@ -370,16 +365,16 @@ def test_deepseek_afd_attention_gate_can_force_balanced_topk_ids():
     assert "from afd_plugin.model_executor.models.npu import (" in compute_attn_output
     assert "deepseek_v2_attention_gate," in compute_attn_output
     assert "force_balanced_topk_ids_enabled" in gate_source
-    assert "def _force_balanced_topk_ids(" in gate_source
-    assert "topk_ids.copy_(balanced_topk_ids)" in gate_source
-    assert "topk_weights, topk_ids = afd_connector.select_experts(" in (gate_source)
+    assert "balanced_topk_ids = torch.arange(" in gate_source
+    assert "topk_ids.copy_(" in gate_source
+    assert "topk_weights, topk_ids = select_experts(" in (gate_source)
     assert "if force_balanced_topk_ids_enabled():" in gate_source
     assert (
         gate_source.index(
-            "topk_weights, topk_ids = afd_connector.select_experts(",
+            "topk_weights, topk_ids = select_experts(",
         )
         < gate_source.index("if force_balanced_topk_ids_enabled():")
-        < gate_source.index("topk_weights = topk_weights.to(torch.float32)")
+        < gate_source.index("return topk_weights.to(torch.float32)")
     )
 
 
@@ -402,7 +397,8 @@ def test_deepseek_compute_gate_on_attention_selects_backend_boundary():
 
     assert 'device_type not in ("cuda", "npu")' in source
     assert "self.mlp = AFDDeepseekV2RemoteExpertsMoE(" in source
-    assert "self.mlp = GateOnlyRemoteMoE(" in source
+    assert "GateOnlyRemoteMoE" not in source
+    assert "AFDRemoteMoERunner.create(" in source
     assert 'prefix=f"{prefix}.mlp"' in source
     assert (
         "# NPU-only: Attention-side gate/topk is implemented in the NPU helper."

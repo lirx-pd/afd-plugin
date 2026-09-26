@@ -21,15 +21,6 @@ if TYPE_CHECKING:
     )
 
 
-def compute_attention_gate_topk(
-    layer: AFDDeepseekV2DecoderLayer,
-    hidden_states: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute router logits and top-k payloads for Attention-side gate."""
-
-    return layer.mlp.experts.compute_gate_topk(hidden_states)
-
-
 def compute_attention_gate_moe_ffn(
     layer: AFDDeepseekV2DecoderLayer,
     *,
@@ -306,5 +297,4 @@ def _gmmswigluquant_fusion_enabled() -> bool:
 
 __all__ = [
     "compute_attention_gate_moe_ffn",
-    "compute_attention_gate_topk",
 ]

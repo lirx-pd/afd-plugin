@@ -450,17 +450,9 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         topk_weights = None
         topk_ids = None
         router_logits = None
-        # NPU-only: Attention-side gate/topk is implemented in the NPU helper.
         if self.compute_gate_on_attention and self.is_moe_layer:
-            from afd_plugin.model_executor.models.npu import (
-                deepseek_v2_attention_gate,
-            )
-
-            topk_weights, topk_ids, router_logits = (
-                deepseek_v2_attention_gate.compute_attention_gate_topk(
-                    self,
-                    hidden_states,
-                )
+            topk_weights, topk_ids, router_logits = self.mlp.experts.compute_gate_topk(
+                hidden_states
             )
         return hidden_states, residual, topk_weights, topk_ids, router_logits
 

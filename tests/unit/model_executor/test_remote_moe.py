@@ -15,7 +15,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
-from torch import nn  # noqa: E402
+from torch import Tensor, nn  # noqa: E402
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config  # noqa: E402
 from vllm.forward_context import (  # noqa: E402
     ForwardContext,
@@ -637,10 +637,247 @@ def test_attention_gate_runner_owns_routing_once(
     assert sent[0]["router_logits"] is logits
 
 
+@pytest.fixture
+def attention_gate_runner(monkeypatch):
+    from afd_plugin.model_executor.npu import remote_moe as npu_remote_moe
+
+    monkeypatch.setattr(npu_remote_moe, "validate_remote_moe_config", lambda: None)
+    runner = _make_runner(
+        VllmConfig(device_config=DeviceConfig("cpu")),
+        device_type="npu",
+        connector="CAMAsyncAFDConnector",
+        compute_gate_on_attention=True,
+        gate=nn.Linear(7, 4, bias=False),
+    )
+    for name in (
+        "compute_gate_topk",
+        "_forward_entry",
+        "_forward_impl",
+        "_maybe_apply_shared_experts",
+        "_maybe_apply_routed_scale_to_output",
+        "_maybe_reduce_final_output",
+    ):
+        monkeypatch.setattr(runner, name, _unexpected_local_compute)
+    monkeypatch.setattr(runner.gate, "forward", _unexpected_local_compute)
+    monkeypatch.setattr(runner.router, "select_experts", _unexpected_local_compute)
+    monkeypatch.setattr(remote_moe, "maybe_apply_dbo_yield", _unexpected_local_compute)
+    return runner
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "tp_rank", "use_sequence_parallel"),
+    [(1, 0, False), (2, 0, False), (2, 1, False), (2, 1, True)],
+    ids=["tp1", "tp2-rank0", "tp2-rank1", "flashcomm1"],
+)
+def test_cam_dispatch_combine_uses_live_connector_and_explicit_stage(
+    monkeypatch, attention_gate_runner, tp_size, tp_rank, use_sequence_parallel
+):
+    from afd_plugin.model_executor.models.npu import async_cam_layout
+
+    runner = attention_gate_runner
+    monkeypatch.setattr(
+        async_cam_layout,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=tp_size, rank_in_group=tp_rank),
+    )
+    state_before = dict(runner.__dict__)
+    requires_gather = tp_size > 1 and not use_sequence_parallel
+    for stage_idx, rows in enumerate((5, 3)):
+        hidden = torch.arange(rows * 7, dtype=torch.bfloat16).reshape(rows, 7)
+        weights = torch.arange(rows * 2, dtype=torch.float32).reshape(rows, 2)
+        ids = torch.arange(rows * 2, dtype=torch.int32).reshape(rows, 2)
+        logits = (
+            torch.arange(rows * 4, dtype=torch.float32).reshape(rows, 4)
+            if stage_idx == 0
+            else None
+        )
+        sent: list[tuple] = []
+
+        def send(hidden_states, transfer_context, *, sent=sent, **kwargs):
+            sent.append((hidden_states, transfer_context.metadata, kwargs))
+
+        send_connector = SimpleNamespace(
+            send_attn_output=send, recv_ffn_output=_unexpected_local_compute
+        )
+        send_context = _context(send_connector, 8)
+        send_metadata = send_context.additional_kwargs["afd_metadata"]
+        send_metadata.stage_idx = 9
+        with override_forward_context(send_context):
+            dispatch_ref, layout = runner.dispatch(
+                hidden,
+                weights,
+                ids,
+                logits,
+                stage_idx=stage_idx,
+                use_sequence_parallel=use_sequence_parallel,
+            )
+        assert len(sent) == 1
+        sent_hidden, metadata, routing = sent[0]
+        assert dispatch_ref is sent_hidden
+        assert metadata.layer_idx == runner.layer_id == 3
+        assert metadata.stage_idx == stage_idx
+        assert metadata.seq_lens == [dispatch_ref.shape[0]]
+        assert send_metadata.stage_idx == 9
+        assert send_context.ubatch_idx == 8
+        assert set(routing) == {"topk_weights", "topk_ids", "router_logits"}
+        assert layout.parent_tokens == rows
+        assert layout.requires_tp_all_gather is requires_gather
+        assert layout.use_sequence_parallel is use_sequence_parallel
+        assert (layout.tp_size, layout.tp_rank) == (tp_size, tp_rank)
+        for actual, original in zip(
+            (
+                dispatch_ref,
+                routing["topk_weights"],
+                routing["topk_ids"],
+                routing["router_logits"],
+            ),
+            (hidden, weights, ids, logits),
+            strict=True,
+        ):
+            if original is None:
+                assert actual is None
+            elif requires_gather:
+                padding = original.new_zeros((1, original.shape[1]))
+                expected = torch.cat((original, padding))[layout.local_token_slice]
+                assert actual.dtype == original.dtype
+                assert torch.equal(actual, expected)
+            else:
+                assert actual is original
+        assert layout.padded_tokens == rows + int(requires_gather)
+        gathers: list[Tensor] = []
+        if requires_gather:
+            global_output = (
+                torch.arange(layout.padded_tokens * 7, dtype=hidden.dtype).reshape(
+                    layout.padded_tokens, 7
+                )
+                + 100
+            )
+            local_output = global_output[layout.local_token_slice]
+
+            def all_gather(
+                tensor,
+                token_dim,
+                *,
+                local_output=local_output,
+                gathers=gathers,
+                global_output=global_output,
+            ):
+                assert tensor is local_output
+                assert token_dim == 0
+                gathers.append(tensor)
+                return global_output
+
+            monkeypatch.setattr(
+                async_cam_layout, "tensor_model_parallel_all_gather", all_gather
+            )
+        else:
+            local_output = hidden + 100
+            monkeypatch.setattr(
+                async_cam_layout,
+                "tensor_model_parallel_all_gather",
+                _unexpected_local_compute,
+            )
+        received: list[Tensor] = []
+
+        def receive(
+            *,
+            ref_tensor,
+            ubatch_idx,
+            dispatch_ref=dispatch_ref,
+            stage_idx=stage_idx,
+            received=received,
+            local_output=local_output,
+        ):
+            assert ref_tensor is dispatch_ref
+            assert ubatch_idx == stage_idx
+            received.append(ref_tensor)
+            return local_output
+
+        recv_connector = SimpleNamespace(
+            send_attn_output=_unexpected_local_compute, recv_ffn_output=receive
+        )
+        recv_context = _context(recv_connector, 8)
+        recv_metadata = recv_context.additional_kwargs["afd_metadata"]
+        recv_metadata.stage_idx = 9
+        with override_forward_context(recv_context):
+            output = runner.combine(dispatch_ref, layout, stage_idx=stage_idx)
+        assert len(received) == 1
+        assert len(gathers) == int(requires_gather)
+        if requires_gather:
+            assert torch.equal(output, global_output[:rows])
+        else:
+            assert output is local_output
+        assert recv_metadata.stage_idx == 9
+        assert recv_context.ubatch_idx == 8
+        assert runner.__dict__.keys() == state_before.keys()
+        assert all(
+            runner.__dict__[name] is value for name, value in state_before.items()
+        )
+
+
+@pytest.mark.parametrize("failure", ["send", "recv"])
+def test_cam_dispatch_combine_propagates_original_error(
+    monkeypatch, attention_gate_runner, failure
+):
+    from afd_plugin.model_executor.models.npu import async_cam_layout
+
+    runner = attention_gate_runner
+    monkeypatch.setattr(
+        async_cam_layout,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=1, rank_in_group=0),
+    )
+    hidden = torch.ones(2, 7, dtype=torch.bfloat16)
+    weights = torch.ones(2, 2, dtype=torch.float32)
+    ids = torch.ones(2, 2, dtype=torch.int32)
+    error = RuntimeError("CAM transport failed")
+    events = []
+
+    def send(*args, **kwargs):
+        events.append("send")
+        if failure == "send":
+            raise error
+
+    def receive(**kwargs):
+        events.append("recv")
+        raise error
+
+    connector = SimpleNamespace(send_attn_output=send, recv_ffn_output=receive)
+    state_before = dict(runner.__dict__)
+    with (
+        override_forward_context(_context(connector, 9)),
+        pytest.raises(RuntimeError) as caught,
+    ):
+        dispatch_ref, layout = runner.dispatch(
+            hidden,
+            weights,
+            ids,
+            None,
+            stage_idx=1,
+            use_sequence_parallel=False,
+        )
+        monkeypatch.setattr(
+            async_cam_layout,
+            "tensor_model_parallel_all_gather",
+            _unexpected_local_compute,
+        )
+        runner.combine(dispatch_ref, layout, stage_idx=1)
+    assert caught.value is error
+    assert events == (["send"] if failure == "send" else ["send", "recv"])
+    assert runner.__dict__.keys() == state_before.keys()
+    assert all(runner.__dict__[name] is value for name, value in state_before.items())
+
+
 @pytest.mark.npu
 @pytest.mark.parametrize("import_order", ["before", "after"])
-def test_real_ascend_factory_and_post_load_in_isolated_process(import_order):
+@pytest.mark.parametrize("connector", ["CAMP2pAFDConnector", "CAMAsyncAFDConnector"])
+def test_real_ascend_factory_and_post_load_in_isolated_process(import_order, connector):
     pytest.importorskip("vllm_ascend")
+    runner_name = (
+        "AFDAttentionGateMoERunner"
+        if connector == "CAMAsyncAFDConnector"
+        else "AFDRemoteMoERunner"
+    )
     program = f"""
 import runpy
 import vllm_ascend.ops
@@ -657,9 +894,10 @@ config = namespace['VllmConfig'](device_config=namespace['DeviceConfig']('cpu'))
 init_ascend_config(config)
 assert namespace['fused_moe'].FusedMoE is patch_fused_moe._ascend_FusedMoE
 runner = namespace['_make_runner'](
-    config, device_type='npu', connector='CAMP2pAFDConnector'
+    config, device_type='npu', connector={connector!r},
+    compute_gate_on_attention={connector == "CAMAsyncAFDConnector"!r},
 )
-assert type(runner) is namespace['AFDRemoteMoERunner']
+assert type(runner).__name__ == {runner_name!r}
 assert type(runner.routed_experts) is namespace['AFDRemoteRoutedExperts']
 check = namespace['test_real_post_load_is_parameter_free_and_keeps_quant_method']
 check((config, runner))

@@ -315,24 +315,6 @@ def test_cuda_attention_gate_uses_v026_native_gate_contract(
         SimpleNamespace(device_type="cuda"),
     )
     monkeypatch.setattr(adapter.native, "GateLinear", _FakeGate)
-    monkeypatch.setattr(
-        adapter.native,
-        "get_tensor_model_parallel_world_size",
-        lambda: 1,
-    )
-    monkeypatch.setattr(
-        adapter.native,
-        "get_tensor_model_parallel_rank",
-        lambda: 0,
-    )
-    monkeypatch.setattr(
-        adapter.native,
-        "get_ep_group",
-        lambda: SimpleNamespace(
-            device_group=SimpleNamespace(size=lambda: 1),
-            rank_in_group=0,
-        ),
-    )
 
     moe = _make_layer(
         monkeypatch,
@@ -684,12 +666,12 @@ def test_camp2p_rejects_ascend_local_expert_settings(
 
 
 @pytest.mark.parametrize(
-    ("device_type", "connector", "role", "layer_idx", "attention_gate"),
+    ("device_type", "connector", "role", "layer_idx"),
     [
-        ("cuda", "P2pNcclAFDConnector", "attention", 0, False),
-        ("npu", "CAMP2pAFDConnector", "attention", 0, False),
-        ("npu", "CAMP2pAFDConnector", "ffn", 1, False),
-        ("cuda", "P2pNcclAFDConnector", "ffn", 1, False),
+        ("cuda", "P2pNcclAFDConnector", "attention", 0),
+        ("npu", "CAMP2pAFDConnector", "attention", 0),
+        ("npu", "CAMP2pAFDConnector", "ffn", 1),
+        ("cuda", "P2pNcclAFDConnector", "ffn", 1),
     ],
 )
 def test_non_target_layers_keep_existing_components(
@@ -700,7 +682,6 @@ def test_non_target_layers_keep_existing_components(
     connector,
     role,
     layer_idx,
-    attention_gate,
 ):
     monkeypatch.setattr(
         adapter.native,
@@ -716,7 +697,6 @@ def test_non_target_layers_keep_existing_components(
         monkeypatch,
         role=role,
         layer_idx=layer_idx,
-        attention_gate=attention_gate,
         connector=connector,
         vllm_config=config,
     )

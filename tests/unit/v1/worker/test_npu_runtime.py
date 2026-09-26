@@ -2465,6 +2465,20 @@ def test_npu_async_feature_validation_rejects_native_ubatching(
         )
 
 
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_npu_async_feature_validation_rejects_mixed_placement(role):
+    config = _vllm_config(
+        role=role,
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+    )
+    config.additional_config["mix_placement"] = True
+
+    with pytest.raises(RuntimeError, match="does not support mix_placement"):
+        fail_if_unsupported_npu_afd_features(config)
+
+
 def test_npu_async_feature_validation_allows_dynamic_quant_zero_or_one():
     fail_if_unsupported_npu_afd_features(
         _vllm_config(

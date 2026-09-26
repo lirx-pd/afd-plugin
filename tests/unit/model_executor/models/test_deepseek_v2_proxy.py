@@ -209,8 +209,7 @@ def test_ffn_compute_applies_dense_fp16_scaling_once(
     assert torch.equal(output, hidden_states * expected_scale)
 
 
-def test_cam_gate_helper_delegates_to_moe_runner(monkeypatch):
-    from afd_plugin.model_executor.models.npu import deepseek_v2_attention_gate
+def test_cam_decoder_delegates_gate_to_moe_runner():
 
     hidden_states = torch.ones(1, 4)
     expected = (
@@ -224,16 +223,26 @@ def test_cam_gate_helper_delegates_to_moe_runner(monkeypatch):
         gate_calls.append(states)
         return expected
 
-    layer = SimpleNamespace(
-        mlp=SimpleNamespace(
-            experts=SimpleNamespace(compute_gate_topk=compute_gate_topk)
-        ),
+    layer = object.__new__(adapter.AFDDeepseekV2DecoderLayer)
+    nn.Module.__init__(layer)
+    layer.compute_gate_on_attention = True
+    layer.is_moe_layer = True
+    layer.use_mha = True
+    layer.input_layernorm = _PassthroughNorm()
+    layer.self_attn = _FakeAttention()
+    layer.post_attention_layernorm = _PassthroughNorm()
+    layer.mlp = SimpleNamespace(
+        experts=SimpleNamespace(compute_gate_topk=compute_gate_topk)
     )
-    output = deepseek_v2_attention_gate.compute_attention_gate_topk(
-        layer, hidden_states
+    output, residual, weights, ids, logits = layer.compute_attn_output(
+        torch.zeros(1, dtype=torch.long), hidden_states, None
     )
 
-    assert output is expected
+    assert output is hidden_states
+    assert torch.equal(residual, hidden_states)
+    assert weights is expected[0]
+    assert ids is expected[1]
+    assert logits is expected[2]
     assert len(gate_calls) == 1
     assert gate_calls[0] is hidden_states
 

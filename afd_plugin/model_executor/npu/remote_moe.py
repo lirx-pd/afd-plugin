@@ -10,7 +10,14 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.router.base_router import FusedMoERouter
 
+from afd_plugin.connectors import AFDTransferContext, AFDTransferMetadata
 from afd_plugin.envs import force_balanced_topk_ids_enabled
+from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
+from afd_plugin.model_executor.models.npu.async_cam_layout import (
+    CAMDispatchLayout,
+    prepare_cam_dispatch_payload,
+    restore_cam_dispatch_output,
+)
 from afd_plugin.model_executor.remote_moe import (
     AFDRemoteMoERunner,
     remote_ffn_forward,
@@ -37,7 +44,7 @@ def validate_remote_moe_config() -> None:
 
 
 class AFDAttentionGateMoERunner(AFDRemoteMoERunner):
-    """Own routing while CAM's model loop schedules dispatch and combine."""
+    """Own CAM routing and transport while the model loop schedules completion."""
 
     @staticmethod
     def get_factory_kwargs(
@@ -129,6 +136,58 @@ class AFDAttentionGateMoERunner(AFDRemoteMoERunner):
                 balanced_topk_ids.remainder(router_logits.shape[1]).to(topk_ids.dtype)
             )
         return topk_weights.to(torch.float32), topk_ids, router_logits
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        router_logits: torch.Tensor | None,
+        *,
+        stage_idx: int,
+        use_sequence_parallel: bool,
+    ) -> tuple[torch.Tensor, CAMDispatchLayout]:
+        """Send one routed shard; the caller retains its completion state."""
+        afd_metadata = get_afd_metadata_from_forward_context()
+        if afd_metadata is None:
+            raise RuntimeError("Remote MoE execution requires AFD forward metadata")
+        payload = prepare_cam_dispatch_payload(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            router_logits,
+            use_sequence_parallel=use_sequence_parallel,
+        )
+        metadata = AFDTransferMetadata.create_attention_metadata(
+            layer_idx=self.layer_id,
+            stage_idx=stage_idx,
+            seq_len=int(payload.hidden_states.shape[0]),
+        )
+        afd_metadata.connector.send_attn_output(
+            payload.hidden_states,
+            AFDTransferContext(metadata=metadata),
+            topk_weights=payload.topk_weights,
+            topk_ids=payload.topk_ids,
+            router_logits=payload.router_logits,
+        )
+        return payload.hidden_states, payload.layout
+
+    def combine(
+        self,
+        dispatch_ref: torch.Tensor,
+        layout: CAMDispatchLayout,
+        *,
+        stage_idx: int,
+    ) -> torch.Tensor:
+        """Receive routed output and restore the dispatch's model token layout."""
+        afd_metadata = get_afd_metadata_from_forward_context()
+        if afd_metadata is None:
+            raise RuntimeError("Remote MoE execution requires AFD forward metadata")
+        local_output = afd_metadata.connector.recv_ffn_output(
+            ref_tensor=dispatch_ref,
+            ubatch_idx=stage_idx,
+        )
+        return restore_cam_dispatch_output(local_output, layout)
 
     def forward(
         self,

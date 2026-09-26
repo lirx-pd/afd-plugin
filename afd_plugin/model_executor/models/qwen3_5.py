@@ -12,7 +12,7 @@ from vllm.model_executor.models import qwen3_5 as native
 from vllm.model_executor.models import qwen3_next as next_native
 
 from afd_plugin.config import parse_optional_afd_config
-from afd_plugin.model_executor.remote_moe import AFDRemoteMoERunner
+from afd_plugin.model_executor.remote_moe import build_attention_moe_runner
 
 _ATTENTION_ROLE = frozenset(("attention",))
 _FFN_ROLE = frozenset(("ffn",))
@@ -122,7 +122,7 @@ class AFDQwen3_5RemoteExpertsMoE(  # noqa: N801
         self.gate = None
         self.shared_expert = None
         self.shared_expert_gate = None
-        self.experts = AFDRemoteMoERunner.create(
+        self.experts = build_attention_moe_runner(
             vllm_config,
             num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,

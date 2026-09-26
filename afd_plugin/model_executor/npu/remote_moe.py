@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Attention-owned Ascend routing for remote CAM experts."""
+"""Complete Attention-owned CAM MoE execution with native Ascend routing."""
 
-from typing import Any
+import weakref
 
 import torch
 from vllm.config import VllmConfig
@@ -18,10 +18,11 @@ from afd_plugin.model_executor.models.npu.async_cam_layout import (
     prepare_cam_dispatch_payload,
     restore_cam_dispatch_output,
 )
-from afd_plugin.model_executor.remote_moe import (
-    AFDRemoteMoERunner,
-    remote_ffn_forward,
+from afd_plugin.model_executor.npu.async_cam_execution import (
+    CAMAsyncPhase,
+    require_cam_async_execution_context,
 )
+from afd_plugin.model_executor.remote_moe import AFDRemoteMoERunnerBase
 
 
 def validate_remote_moe_config() -> None:
@@ -43,24 +44,8 @@ def validate_remote_moe_config() -> None:
         )
 
 
-class AFDAttentionGateMoERunner(AFDRemoteMoERunner):
-    """Own CAM routing and transport while the model loop schedules completion."""
-
-    @staticmethod
-    def get_factory_kwargs(
-        vllm_config: VllmConfig,
-        gate: torch.nn.Module | None,
-        num_shared_experts: int | None,
-    ) -> dict[str, Any]:
-        return {
-            "gate": gate,
-            "runner_args": {
-                "mix_placement": bool(
-                    vllm_config.additional_config.get("mix_placement", False)
-                ),
-                "num_shared_experts": num_shared_experts,
-            },
-        }
+class AFDCAMAsyncMoERunner(AFDRemoteMoERunnerBase):
+    """Complete routing, CAM transport, layout restoration, and shared experts."""
 
     def __init__(
         self,
@@ -76,8 +61,10 @@ class AFDAttentionGateMoERunner(AFDRemoteMoERunner):
         routed_output_transform: torch.nn.Module | None = None,
         routed_scaling_factor: float = 1.0,
         *,
-        mix_placement: bool,
+        vllm_config: VllmConfig,
         num_shared_experts: int | None,
+        attention_shared_experts: torch.nn.Module | None = None,
+        shared_output_divisor_fp16: float = 1.0,
     ) -> None:
         super().__init__(
             layer_name=layer_name,
@@ -92,10 +79,19 @@ class AFDAttentionGateMoERunner(AFDRemoteMoERunner):
             routed_output_transform=routed_output_transform,
             routed_scaling_factor=routed_scaling_factor,
         )
-        self.mix_placement = mix_placement
+        self.mix_placement = bool(
+            vllm_config.additional_config.get("mix_placement", False)
+        )
         self.num_shared_experts = num_shared_experts or 0
+        # The outer MoE owns canonical shared weight names and their lifetime.
+        self._attention_shared_experts = (
+            None
+            if attention_shared_experts is None
+            else weakref.ref(attention_shared_experts)
+        )
+        self.shared_output_divisor_fp16 = shared_output_divisor_fp16
 
-    def compute_gate_topk(
+    def _route_native(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Keep Ascend imports lazy so GPU workers can load the same model shell.
@@ -107,8 +103,8 @@ class AFDAttentionGateMoERunner(AFDRemoteMoERunner):
         num_experts = experts.global_num_experts
         if self.mix_placement:
             num_experts += self.num_shared_experts
-        # CAM's FFN path applies the scale unless mixed placement folds it into
-        # top-k weights. Never run MoERunner's final scaling/reduction again.
+        # Preserve the existing selector scaling placement; FFN/combine owns
+        # the remaining math. Never run generic MoERunner post-processing.
         topk_weights, topk_ids = select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -137,7 +133,7 @@ class AFDAttentionGateMoERunner(AFDRemoteMoERunner):
             )
         return topk_weights.to(torch.float32), topk_ids, router_logits
 
-    def dispatch(
+    def _dispatch_cam(
         self,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -147,7 +143,7 @@ class AFDAttentionGateMoERunner(AFDRemoteMoERunner):
         stage_idx: int,
         use_sequence_parallel: bool,
     ) -> tuple[torch.Tensor, CAMDispatchLayout]:
-        """Send one routed shard; the caller retains its completion state."""
+        """Send one routed shard while forward retains its completion state."""
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:
             raise RuntimeError("Remote MoE execution requires AFD forward metadata")
@@ -172,7 +168,7 @@ class AFDAttentionGateMoERunner(AFDRemoteMoERunner):
         )
         return payload.hidden_states, payload.layout
 
-    def combine(
+    def _combine_cam(
         self,
         dispatch_ref: torch.Tensor,
         layout: CAMDispatchLayout,
@@ -189,6 +185,18 @@ class AFDAttentionGateMoERunner(AFDRemoteMoERunner):
         )
         return restore_cam_dispatch_output(local_output, layout)
 
+    def _compute_attention_shared(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor | None:
+        if self._attention_shared_experts is None:
+            return None
+        shared_module = self._attention_shared_experts()
+        assert shared_module is not None
+        shared_output = shared_module(hidden_states)
+        if hidden_states.dtype == torch.float16:
+            shared_output = shared_output / self.shared_output_divisor_fp16
+        return shared_output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -199,11 +207,24 @@ class AFDAttentionGateMoERunner(AFDRemoteMoERunner):
             raise NotImplementedError(
                 "experts-boundary input_ids transport is not implemented",
             )
-        topk_weights, topk_ids, router_logits = self.compute_gate_topk(hidden_states)
-        return remote_ffn_forward(
+        execution = require_cam_async_execution_context()
+        topk_weights, topk_ids, computed_logits = self._route_native(hidden_states)
+        execution.checkpoint(self.layer_id, CAMAsyncPhase.ROUTED)
+        dispatch_ref, layout = self._dispatch_cam(
             hidden_states,
-            layer_idx=self.layer_id,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            router_logits=router_logits,
+            topk_weights,
+            topk_ids,
+            computed_logits,
+            stage_idx=execution.stage_idx,
+            use_sequence_parallel=execution.use_sequence_parallel,
         )
+        shared_output = self._compute_attention_shared(hidden_states)
+        execution.checkpoint(self.layer_id, CAMAsyncPhase.DISPATCHED)
+        output = self._combine_cam(
+            dispatch_ref,
+            layout,
+            stage_idx=execution.stage_idx,
+        )
+        if shared_output is not None:
+            output = output + shared_output
+        return output

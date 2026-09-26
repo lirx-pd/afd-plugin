@@ -48,6 +48,7 @@ from afd_plugin.model_executor import remote_moe  # noqa: E402
 from afd_plugin.model_executor.remote_moe import (  # noqa: E402
     AFDRemoteMoEMethod,
     AFDRemoteMoERunner,
+    AFDRemoteMoERunnerBase,
     AFDRemoteRoutedExperts,
 )
 
@@ -72,7 +73,7 @@ def _make_runner(
         patch.setattr(
             remote_moe, "current_platform", SimpleNamespace(device_type=device_type)
         )
-        return remote_moe.AFDRemoteMoERunner.create(
+        return remote_moe.build_attention_moe_runner(
             config,
             num_experts=4,
             top_k=2,
@@ -105,7 +106,9 @@ def test_real_factory_preserves_inherited_constructors_and_registration(monkeypa
     configs = [VllmConfig(device_config=DeviceConfig("cpu")) for _ in range(2)]
     runners = [_make_runner(config) for config in configs]
 
+    assert AFDRemoteMoERunnerBase.__init__ is MoERunner.__init__
     assert AFDRemoteMoERunner.__init__ is MoERunner.__init__
+    assert inspect.isabstract(AFDRemoteMoERunnerBase)
     assert AFDRemoteRoutedExperts.__init__ is RoutedExperts.__init__
     assert AFDRemoteMoEMethod.__init__ is FusedMoEMethodBase.__init__
     assert (
@@ -175,10 +178,10 @@ def test_real_post_load_is_parameter_free_and_keeps_quant_method(remote_runner):
         ("cuda", "P2pNcclAFDConnector", False, "AFDRemoteMoERunner"),
         ("cuda", "P2pNcclAFDConnector", True, "AFDExternalRoutingMoERunner"),
         ("npu", "CAMP2pAFDConnector", False, "AFDRemoteMoERunner"),
-        ("npu", "CAMAsyncAFDConnector", True, "AFDAttentionGateMoERunner"),
+        ("npu", "CAMAsyncAFDConnector", True, "AFDCAMAsyncMoERunner"),
     ],
 )
-def test_factory_builds_registered_backend_with_runner_kwargs(
+def test_factory_builds_selected_backend_with_runner_kwargs(
     monkeypatch, device_type, connector, compute_gate, runner_name
 ):
     config = VllmConfig(device_config=DeviceConfig("cpu"))
@@ -196,12 +199,15 @@ def test_factory_builds_registered_backend_with_runner_kwargs(
 
     monkeypatch.setattr(remote_moe.importlib, "import_module", track_import)
     gate = nn.Linear(7, 4, bias=False) if compute_gate else None
+    shared = nn.Linear(7, 7, bias=False)
     runner = _make_runner(
         config,
         device_type=device_type,
         connector=connector,
         compute_gate_on_attention=compute_gate,
         gate=gate,
+        attention_shared_experts=shared,
+        shared_output_divisor_fp16=2.5,
         num_shared_experts=3,
     )
 
@@ -216,10 +222,14 @@ def test_factory_builds_registered_backend_with_runner_kwargs(
     assert list(runner.routed_experts.get_expert_weights()) == []
     assert runner.shared_experts is None
     assert config.compilation_config.static_forward_context == {PREFIX: runner}
-    if runner_name == "AFDAttentionGateMoERunner":
+    if runner_name == "AFDCAMAsyncMoERunner":
         assert runner.gate is gate
         assert runner.mix_placement is True
         assert runner.num_shared_experts == 3
+        assert runner.shared_output_divisor_fp16 == 2.5
+        assert "attention_shared_experts" not in runner._modules
+        assert not isinstance(runner, AFDRemoteMoERunner)
+        assert isinstance(runner, AFDRemoteMoERunnerBase)
         assert list(runner.parameters()) == list(gate.parameters())
     else:
         assert runner.gate is None
@@ -292,7 +302,7 @@ def test_factory_rejects_local_eplb_and_capture_before_native_construction(
     )
     context_before = dict(config.compilation_config.static_forward_context)
     with pytest.raises(RuntimeError, match=message):
-        remote_moe.AFDRemoteMoERunner.create(
+        remote_moe.build_attention_moe_runner(
             config,
             num_experts=4,
             top_k=2,
@@ -490,13 +500,15 @@ def test_external_router_sends_logits_without_local_moe_math(monkeypatch):
     assert sent[0][1]["router_logits"] is logits
 
 
-def test_runner_registration_rejects_duplicate_and_unsupported_paths():
-    registered = dict(AFDRemoteMoERunner._registry)
-    with pytest.raises(ValueError, match="already registered"):
-        AFDRemoteMoERunner.register_runner(
-            "cuda", "P2pNcclAFDConnector", False, "wrong.module", "WrongRunner"
+def test_runner_selection_is_immutable_and_rejects_unsupported_paths():
+    with pytest.raises(TypeError):
+        remote_moe._ATTENTION_MOE_RUNNERS[("cuda", "P2pNcclAFDConnector", False)] = (
+            "wrong.module",
+            "WrongRunner",
         )
-    assert AFDRemoteMoERunner._registry == registered
+    for name in ("create", "register_runner", "_registry", "get_factory_kwargs"):
+        assert name not in vars(AFDRemoteMoERunner)
+        assert name not in vars(AFDRemoteMoERunnerBase)
     for device, connector, on_attention in (
         ("cuda", "CAMAsyncAFDConnector", True),
         ("npu", "CAMP2pAFDConnector", True),
@@ -515,7 +527,7 @@ def test_runner_registration_rejects_duplicate_and_unsupported_paths():
 @pytest.mark.parametrize("mix_placement", [False, True])
 @pytest.mark.parametrize("balanced", [False, True])
 @pytest.mark.parametrize("shared_count", [None, 2])
-def test_attention_gate_runner_owns_routing_once(
+def test_cam_runner_uses_native_selector_once(
     monkeypatch, mix_placement, balanced, shared_count
 ):
     from afd_plugin.model_executor.npu import remote_moe as npu_remote_moe
@@ -523,11 +535,9 @@ def test_attention_gate_runner_owns_routing_once(
     config = VllmConfig(device_config=DeviceConfig("cpu"))
     hidden = torch.ones(2, 7, dtype=torch.bfloat16)
     logits = torch.arange(8).reshape(2, 4).float()
-    output = torch.full_like(hidden, 3)
     correction_bias = torch.zeros(4)
     selected = []
     events = []
-    sent = []
 
     class Gate(nn.Module):
         def forward(self, hidden_states):
@@ -581,27 +591,8 @@ def test_attention_gate_runner_owns_routing_once(
         runner, "_maybe_apply_routed_scale_to_output", _unexpected_local_compute
     )
 
-    def send(hidden_states, context, **kwargs):
-        assert hidden_states is hidden
-        events.append("send")
-        sent.append(kwargs)
-
-    def receive(**kwargs):
-        events.append("recv")
-        return output
-
-    def yield_stage(hidden_states, **kwargs):
-        events.append("yield")
-        return hidden_states
-
-    connector = SimpleNamespace(send_attn_output=send, recv_ffn_output=receive)
-    monkeypatch.setattr(remote_moe, "maybe_apply_dbo_yield", yield_stage)
-    with override_forward_context(_context(connector, 0)):
-        with pytest.raises(NotImplementedError, match="input_ids"):
-            runner(hidden, hidden, input_ids=torch.tensor([1, 2]))
-        assert events == []
-        assert runner(hidden, hidden) is output
-    assert events == ["gate", "select", "send", "yield", "recv"]
+    weights, ids, computed_logits = runner._route_native(hidden)
+    assert events == ["gate", "select"]
     assert selected[0] == {
         "hidden_states": hidden,
         "router_logits": logits,
@@ -619,8 +610,6 @@ def test_attention_gate_runner_owns_routing_once(
         "num_shared_experts": shared_count or 0,
         "num_experts": 4 + ((shared_count or 0) if mix_placement else 0),
     }
-    weights = sent[0]["topk_weights"]
-    ids = sent[0]["topk_ids"]
     assert weights.dtype is torch.float32
     torch.testing.assert_close(
         weights,
@@ -634,7 +623,7 @@ def test_attention_gate_runner_owns_routing_once(
         else torch.full_like(ids, 3)
     )
     assert torch.equal(ids, expected_ids)
-    assert sent[0]["router_logits"] is logits
+    assert computed_logits is logits
 
 
 @pytest.fixture
@@ -650,7 +639,7 @@ def attention_gate_runner(monkeypatch):
         gate=nn.Linear(7, 4, bias=False),
     )
     for name in (
-        "compute_gate_topk",
+        "_route_native",
         "_forward_entry",
         "_forward_impl",
         "_maybe_apply_shared_experts",
@@ -703,7 +692,7 @@ def test_cam_dispatch_combine_uses_live_connector_and_explicit_stage(
         send_metadata = send_context.additional_kwargs["afd_metadata"]
         send_metadata.stage_idx = 9
         with override_forward_context(send_context):
-            dispatch_ref, layout = runner.dispatch(
+            dispatch_ref, layout = runner._dispatch_cam(
                 hidden,
                 weights,
                 ids,
@@ -800,7 +789,7 @@ def test_cam_dispatch_combine_uses_live_connector_and_explicit_stage(
         recv_metadata = recv_context.additional_kwargs["afd_metadata"]
         recv_metadata.stage_idx = 9
         with override_forward_context(recv_context):
-            output = runner.combine(dispatch_ref, layout, stage_idx=stage_idx)
+            output = runner._combine_cam(dispatch_ref, layout, stage_idx=stage_idx)
         assert len(received) == 1
         assert len(gathers) == int(requires_gather)
         if requires_gather:
@@ -848,7 +837,7 @@ def test_cam_dispatch_combine_propagates_original_error(
         override_forward_context(_context(connector, 9)),
         pytest.raises(RuntimeError) as caught,
     ):
-        dispatch_ref, layout = runner.dispatch(
+        dispatch_ref, layout = runner._dispatch_cam(
             hidden,
             weights,
             ids,
@@ -861,7 +850,7 @@ def test_cam_dispatch_combine_propagates_original_error(
             "tensor_model_parallel_all_gather",
             _unexpected_local_compute,
         )
-        runner.combine(dispatch_ref, layout, stage_idx=1)
+        runner._combine_cam(dispatch_ref, layout, stage_idx=1)
     assert caught.value is error
     assert events == (["send"] if failure == "send" else ["send", "recv"])
     assert runner.__dict__.keys() == state_before.keys()
@@ -874,7 +863,7 @@ def test_cam_dispatch_combine_propagates_original_error(
 def test_real_ascend_factory_and_post_load_in_isolated_process(import_order, connector):
     pytest.importorskip("vllm_ascend")
     runner_name = (
-        "AFDAttentionGateMoERunner"
+        "AFDCAMAsyncMoERunner"
         if connector == "CAMAsyncAFDConnector"
         else "AFDRemoteMoERunner"
     )

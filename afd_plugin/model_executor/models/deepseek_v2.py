@@ -30,7 +30,7 @@ from afd_plugin.connectors import (
     AFDF2ATransferPayload,
 )
 from afd_plugin.model_executor.remote_moe import (
-    AFDRemoteMoERunner,
+    build_attention_moe_runner,
     remote_ffn_forward,
 )
 
@@ -212,10 +212,12 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         self.n_logical_experts = self.n_routed_experts
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
         self.n_local_physical_experts = self.n_physical_experts // ep_size
-        self.experts = AFDRemoteMoERunner.create(
+        self.experts = build_attention_moe_runner(
             vllm_config,
             gate=self.gate,
             num_shared_experts=self.n_shared_experts,
+            attention_shared_experts=self.shared_experts,
+            shared_output_divisor_fp16=getattr(config, "routed_scaling_factor", 1.0),
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
@@ -414,13 +416,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-    ]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states.clone()
             hidden_states = self.input_layernorm(hidden_states)
@@ -447,14 +443,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
             hidden_states,
             residual,
         )
-        topk_weights = None
-        topk_ids = None
-        router_logits = None
-        if self.compute_gate_on_attention and self.is_moe_layer:
-            topk_weights, topk_ids, router_logits = self.mlp.experts.compute_gate_topk(
-                hidden_states
-            )
-        return hidden_states, residual, topk_weights, topk_ids, router_logits
+        return hidden_states, residual
 
     def compute_ffn_output(
         self,

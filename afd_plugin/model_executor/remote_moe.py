@@ -3,7 +3,9 @@
 """Native MoE construction and runners for Attention-to-FFN handoff."""
 
 import importlib
-from typing import Any, ClassVar
+from abc import abstractmethod
+from types import MappingProxyType
+from typing import Any
 
 import torch
 from vllm.config import VllmConfig
@@ -71,93 +73,104 @@ class AFDRemoteRoutedExperts(RoutedExperts):
         return AFDRemoteMoEMethod(moe_config)
 
 
-class AFDRemoteMoERunner(MoERunner):
-    """Construct registered remote runners and delegate MoE execution to FFN."""
+_ATTENTION_MOE_RUNNERS = MappingProxyType(
+    {
+        ("cuda", "P2pNcclAFDConnector", False): (
+            "afd_plugin.model_executor.remote_moe",
+            "AFDRemoteMoERunner",
+        ),
+        ("cuda", "P2pNcclAFDConnector", True): (
+            "afd_plugin.model_executor.remote_moe",
+            "AFDExternalRoutingMoERunner",
+        ),
+        ("npu", CAMP2P_CONNECTOR, False): (
+            "afd_plugin.model_executor.remote_moe",
+            "AFDRemoteMoERunner",
+        ),
+        ("npu", AFD_ASYNC_CONNECTOR, True): (
+            "afd_plugin.model_executor.npu.remote_moe",
+            "AFDCAMAsyncMoERunner",
+        ),
+    }
+)
 
-    _registry: ClassVar[dict[tuple[str, str, bool], tuple[str, str]]] = {}
 
-    @classmethod
-    def register_runner(
-        cls,
-        device_type: str,
-        connector: str,
-        compute_gate_on_attention: bool,
-        module_path: str,
-        class_name: str,
-    ) -> None:
-        key = (device_type, connector, compute_gate_on_attention)
-        if key in cls._registry:
-            raise ValueError(f"remote MoE runner {key!r} is already registered")
-        cls._registry[key] = (module_path, class_name)
-
-    @classmethod
-    def create(
-        cls,
-        vllm_config: VllmConfig,
-        *,
-        gate: torch.nn.Module | None = None,
-        num_shared_experts: int | None = None,
-        **moe_kwargs: Any,
-    ) -> MoERunner:
-        """Build remote experts from model-owned routing parameters and modules."""
-        afd_config = parse_afd_config(vllm_config, validate=False)
-        device_type = current_platform.device_type
-        key = (device_type, afd_config.connector, afd_config.compute_gate_on_attention)
-        if key not in cls._registry:
-            raise ValueError(f"unsupported Attention remote MoE configuration: {key!r}")
-        module_path, class_name = cls._registry[key]
-        runner_cls = vars(importlib.import_module(module_path))[class_name]
-        parallel_config = vllm_config.parallel_config
-        if parallel_config.enable_eplb:
-            raise RuntimeError(
-                "Remote MoE does not support Attention-local EPLB (enable_eplb)",
-            )
-        if parallel_config.eplb_config.num_redundant_experts != 0:
-            raise RuntimeError(
-                "Remote MoE does not support Attention-local redundant experts",
-            )
-        model_config = vllm_config.model_config
-        if model_config is not None and model_config.enable_return_routed_experts:
-            raise RuntimeError(
-                "Remote MoE does not support Attention-local routed_experts capture",
-            )
-        if device_type == "npu":
-            from afd_plugin.model_executor.npu.remote_moe import (
-                validate_remote_moe_config,
-            )
-
-            validate_remote_moe_config()
-
-        # Resolve the live package factory so Ascend's platform patch is honored.
-        # Unit dimensions describe a non-computing container, not FFN topology.
-        return fused_moe.FusedMoE(
-            **moe_kwargs,
-            quant_config=None,
-            shared_experts=None,
-            shared_expert_gate=None,
-            routed_input_transform=None,
-            routed_output_transform=None,
-            n_shared_experts=None,
-            apply_routed_scale_to_output=True,
-            enable_eplb=False,
-            num_redundant_experts=0,
-            is_sequence_parallel=False,
-            tp_size=1,
-            dp_size=1,
-            pcp_size=1,
-            runner_cls=runner_cls,
-            routed_experts_cls=AFDRemoteRoutedExperts,
-            **runner_cls.get_factory_kwargs(vllm_config, gate, num_shared_experts),
+def build_attention_moe_runner(
+    vllm_config: VllmConfig,
+    *,
+    gate: torch.nn.Module | None = None,
+    attention_shared_experts: torch.nn.Module | None = None,
+    num_shared_experts: int | None = None,
+    shared_output_divisor_fp16: float = 1.0,
+    **moe_kwargs: Any,
+) -> MoERunner:
+    """Construct the selected remote runner through the live native factory."""
+    afd_config = parse_afd_config(vllm_config, validate=False)
+    device_type = current_platform.device_type
+    key = (device_type, afd_config.connector, afd_config.compute_gate_on_attention)
+    if key not in _ATTENTION_MOE_RUNNERS:
+        raise ValueError(f"unsupported Attention remote MoE configuration: {key!r}")
+    parallel_config = vllm_config.parallel_config
+    if parallel_config.enable_eplb:
+        raise RuntimeError(
+            "Remote MoE does not support Attention-local EPLB (enable_eplb)",
+        )
+    if parallel_config.eplb_config.num_redundant_experts != 0:
+        raise RuntimeError(
+            "Remote MoE does not support Attention-local redundant experts",
+        )
+    model_config = vllm_config.model_config
+    if model_config is not None and model_config.enable_return_routed_experts:
+        raise RuntimeError(
+            "Remote MoE does not support Attention-local routed_experts capture",
+        )
+    if device_type == "npu":
+        from afd_plugin.model_executor.npu.remote_moe import (
+            validate_remote_moe_config,
         )
 
-    @staticmethod
-    def get_factory_kwargs(
-        vllm_config: VllmConfig,
-        gate: torch.nn.Module | None,
-        num_shared_experts: int | None,
-    ) -> dict[str, Any]:
+        validate_remote_moe_config()
+
+    module_path, class_name = _ATTENTION_MOE_RUNNERS[key]
+    runner_cls = vars(importlib.import_module(module_path))[class_name]
+    runner_args = None
+    if afd_config.connector == AFD_ASYNC_CONNECTOR:
+        runner_args = {
+            "vllm_config": vllm_config,
+            "num_shared_experts": num_shared_experts,
+            "attention_shared_experts": attention_shared_experts,
+            "shared_output_divisor_fp16": shared_output_divisor_fp16,
+        }
+    else:
         # Synchronous routing belongs to the model's outer gate or the FFN role.
-        return {"gate": None, "runner_args": None}
+        gate = None
+
+    # Resolve the live package factory so Ascend's platform patch is honored.
+    # Unit dimensions describe a non-computing container, not FFN topology.
+    return fused_moe.FusedMoE(
+        **moe_kwargs,
+        quant_config=None,
+        gate=gate,
+        shared_experts=None,
+        shared_expert_gate=None,
+        routed_input_transform=None,
+        routed_output_transform=None,
+        n_shared_experts=None,
+        apply_routed_scale_to_output=True,
+        enable_eplb=False,
+        num_redundant_experts=0,
+        is_sequence_parallel=False,
+        tp_size=1,
+        dp_size=1,
+        pcp_size=1,
+        runner_cls=runner_cls,
+        runner_args=runner_args,
+        routed_experts_cls=AFDRemoteRoutedExperts,
+    )
+
+
+class AFDRemoteMoERunnerBase(MoERunner):
+    """Native lifecycle for parameter-free remote experts."""
 
     @property
     def is_internal_router(self) -> bool:
@@ -165,6 +178,19 @@ class AFDRemoteMoERunner(MoERunner):
 
     def maybe_init_modular_kernel(self) -> None:
         pass
+
+    @abstractmethod
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+
+class AFDRemoteMoERunner(AFDRemoteMoERunnerBase):
+    """Delegate synchronous MoE execution to the FFN role."""
 
     def forward(
         self,
@@ -188,36 +214,6 @@ class AFDExternalRoutingMoERunner(AFDRemoteMoERunner):
     @property
     def is_internal_router(self) -> bool:
         return False
-
-
-AFDRemoteMoERunner.register_runner(
-    "cuda",
-    "P2pNcclAFDConnector",
-    False,
-    "afd_plugin.model_executor.remote_moe",
-    "AFDRemoteMoERunner",
-)
-AFDRemoteMoERunner.register_runner(
-    "npu",
-    CAMP2P_CONNECTOR,
-    False,
-    "afd_plugin.model_executor.remote_moe",
-    "AFDRemoteMoERunner",
-)
-AFDRemoteMoERunner.register_runner(
-    "cuda",
-    "P2pNcclAFDConnector",
-    True,
-    "afd_plugin.model_executor.remote_moe",
-    "AFDExternalRoutingMoERunner",
-)
-AFDRemoteMoERunner.register_runner(
-    "npu",
-    AFD_ASYNC_CONNECTOR,
-    True,
-    "afd_plugin.model_executor.npu.remote_moe",
-    "AFDAttentionGateMoERunner",
-)
 
 
 def remote_ffn_forward(

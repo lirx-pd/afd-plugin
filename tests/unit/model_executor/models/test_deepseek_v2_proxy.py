@@ -209,19 +209,11 @@ def test_ffn_compute_applies_dense_fp16_scaling_once(
     assert torch.equal(output, hidden_states * expected_scale)
 
 
-def test_cam_decoder_delegates_gate_to_moe_runner():
-
+def test_cam_decoder_returns_attention_without_routing():
     hidden_states = torch.ones(1, 4)
-    expected = (
-        torch.tensor([[0.75, 0.25]]),
-        torch.tensor([[1, 3]]),
-        torch.tensor([[0.1, 0.2, 0.3, 0.4]]),
-    )
-    gate_calls = []
 
-    def compute_gate_topk(states):
-        gate_calls.append(states)
-        return expected
+    def unexpected_routing(_states):
+        raise AssertionError("Attention must leave routing to the complete MoE call")
 
     layer = object.__new__(adapter.AFDDeepseekV2DecoderLayer)
     nn.Module.__init__(layer)
@@ -232,19 +224,15 @@ def test_cam_decoder_delegates_gate_to_moe_runner():
     layer.self_attn = _FakeAttention()
     layer.post_attention_layernorm = _PassthroughNorm()
     layer.mlp = SimpleNamespace(
-        experts=SimpleNamespace(compute_gate_topk=compute_gate_topk)
+        experts=SimpleNamespace(_route_native=unexpected_routing)
     )
-    output, residual, weights, ids, logits = layer.compute_attn_output(
+    output, residual = layer.compute_attn_output(
         torch.zeros(1, dtype=torch.long), hidden_states, None
     )
 
     assert output is hidden_states
+    assert residual is not hidden_states
     assert torch.equal(residual, hidden_states)
-    assert weights is expected[0]
-    assert ids is expected[1]
-    assert logits is expected[2]
-    assert len(gate_calls) == 1
-    assert gate_calls[0] is hidden_states
 
 
 def test_remote_experts_runner_sends_router_logits(monkeypatch):

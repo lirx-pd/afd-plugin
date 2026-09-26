@@ -62,6 +62,7 @@ def _make_runner(
     device_type="cuda",
     connector="P2pNcclAFDConnector",
     compute_gate_on_attention=False,
+    routed_scaling_factor=2.5,
     **kwargs,
 ):
     config.additional_config["afd"] = {
@@ -81,7 +82,7 @@ def _make_runner(
             intermediate_size=11,
             params_dtype=torch.bfloat16,
             prefix=PREFIX,
-            routed_scaling_factor=2.5,
+            routed_scaling_factor=routed_scaling_factor,
             **kwargs,
         )
 
@@ -185,7 +186,7 @@ def test_factory_builds_selected_backend_with_runner_kwargs(
     monkeypatch, device_type, connector, compute_gate, runner_name
 ):
     config = VllmConfig(device_config=DeviceConfig("cpu"))
-    config.additional_config["mix_placement"] = True
+    config.additional_config["mix_placement"] = False
     if device_type == "npu":
         from afd_plugin.model_executor.npu import remote_moe as npu_remote_moe
 
@@ -199,7 +200,9 @@ def test_factory_builds_selected_backend_with_runner_kwargs(
 
     monkeypatch.setattr(remote_moe.importlib, "import_module", track_import)
     gate = nn.Linear(7, 4, bias=False) if compute_gate else None
-    shared = nn.Linear(7, 7, bias=False)
+    shared = (
+        nn.Linear(7, 7, bias=False) if connector == "CAMAsyncAFDConnector" else None
+    )
     runner = _make_runner(
         config,
         device_type=device_type,
@@ -224,7 +227,6 @@ def test_factory_builds_selected_backend_with_runner_kwargs(
     assert config.compilation_config.static_forward_context == {PREFIX: runner}
     if runner_name == "AFDCAMAsyncMoERunner":
         assert runner.gate is gate
-        assert runner.mix_placement is True
         assert runner.num_shared_experts == 3
         assert runner.shared_output_divisor_fp16 == 2.5
         assert "attention_shared_experts" not in runner._modules
@@ -234,6 +236,195 @@ def test_factory_builds_selected_backend_with_runner_kwargs(
     else:
         assert runner.gate is None
         assert list(runner.parameters()) == []
+
+
+@pytest.mark.parametrize(
+    ("device_type", "connector", "compute_gate"),
+    [
+        ("cuda", "P2pNcclAFDConnector", False),
+        ("cuda", "P2pNcclAFDConnector", True),
+        ("npu", "CAMP2pAFDConnector", False),
+    ],
+)
+def test_factory_rejects_shared_experts_on_synchronous_paths(
+    monkeypatch, device_type, connector, compute_gate
+):
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+    monkeypatch.setattr(remote_moe.fused_moe, "FusedMoE", _unexpected_local_compute)
+    with pytest.raises(ValueError, match="attention_shared_experts requires CAMAsync"):
+        _make_runner(
+            config,
+            device_type=device_type,
+            connector=connector,
+            compute_gate_on_attention=compute_gate,
+            attention_shared_experts=nn.Identity(),
+        )
+    assert not config.compilation_config.static_forward_context
+    assert not config.compilation_config.static_all_moe_layers
+
+
+def test_factory_rejects_cam_without_gate_before_native_construction(monkeypatch):
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+    monkeypatch.setattr(remote_moe.fused_moe, "FusedMoE", _unexpected_local_compute)
+    with pytest.raises(ValueError, match="requires an Attention gate"):
+        _make_runner(
+            config,
+            device_type="npu",
+            connector="CAMAsyncAFDConnector",
+            compute_gate_on_attention=True,
+        )
+    assert not config.compilation_config.static_forward_context
+    assert not config.compilation_config.static_all_moe_layers
+
+
+@pytest.mark.parametrize(
+    "divisor", [0.0, -1.0, float("inf"), -float("inf"), float("nan")]
+)
+def test_factory_rejects_invalid_local_shared_divisor(monkeypatch, divisor):
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+    monkeypatch.setattr(remote_moe.fused_moe, "FusedMoE", _unexpected_local_compute)
+    with pytest.raises(
+        ValueError, match="shared_output_divisor_fp16 must be finite and positive"
+    ):
+        _make_runner(
+            config,
+            device_type="npu",
+            connector="CAMAsyncAFDConnector",
+            compute_gate_on_attention=True,
+            gate=nn.Identity(),
+            attention_shared_experts=nn.Identity(),
+            shared_output_divisor_fp16=divisor,
+        )
+    assert not config.compilation_config.static_forward_context
+    assert not config.compilation_config.static_all_moe_layers
+
+
+@pytest.mark.parametrize("factor", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize(
+    ("device_type", "connector", "compute_gate", "has_local_shared"),
+    [
+        ("cuda", "P2pNcclAFDConnector", False, False),
+        ("cuda", "P2pNcclAFDConnector", True, False),
+        ("npu", "CAMP2pAFDConnector", False, False),
+        ("npu", "CAMAsyncAFDConnector", True, False),
+        ("npu", "CAMAsyncAFDConnector", True, True),
+    ],
+)
+def test_factory_rejects_nonfinite_routed_scaling_factor(
+    monkeypatch, factor, device_type, connector, compute_gate, has_local_shared
+):
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+    monkeypatch.setattr(remote_moe.fused_moe, "FusedMoE", _unexpected_local_compute)
+    with pytest.raises(ValueError, match="routed_scaling_factor must be finite"):
+        _make_runner(
+            config,
+            device_type=device_type,
+            connector=connector,
+            compute_gate_on_attention=compute_gate,
+            gate=nn.Identity() if compute_gate else None,
+            attention_shared_experts=nn.Identity() if has_local_shared else None,
+            routed_scaling_factor=factor,
+        )
+    assert not config.compilation_config.static_forward_context
+    assert not config.compilation_config.static_all_moe_layers
+
+
+@pytest.mark.parametrize(
+    ("scale_kwargs", "expected"),
+    [
+        ({}, 1.0),
+        ({"routed_scaling_factor": 0.0}, 0.0),
+        ({"routed_scaling_factor": -2.5}, -2.5),
+        ({"routed_scaling_factor": 2.5}, 2.5),
+    ],
+    ids=["native-default", "zero", "negative", "positive"],
+)
+def test_factory_preserves_finite_routed_scaling_factor_and_shared_divisor(
+    monkeypatch, scale_kwargs, expected
+):
+    from afd_plugin.model_executor.npu import remote_moe as npu_remote_moe
+
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+    config.additional_config["afd"] = {
+        "role": "attention",
+        "connector": "CAMAsyncAFDConnector",
+        "compute_gate_on_attention": True,
+    }
+    monkeypatch.setattr(
+        remote_moe, "current_platform", SimpleNamespace(device_type="npu")
+    )
+    monkeypatch.setattr(npu_remote_moe, "validate_remote_moe_config", lambda: None)
+    shared = nn.Identity()
+    with set_current_vllm_config(config):
+        runner = remote_moe.build_attention_moe_runner(
+            config,
+            gate=nn.Identity(),
+            attention_shared_experts=shared,
+            shared_output_divisor_fp16=3.0,
+            num_experts=4,
+            top_k=2,
+            hidden_size=7,
+            intermediate_size=11,
+            prefix=PREFIX,
+            **scale_kwargs,
+        )
+    assert runner.routed_scaling_factor == expected
+    assert runner.shared_output_divisor_fp16 == 3.0
+    assert runner._attention_shared_experts() is shared
+
+
+@pytest.mark.parametrize("shared_count", [None, 0, 2])
+@pytest.mark.parametrize("has_local_shared", [False, True])
+def test_factory_rejects_mixed_placement_before_native_construction(
+    monkeypatch, shared_count, has_local_shared
+):
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+    config.additional_config["mix_placement"] = True
+    monkeypatch.setattr(remote_moe.fused_moe, "FusedMoE", _unexpected_local_compute)
+    with pytest.raises(RuntimeError, match="routed-only expert IDs.*mix_placement"):
+        _make_runner(
+            config,
+            device_type="npu",
+            connector="CAMAsyncAFDConnector",
+            compute_gate_on_attention=True,
+            gate=nn.Identity(),
+            num_shared_experts=shared_count,
+            attention_shared_experts=nn.Identity() if has_local_shared else None,
+        )
+    assert not config.compilation_config.static_forward_context
+    assert not config.compilation_config.static_all_moe_layers
+
+
+@pytest.mark.parametrize(
+    "reserved_name",
+    [
+        "quant_config",
+        "shared_experts",
+        "shared_expert_gate",
+        "routed_input_transform",
+        "routed_output_transform",
+        "n_shared_experts",
+        "apply_routed_scale_to_output",
+        "enable_eplb",
+        "num_redundant_experts",
+        "is_sequence_parallel",
+        "tp_size",
+        "dp_size",
+        "pcp_size",
+        "runner_cls",
+        "runner_args",
+        "routed_experts_cls",
+    ],
+)
+def test_factory_rejects_reserved_native_arguments(monkeypatch, reserved_name):
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+    monkeypatch.setattr(remote_moe.fused_moe, "FusedMoE", _unexpected_local_compute)
+    with pytest.raises(
+        ValueError, match=f"factory reserves these arguments: {reserved_name}"
+    ):
+        _make_runner(config, **{reserved_name: None})
+    assert not config.compilation_config.static_forward_context
+    assert not config.compilation_config.static_all_moe_layers
 
 
 @pytest.mark.parametrize(
@@ -524,12 +715,9 @@ def test_runner_selection_is_immutable_and_rejects_unsupported_paths():
             )
 
 
-@pytest.mark.parametrize("mix_placement", [False, True])
 @pytest.mark.parametrize("balanced", [False, True])
 @pytest.mark.parametrize("shared_count", [None, 2])
-def test_cam_runner_uses_native_selector_once(
-    monkeypatch, mix_placement, balanced, shared_count
-):
+def test_cam_runner_uses_native_selector_once(monkeypatch, balanced, shared_count):
     from afd_plugin.model_executor.npu import remote_moe as npu_remote_moe
 
     config = VllmConfig(device_config=DeviceConfig("cpu"))
@@ -548,10 +736,9 @@ def test_cam_runner_uses_native_selector_once(
     def select_experts(**kwargs):
         events.append("select")
         selected.append(kwargs)
-        width = 2 + (kwargs["num_shared_experts"] if mix_placement else 0)
-        weights = torch.full((2, width), 0.25, dtype=torch.float16)
+        weights = torch.full((2, 2), 0.25, dtype=torch.float16)
         weights *= kwargs["routed_scaling_factor"]
-        ids = torch.full((2, width), 3, dtype=torch.int32)
+        ids = torch.full((2, 2), 3, dtype=torch.int32)
         return weights, ids
 
     monkeypatch.setitem(
@@ -564,7 +751,7 @@ def test_cam_runner_uses_native_selector_once(
     )
     gate = Gate()
     gate.weight = torch.nn.Parameter(torch.ones(4, 7))
-    config.additional_config["mix_placement"] = mix_placement
+    config.additional_config["mix_placement"] = False
     monkeypatch.setattr(npu_remote_moe, "validate_remote_moe_config", lambda: None)
     runner = _make_runner(
         config,
@@ -603,17 +790,17 @@ def test_cam_runner_uses_native_selector_once(
         "num_expert_group": 2,
         "custom_routing_function": None,
         "scoring_func": "sigmoid",
-        "routed_scaling_factor": 2.5 if mix_placement else 1.0,
+        "routed_scaling_factor": 1.0,
         "e_score_correction_bias": correction_bias,
-        "mix_placement": mix_placement,
+        "mix_placement": False,
         "num_logical_experts": 4,
         "num_shared_experts": shared_count or 0,
-        "num_experts": 4 + ((shared_count or 0) if mix_placement else 0),
+        "num_experts": 4,
     }
     assert weights.dtype is torch.float32
     torch.testing.assert_close(
         weights,
-        torch.full_like(weights, 0.625 if mix_placement else 0.25),
+        torch.full_like(weights, 0.25),
         rtol=0,
         atol=0,
     )
@@ -885,6 +1072,8 @@ assert namespace['fused_moe'].FusedMoE is patch_fused_moe._ascend_FusedMoE
 runner = namespace['_make_runner'](
     config, device_type='npu', connector={connector!r},
     compute_gate_on_attention={connector == "CAMAsyncAFDConnector"!r},
+    gate=(namespace['nn'].Identity()
+          if {connector == "CAMAsyncAFDConnector"!r} else None),
 )
 assert type(runner).__name__ == {runner_name!r}
 assert type(runner.routed_experts) is namespace['AFDRemoteRoutedExperts']

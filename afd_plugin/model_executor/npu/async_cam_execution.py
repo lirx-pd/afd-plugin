@@ -89,7 +89,9 @@ class CAMAsyncUbatchScheduler(Generic[_Result]):
         self._active = False
         self._abandoned = False
         self._closed = False
+        # Failures are terminal: partially completed CAM transfers cannot be retried.
         self._failed = False
+        self._failure_reason: str | None = None
         self._cancelled = False
         self._remaining = 0
         self._permission: int | None = None
@@ -106,6 +108,15 @@ class CAMAsyncUbatchScheduler(Generic[_Result]):
     def quiescent(self) -> bool:
         with self._condition:
             return self._remaining == 0 and not self._active
+
+    def _check_available(self) -> None:
+        if self._failed:
+            raise RuntimeError(
+                "CAMAsync scheduler is FAILED and cannot be reused: "
+                f"{self._failure_reason}"
+            )
+        if self._active or self._closed:
+            raise RuntimeError("CAMAsync scheduler is active or closed")
 
     def _check_cancelled(self) -> None:
         if self._cancelled or self._closed:
@@ -151,6 +162,8 @@ class CAMAsyncUbatchScheduler(Generic[_Result]):
     def _fail(self, error: BaseException) -> None:
         if self._error is None:
             self._error = error
+            # Retain only text after _clear_run releases the request traceback.
+            self._failure_reason = f"{type(error).__name__}: {error}"
         self._failed = True
         self._cancelled = True
         self._permission = None
@@ -247,34 +260,49 @@ class CAMAsyncUbatchScheduler(Generic[_Result]):
     ) -> tuple[_Result, _Result]:
         if not layer_ids:
             raise ValueError("CAMAsync scheduling requires at least one MoE layer")
+        startup_error: BaseException | None = None
         with self._condition:
-            if self._active or self._closed or self._failed:
-                raise RuntimeError("CAMAsync scheduler is active, closed, or FAILED")
-            self._run_id += 1
-            self._task = task
-            self._activate = activate
-            self._thread_context = thread_context
-            self._executions = [
-                CAMAsyncExecutionContext(
-                    self._run_id, idx, STAGE_COUNT, use_sequence_parallel, self
-                )
-                for idx in range(STAGE_COUNT)
-            ]
-            self._active = True
-            self._remaining = STAGE_COUNT
-            if not self._threads:
-                self._threads = [
-                    Thread(
-                        target=self._worker,
-                        args=(idx,),
-                        name=f"afd-cam-stage-{idx}",
-                        daemon=True,
+            self._check_available()
+            try:
+                if not self._threads:
+                    for idx in range(STAGE_COUNT):
+                        thread = Thread(
+                            target=self._worker,
+                            args=(idx,),
+                            name=f"afd-cam-stage-{idx}",
+                            daemon=True,
+                        )
+                        thread.start()
+                        self._threads.append(thread)
+            except BaseException as error:
+                startup_error = error
+                self._failure_reason = f"{type(error).__name__}: {error}"
+                self._failed = True
+                self._closed = True
+                self._cancelled = True
+                self._condition.notify_all()
+            else:
+                # Publish only when both workers exist; idle workers hold no task.
+                self._run_id += 1
+                self._task = task
+                self._activate = activate
+                self._thread_context = thread_context
+                self._executions = [
+                    CAMAsyncExecutionContext(
+                        self._run_id, idx, STAGE_COUNT, use_sequence_parallel, self
                     )
                     for idx in range(STAGE_COUNT)
                 ]
-                for thread in self._threads:
-                    thread.start()
-            self._condition.notify_all()
+                self._active = True
+                self._remaining = STAGE_COUNT
+                self._condition.notify_all()
+        if startup_error is not None:
+            # A started worker needs the condition lock to observe closure and exit.
+            try:
+                self.shutdown()
+            except RuntimeError as cleanup_error:
+                raise cleanup_error from startup_error
+            raise startup_error
         try:
             first = layer_ids[0]
             self._advance(0, first, CAMAsyncPhase.ROUTED)
@@ -315,7 +343,7 @@ class CAMAsyncUbatchScheduler(Generic[_Result]):
                     self._abandoned = True
                     raise RuntimeError(
                         "CAMAsync worker is still executing; process cleanup required"
-                    )
+                    ) from self._error
 
     def _clear_run(self) -> None:
         # Called under the condition lock only after both task frames are released.
@@ -335,8 +363,7 @@ class CAMAsyncUbatchScheduler(Generic[_Result]):
         self, *, use_sequence_parallel: bool
     ) -> Iterator[CAMAsyncExecutionContext]:
         with self._condition:
-            if self._active or self._closed or self._failed:
-                raise RuntimeError("CAMAsync scheduler is active, closed, or FAILED")
+            self._check_available()
             self._active = True
             self._run_id += 1
             execution = CAMAsyncExecutionContext(
@@ -348,8 +375,9 @@ class CAMAsyncUbatchScheduler(Generic[_Result]):
             )
         try:
             yield execution
-        except BaseException:
+        except BaseException as error:
             with self._condition:
+                self._failure_reason = f"{type(error).__name__}: {error}"
                 self._failed = True
             raise
         finally:

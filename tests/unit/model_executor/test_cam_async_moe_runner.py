@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 import sys
 from types import SimpleNamespace
 
@@ -65,10 +66,9 @@ def _context(connector, execution):
     )
 
 
-def _make_moe(monkeypatch, events, *, dtype, mix_placement=False, shared=True):
+def _make_moe(monkeypatch, events, *, dtype, shared=True):
     config = VllmConfig(device_config=DeviceConfig("cpu"))
     config.additional_config.update(
-        mix_placement=mix_placement,
         afd={
             "role": "attention",
             "connector": "CAMAsyncAFDConnector",
@@ -136,17 +136,9 @@ def _selector(monkeypatch, events):
         assert kwargs["num_logical_experts"] == 4
         weights = torch.tensor([0.2, 0.3], dtype=torch.float32)
         ids = torch.tensor([1, 3], dtype=torch.int32)
-        if kwargs["mix_placement"]:
-            assert kwargs["num_experts"] == 6
-            weights = torch.cat(
-                (weights * ROUTED_SCALE, torch.full((2,), 1.0 / ROUTED_SCALE))
-            )
-            ids = torch.cat((ids, torch.tensor([4, 5], dtype=torch.int32)))
-        else:
-            assert kwargs["num_experts"] == 4
-        assert kwargs["routed_scaling_factor"] == (
-            ROUTED_SCALE if kwargs["mix_placement"] else 1.0
-        )
+        assert kwargs["mix_placement"] is False
+        assert kwargs["num_experts"] == 4
+        assert kwargs["routed_scaling_factor"] == 1.0
         return weights.repeat(len(hidden), 1), ids.repeat(len(hidden), 1)
 
     monkeypatch.setitem(
@@ -158,20 +150,16 @@ def _selector(monkeypatch, events):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
-@pytest.mark.parametrize(
-    "mix_placement,shared", [(False, False), (False, True), (True, False)]
-)
+@pytest.mark.parametrize("shared", [False, True])
 @pytest.mark.parametrize(
     "tp_size,tp_rank,use_sp",
     [(1, 0, False), (2, 0, False), (2, 1, False), (2, 1, True)],
 )
 def test_complete_forward_preserves_numeric_and_layout_contract(
-    monkeypatch, dtype, mix_placement, shared, tp_size, tp_rank, use_sp
+    monkeypatch, dtype, shared, tp_size, tp_rank, use_sp
 ):
     events: list[str] = []
-    moe = _make_moe(
-        monkeypatch, events, dtype=dtype, mix_placement=mix_placement, shared=shared
-    )
+    moe = _make_moe(monkeypatch, events, dtype=dtype, shared=shared)
     _selector(monkeypatch, events)
     monkeypatch.setattr(
         async_cam_layout,
@@ -181,8 +169,8 @@ def test_complete_forward_preserves_numeric_and_layout_contract(
     hidden = torch.arange(1, 36, dtype=dtype).reshape(5, 7) / 7
     sent = []
     coefficient = 0.2 * 2 + 0.3 * 4
-    if mix_placement:
-        coefficient = coefficient * ROUTED_SCALE + (5 + 6) / ROUTED_SCALE
+    # Characterize the existing AFD dtype contract. FP16 without shared skips
+    # routed scaling here, unlike native MoERunner; this is not native parity.
     # V2 FFN currently leaves routed_scale_applied_in_topk at its default False.
     ffn_scale = ROUTED_SCALE if dtype != torch.float16 else 1.0
     routed_output = (hidden.float() * (coefficient * ffn_scale)).to(dtype)
@@ -323,47 +311,101 @@ def test_forward_requires_execution_context_and_rejects_input_ids(monkeypatch):
     assert events == []
 
 
-@pytest.mark.parametrize("mix_placement", [False, True])
-def test_real_native_selector_preserves_nonunit_weights(monkeypatch, mix_placement):
+@pytest.mark.ascend_runtime
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_native_selector_and_ffn_match_independent_reference(
+    monkeypatch, fused, shared, dtype
+):
+    """Check non-FP16 math through real selector/FFN Python paths."""
     selector = pytest.importorskip("vllm_ascend.ops.fused_moe.experts_selector")
+    from vllm_ascend.ops.fused_moe import moe_mlp
+    from vllm_ascend.quantization.quant_type import QuantType
+
+    from afd_plugin.model_executor.models import deepseek_v2
+
     events: list[str] = []
-    moe = _make_moe(
-        monkeypatch,
-        events,
-        dtype=torch.float32,
-        mix_placement=mix_placement,
-        shared=False,
-    )
-    native_select = selector.select_experts
-    calls = []
-
-    def select(**kwargs):
-        calls.append(kwargs)
-        return native_select(**kwargs)
-
-    monkeypatch.setattr(selector, "select_experts", select)
-    monkeypatch.setattr(selector, "check_npu_moe_gating_top_k", lambda **_: False)
+    moe = _make_moe(monkeypatch, events, dtype=dtype, shared=shared)
+    monkeypatch.setattr(selector, "check_npu_moe_gating_top_k", lambda **_: fused)
     monkeypatch.setattr(cam_moe, "force_balanced_topk_ids_enabled", lambda: False)
-    hidden = torch.tensor([[0.3, 2.0, -1.2, 0.8, 3.0, 1.0, 4.0]])
-    weights, ids, logits = moe.experts._route_native(hidden)
-    expected_weights, expected_ids = torch.softmax(hidden[:, :4], dim=-1).topk(2)
-    expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
-    if mix_placement:
-        # The pinned native fallback scales in both _native_select_experts and
-        # select_experts. Preserve that pre-existing behavior in this refactor.
-        expected_weights = torch.cat(
-            (
-                expected_weights * ROUTED_SCALE**2,
-                torch.full((1, 2), 1.0 / ROUTED_SCALE),
-            ),
-            dim=-1,
+    monkeypatch.setattr(
+        async_cam_layout,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=1, rank_in_group=0),
+    )
+    monkeypatch.setattr(
+        deepseek_v2.native, "current_platform", SimpleNamespace(device_type="npu")
+    )
+    kernel_calls = []
+
+    def gating_kernel(logits, *, k, renorm, routed_scaling_factor, **kwargs):
+        kernel_calls.append("gate")
+        assert routed_scaling_factor == 1.0
+        weights, ids = logits.softmax(dim=-1).topk(k)
+        if renorm:
+            weights /= weights.sum(dim=-1, keepdim=True)
+        return weights * routed_scaling_factor, ids.to(torch.int32), None
+
+    monkeypatch.setattr(selector.DeviceOperator, "moe_gating_top_k", gating_kernel)
+    hidden = torch.tensor([[0.0, 1.0, 2.0, 3.0, 0.5, 1.5, 2.5]], dtype=dtype)
+    experts = SimpleNamespace(
+        quant_type=QuantType.NONE,
+        moe_config=SimpleNamespace(has_bias=False),
+        get_eplb_parameter=lambda _: torch.empty(0),
+        _shared_experts=None,
+        activation="silu",
+        dynamic_eplb=False,
+    )
+    ffn_layer = SimpleNamespace(
+        compute_gate_on_attention=True,
+        is_moe_layer=True,
+        mlp=SimpleNamespace(experts=experts, routed_scaling_factor=ROUTED_SCALE),
+    )
+    pending = []
+
+    def send(payload, transfer, **kwargs):
+        weights, ids = kwargs["topk_weights"], kwargs["topk_ids"]
+        assert weights.shape == ids.shape == (1, 2)
+        assert ids.tolist() == [[3, 2]]
+        pending.append((weights, ids))
+
+    def mlp_kernel(*, mlp_compute_input):
+        kernel_calls.append("mlp")
+        # Expert i is the independent linear function E_i(x) = (i + 1) * x.
+        ids = pending[0][1]
+        return mlp_compute_input.hidden_states * (ids + 1).reshape(-1, 1), None
+
+    monkeypatch.setattr(moe_mlp, "unified_apply_mlp", mlp_kernel)
+
+    def receive(*, ref_tensor, ubatch_idx):
+        weights, _ = pending[0]
+        payload = deepseek_v2.AFDDeepseekV2DecoderLayer.compute_ffn_output(
+            ffn_layer,
+            ref_tensor.repeat_interleave(2, dim=0),
+            group_list=torch.tensor([0, 0, 1, 2]),
         )
-        expected_ids = torch.cat((expected_ids, torch.tensor([[4, 5]])), dim=-1)
-    torch.testing.assert_close(weights, expected_weights)
-    assert torch.equal(ids, expected_ids.to(ids.dtype))
-    assert torch.equal(logits, hidden[:, :4])
-    assert events == ["gate"]
-    assert len(calls) == 1
+        assert payload.shared_output is None
+        return (
+            (payload.routed_output * weights.reshape(-1, 1))
+            .sum(dim=0, keepdim=True)
+            .to(dtype)
+        )
+
+    connector = SimpleNamespace(send_attn_output=send, recv_ffn_output=receive)
+    execution = CAMAsyncExecutionContext(0, 0, 1, False)
+    with override_forward_context(_context(connector, execution)):
+        actual = moe(hidden)
+
+    # Logits [0, 1, 2, 3] select experts 3 and 2 with renormalized weights.
+    # Derive the answer without reading selector output or its scale arguments.
+    high_weight = math.exp(3) / (math.exp(3) + math.exp(2))
+    expected = hidden.float() * (4 * high_weight + 3 * (1 - high_weight)) * ROUTED_SCALE
+    if shared:
+        expected += hidden.float() * float(moe.shared_experts.weight.detach())
+    torch.testing.assert_close(actual, expected.to(dtype))
+    assert kernel_calls == (["gate"] if fused else []) + ["mlp"]
+    assert events == ["native", "gate"] + (["shared"] if shared else [])
 
 
 @pytest.mark.parametrize("failure", ["gate", "select", "dispatch", "shared", "combine"])

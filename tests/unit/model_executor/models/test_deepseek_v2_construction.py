@@ -416,7 +416,6 @@ def test_attention_moe_type_is_shared_by_all_connectors(
         assert list(moe.mlp.parameters()) == []
     if connector == "CAMAsyncAFDConnector":
         assert remote_factory.calls[0]["runner_args"] == {
-            "vllm_config": config,
             "num_shared_experts": moe.mlp.n_shared_experts,
             "attention_shared_experts": moe.mlp.shared_experts,
             "shared_output_divisor_fp16": (

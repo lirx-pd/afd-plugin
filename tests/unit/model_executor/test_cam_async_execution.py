@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 import weakref
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -276,7 +276,7 @@ def test_cancellation_wakes_waiters_without_granting_permission(scheduler, stop_
         scheduler.shutdown(timeout=TEST_WAIT_SECONDS)
         scheduler.shutdown(timeout=TEST_WAIT_SECONDS)
         assert all(not thread.is_alive() for thread in scheduler._threads)
-        with pytest.raises(RuntimeError, match="closed"):
+        with pytest.raises(RuntimeError, match="FAILED.*cancelled"):
             scheduler.run(task, [FIRST_LAYER_ID])
     finally:
         release_stage_one.set()
@@ -647,7 +647,7 @@ def test_single_stage_cancellation_prevents_dispatch_and_waits_for_exit(
         scheduler.shutdown(timeout=TEST_WAIT_SECONDS)
         scheduler.shutdown(timeout=TEST_WAIT_SECONDS)
         with (
-            pytest.raises(RuntimeError, match="closed"),
+            pytest.raises(RuntimeError, match="FAILED.*cancelled"),
             scheduler.single_stage(use_sequence_parallel=False),
         ):
             pytest.fail("closed scheduler accepted single stage")
@@ -685,6 +685,8 @@ def test_late_worker_exit_releases_abandoned_run_before_shutdown():
         assert len(errors) == 1
         assert isinstance(errors[0], RuntimeError)
         assert "process cleanup required" in str(errors[0])
+        assert isinstance(errors[0].__cause__, TimeoutError)
+        assert errors[0].__cause__ is scheduler._error
         assert not scheduler.quiescent
         with pytest.raises(RuntimeError, match="active|FAILED"):
             scheduler.run(task, [FIRST_LAYER_ID])
@@ -707,3 +709,133 @@ def test_late_worker_exit_releases_abandoned_run_before_shutdown():
         release.set()
         controller.join(TEST_WAIT_SECONDS)
         scheduler.shutdown(timeout=TEST_WAIT_SECONDS)
+
+
+@pytest.mark.parametrize("failed_start", [1, 2])
+def test_thread_start_failure_is_terminal_without_publishing_task(
+    scheduler, monkeypatch, failed_start
+):
+    error = RuntimeError("can't start new thread")
+    original_start = threading.Thread.start
+    attempted: list[threading.Thread] = []
+    task_calls = []
+
+    def fail_start(thread):
+        attempted.append(thread)
+        assert scheduler._task is None
+        assert scheduler._executions == []
+        assert scheduler._remaining == 0
+        if len(attempted) == failed_start:
+            raise error
+        original_start(thread)
+
+    def task(execution):
+        task_calls.append(execution.stage_idx)
+        return execution.stage_idx
+
+    @contextmanager
+    def thread_context():
+        pytest.fail("failed startup entered the task context")
+        yield
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    with pytest.raises(RuntimeError) as caught:
+        scheduler.run(
+            task,
+            [FIRST_LAYER_ID],
+            activate=lambda execution: None,
+            thread_context=thread_context,
+        )
+    assert caught.value is error
+    assert task_calls == []
+    assert len(attempted) == failed_start
+    assert scheduler._run_id == 0
+    assert scheduler._thread_context is nullcontext
+    assert len(scheduler._threads) == failed_start - 1
+    assert all(not thread.is_alive() for thread in attempted)
+    assert scheduler.quiescent
+    assert scheduler._failed
+    assert scheduler._closed
+    assert scheduler._remaining == 0
+    assert scheduler._task is None
+    assert scheduler._activate is None
+    assert scheduler._executions == []
+    assert scheduler._events == [None, None]
+    assert scheduler._results == [None, None]
+    assert scheduler._error is None
+    scheduler.shutdown(timeout=TEST_WAIT_SECONDS)
+    scheduler.shutdown(timeout=TEST_WAIT_SECONDS)
+    with pytest.raises(RuntimeError, match="closed|FAILED"):
+        scheduler.run(task, [FIRST_LAYER_ID])
+    with (
+        pytest.raises(RuntimeError, match="closed|FAILED"),
+        scheduler.single_stage(use_sequence_parallel=False),
+    ):
+        pytest.fail("failed startup admitted a single-stage forward")
+
+
+@pytest.mark.parametrize("failed_start", [1, 2])
+def test_startup_cleanup_failure_preserves_startup_cause(
+    scheduler, monkeypatch, failed_start
+):
+    startup_error = RuntimeError("can't start new thread")
+    cleanup_error = RuntimeError("CAMAsync worker did not stop")
+    original_start = threading.Thread.start
+    starts = 0
+
+    def fail_start(thread):
+        nonlocal starts
+        starts += 1
+        if starts == failed_start:
+            raise startup_error
+        original_start(thread)
+
+    def fail_shutdown():
+        raise cleanup_error
+
+    with monkeypatch.context() as patch:
+        patch.setattr(threading.Thread, "start", fail_start)
+        patch.setattr(scheduler, "shutdown", fail_shutdown)
+        with pytest.raises(RuntimeError) as caught:
+            scheduler.run(lambda execution: execution.stage_idx, [FIRST_LAYER_ID])
+        assert caught.value is cleanup_error
+        assert caught.value.__cause__ is startup_error
+    scheduler.shutdown(timeout=TEST_WAIT_SECONDS)
+    assert scheduler.quiescent
+    assert all(not worker.is_alive() for worker in scheduler._threads)
+
+
+@pytest.mark.parametrize("single_stage", [False, True])
+def test_failed_scheduler_keeps_reason_without_retaining_request(
+    scheduler, single_stage
+):
+    class Payload:
+        pass
+
+    payload_refs = []
+
+    def fail(execution):
+        payload = Payload()
+        payload_refs.append(weakref.ref(payload))
+        raise ValueError("request failed after dispatch")
+
+    with pytest.raises(ValueError, match="request failed after dispatch"):
+        if single_stage:
+            with scheduler.single_stage(use_sequence_parallel=False) as execution:
+                fail(execution)
+        else:
+            scheduler.run(fail, [FIRST_LAYER_ID])
+    assert scheduler.quiescent
+    assert scheduler._error is None
+    gc.collect()
+    assert payload_refs
+    assert all(reference() is None for reference in payload_refs)
+
+    reason = "FAILED.*ValueError: request failed after dispatch"
+    with pytest.raises(RuntimeError, match=reason):
+        scheduler.run(fail, [FIRST_LAYER_ID])
+    with (
+        pytest.raises(RuntimeError, match=reason),
+        scheduler.single_stage(use_sequence_parallel=False),
+    ):
+        pytest.fail("failed scheduler accepted single stage")

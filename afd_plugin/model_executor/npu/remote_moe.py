@@ -5,7 +5,6 @@
 import weakref
 
 import torch
-from vllm.config import VllmConfig
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.router.base_router import FusedMoERouter
@@ -61,7 +60,6 @@ class AFDCAMAsyncMoERunner(AFDRemoteMoERunnerBase):
         routed_output_transform: torch.nn.Module | None = None,
         routed_scaling_factor: float = 1.0,
         *,
-        vllm_config: VllmConfig,
         num_shared_experts: int | None,
         attention_shared_experts: torch.nn.Module | None = None,
         shared_output_divisor_fp16: float = 1.0,
@@ -78,9 +76,6 @@ class AFDCAMAsyncMoERunner(AFDRemoteMoERunnerBase):
             routed_input_transform=routed_input_transform,
             routed_output_transform=routed_output_transform,
             routed_scaling_factor=routed_scaling_factor,
-        )
-        self.mix_placement = bool(
-            vllm_config.additional_config.get("mix_placement", False)
         )
         self.num_shared_experts = num_shared_experts or 0
         # The outer MoE owns canonical shared weight names and their lifetime.
@@ -100,11 +95,8 @@ class AFDCAMAsyncMoERunner(AFDRemoteMoERunnerBase):
         assert self.gate is not None
         router_logits, _ = self.gate(hidden_states)
         experts = self.routed_experts
-        num_experts = experts.global_num_experts
-        if self.mix_placement:
-            num_experts += self.num_shared_experts
-        # Preserve the existing selector scaling placement; FFN/combine owns
-        # the remaining math. Never run generic MoERunner post-processing.
+        # CAM transports routed-only IDs. Shared experts stay on Attention;
+        # FFN owns routed scaling, so both native selector paths use unit scale.
         topk_weights, topk_ids = select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -115,14 +107,12 @@ class AFDCAMAsyncMoERunner(AFDRemoteMoERunnerBase):
             num_expert_group=experts.num_expert_group,
             custom_routing_function=experts.custom_routing_function,
             scoring_func=experts.scoring_func,
-            routed_scaling_factor=(
-                self.routed_scaling_factor if self.mix_placement else 1.0
-            ),
+            routed_scaling_factor=1.0,
             e_score_correction_bias=experts.e_score_correction_bias,
-            mix_placement=self.mix_placement,
+            mix_placement=False,
             num_logical_experts=router_logits.shape[1],
             num_shared_experts=self.num_shared_experts,
-            num_experts=num_experts,
+            num_experts=experts.global_num_experts,
         )
         if force_balanced_topk_ids_enabled():
             balanced_topk_ids = torch.arange(

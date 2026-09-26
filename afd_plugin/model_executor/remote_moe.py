@@ -3,6 +3,7 @@
 """Native MoE construction and runners for Attention-to-FFN handoff."""
 
 import importlib
+import math
 from abc import abstractmethod
 from types import MappingProxyType
 from typing import Any
@@ -124,6 +125,25 @@ def build_attention_moe_runner(
         raise RuntimeError(
             "Remote MoE does not support Attention-local routed_experts capture",
         )
+    if afd_config.connector == AFD_ASYNC_CONNECTOR:
+        if vllm_config.additional_config.get("mix_placement", False):
+            raise RuntimeError(
+                "Async CAM uses routed-only expert IDs "
+                "and does not support mix_placement"
+            )
+        if gate is None:
+            raise ValueError("CAMAsync remote MoE requires an Attention gate")
+    elif attention_shared_experts is not None:
+        raise ValueError("attention_shared_experts requires CAMAsync remote MoE")
+    if attention_shared_experts is not None and (
+        not math.isfinite(shared_output_divisor_fp16) or shared_output_divisor_fp16 <= 0
+    ):
+        raise ValueError(
+            "shared_output_divisor_fp16 must be finite and positive "
+            "when attention_shared_experts is provided"
+        )
+    if not math.isfinite(moe_kwargs.get("routed_scaling_factor", 1.0)):
+        raise ValueError("routed_scaling_factor must be finite")
     if device_type == "npu":
         from afd_plugin.model_executor.npu.remote_moe import (
             validate_remote_moe_config,
@@ -136,7 +156,6 @@ def build_attention_moe_runner(
     runner_args = None
     if afd_config.connector == AFD_ASYNC_CONNECTOR:
         runner_args = {
-            "vllm_config": vllm_config,
             "num_shared_experts": num_shared_experts,
             "attention_shared_experts": attention_shared_experts,
             "shared_output_divisor_fp16": shared_output_divisor_fp16,
@@ -145,10 +164,8 @@ def build_attention_moe_runner(
         # Synchronous routing belongs to the model's outer gate or the FFN role.
         gate = None
 
-    # Resolve the live package factory so Ascend's platform patch is honored.
     # Unit dimensions describe a non-computing container, not FFN topology.
-    return fused_moe.FusedMoE(
-        **moe_kwargs,
+    factory_kwargs = dict(
         quant_config=None,
         gate=gate,
         shared_experts=None,
@@ -167,6 +184,14 @@ def build_attention_moe_runner(
         runner_args=runner_args,
         routed_experts_cls=AFDRemoteRoutedExperts,
     )
+    reserved = moe_kwargs.keys() & factory_kwargs.keys()
+    if reserved:
+        raise ValueError(
+            "Attention remote MoE factory reserves these arguments: "
+            + ", ".join(sorted(reserved))
+        )
+    # Resolve the live package factory so Ascend's platform patch is honored.
+    return fused_moe.FusedMoE(**moe_kwargs, **factory_kwargs)
 
 
 class AFDRemoteMoERunnerBase(MoERunner):

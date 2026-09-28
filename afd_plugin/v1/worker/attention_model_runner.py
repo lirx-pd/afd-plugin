@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any
 
@@ -54,6 +55,7 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
     """Attention model runner that injects AFD metadata into forward context."""
 
     afd_expected_role = "attention"
+    model: Callable[..., Any]
 
     def __init__(
         self,
@@ -255,7 +257,7 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
         )
         kwargs: dict[str, Any] = {}
 
-        # determin if ubatch should be activated.
+        # determine if ubatch should be activated.
         # 1. For dp = 1, vLLM hardcodes `should_ubatch=False`.
         # This is the extra support for dp = 1
         if self.vllm_config.parallel_config.data_parallel_size == 1:
@@ -358,6 +360,23 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
             return super().execute_model(scheduler_output, intermediate_tensors)
         finally:
             self._afd_is_graph_replaying = previous_is_graph_replaying
+
+    # Patch reason: DBO profiling only warms FFN microbatch-sized workspaces.
+    # Patch functionality: also profile the full token budget before graph capture.
+    # Signature: matches upstream; no added parameters.
+    def profile_run(self) -> None:
+        super().profile_run()
+        # ### PATCH START: warm the unsplit FFN workspace
+        if self.parallel_config.use_ubatching:
+            # FFN runs stages sequentially in one workspace. A larger unsplit
+            # prefill must not resize buffers already referenced by CUDA graphs.
+            self._dummy_run(
+                self.max_num_tokens,
+                allow_microbatching=False,
+                is_profile=True,
+            )
+            self._sync_device()
+        # ### PATCH END: warm the unsplit FFN workspace
 
     def _dummy_run(
         self,

@@ -367,7 +367,7 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
     def profile_run(self) -> None:
         super().profile_run()
         # ### PATCH START: warm the unsplit FFN workspace
-        if self.parallel_config.use_ubatching:
+        if self.afd_cudagraph_policy.allow_cuda_graph_with_ubatching:
             # FFN runs stages sequentially in one workspace. A larger unsplit
             # prefill must not resize buffers already referenced by CUDA graphs.
             self._dummy_run(

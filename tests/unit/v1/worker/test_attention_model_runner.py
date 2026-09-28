@@ -28,6 +28,7 @@ from afd_plugin.v1.worker.attention_model_runner import (
     fail_if_cuda_graph_enabled,
     fail_if_unsupported_ubatching,
 )
+from afd_plugin.v1.worker.cuda_graph import validate_cuda_graph_mode
 from afd_plugin.v1.worker.ubatch_wrapper import (
     AFDUBatchWrapper,
     build_ubatch_additional_kwargs,
@@ -717,11 +718,24 @@ def test_attention_runner_inherits_native_dummy_run_microbatching():
 
 
 @pytest.mark.parametrize("use_ubatching", [False, True])
+@pytest.mark.parametrize("enforce_eager", [False, True])
 def test_attention_profile_preserves_native_and_warms_unsplit_dbo(
-    monkeypatch, use_ubatching
+    monkeypatch, use_ubatching, enforce_eager
 ):
     runner = object.__new__(AFDAttentionModelRunner)
-    runner.parallel_config = _parallel_config(use_ubatching=use_ubatching)
+    runner.parallel_config = _parallel_config(
+        use_ubatching=use_ubatching, num_ubatches=2 if use_ubatching else 1
+    )
+    runner.afd_cudagraph_policy = validate_cuda_graph_mode(
+        SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=enforce_eager),
+            compilation_config=SimpleNamespace(
+                cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
+            ),
+            parallel_config=runner.parallel_config,
+        ),
+        role="attention",
+    )
     runner.max_num_tokens = 8192
     calls: list[str] = []
 
@@ -740,7 +754,11 @@ def test_attention_profile_preserves_native_and_warms_unsplit_dbo(
 
     runner.profile_run()
 
-    assert calls == (["native", "dummy", "sync"] if use_ubatching else ["native"])
+    assert calls == (
+        ["native", "dummy", "sync"]
+        if use_ubatching and not enforce_eager
+        else ["native"]
+    )
 
 
 def test_attention_runner_steps_gpu_profiler(monkeypatch):

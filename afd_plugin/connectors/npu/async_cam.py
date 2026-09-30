@@ -65,6 +65,7 @@ from afd_plugin.distributed import (
 if TYPE_CHECKING:
     from torch.distributed.distributed_c10d import ProcessGroup
     from vllm.config import VllmConfig
+    from vllm.model_executor.layers.fused_moe import FusedMoERouter
 
 AFD_ASYNC_CAM_GROUP_NAME = "afd_async_cam"
 CAM_COMM_ID = 0
@@ -103,29 +104,31 @@ def select_cam_experts(
     num_logical_experts: int,
     num_shared_experts: int,
     num_experts: int,
+    router: FusedMoERouter | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Select routed-only CAM experts using Ascend's native router policy."""
-    from vllm_ascend.ops.fused_moe.router.router_factory import (
-        create_ascend_fused_moe_router,
-    )
-
     if mix_placement:
         raise RuntimeError(
             "Async CAM uses routed-only expert IDs and does not support mix_placement"
         )
     # No EPLB state or fused shared experts: CAM dispatch consumes logical
     # routed IDs. Ascend owns fused/fallback selection and weight scaling.
-    router = create_ascend_fused_moe_router(
-        top_k=top_k,
-        global_num_experts=router_logits.shape[-1],
-        num_expert_group=num_expert_group,
-        topk_group=topk_group,
-        use_grouped_topk=use_grouped_topk,
-        renormalize=renormalize,
-        scoring_func=scoring_func,
-        routed_scaling_factor=routed_scaling_factor,
-        e_score_correction_bias=e_score_correction_bias,
-    )
+    if router is None:
+        from vllm_ascend.ops.fused_moe.router.router_factory import (
+            create_ascend_fused_moe_router,
+        )
+
+        router = create_ascend_fused_moe_router(
+            top_k=top_k,
+            global_num_experts=router_logits.shape[-1],
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            use_grouped_topk=use_grouped_topk,
+            renormalize=renormalize,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
+        )
     topk_weights, topk_ids = router.select_experts(
         hidden_states,
         router_logits,

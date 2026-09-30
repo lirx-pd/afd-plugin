@@ -19,7 +19,6 @@ from vllm.config import ParallelConfig, VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers import fused_moe
-from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models import deepseek_v2 as native
 
 from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
@@ -229,11 +228,10 @@ class GateOnlyRemoteMoE(RemoteFFNProxy):
             )
             else None
         )
-        self.gate = ReplicatedLinear(
+        self.gate = native.GateLinear(
             config.hidden_size,
             config.n_routed_experts,
-            bias=False,
-            quant_config=None,
+            out_dtype=native._get_moe_router_dtype(config),
             prefix=f"{prefix}.gate",
         )
         if getattr(config, "topk_method", None) == "noaux_tc":
@@ -242,6 +240,17 @@ class GateOnlyRemoteMoE(RemoteFFNProxy):
             )
         else:
             self.gate.e_score_correction_bias = None
+
+        from afd_plugin.model_executor.models.npu.deepseek_v2_attention_gate import (
+            create_gate_router,
+        )
+
+        self.cam_router = create_gate_router(
+            gate=self.gate,
+            vllm_config=vllm_config,
+            config=config,
+            top_k=self.top_k,
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         from afd_plugin.model_executor.models.npu import (
@@ -255,6 +264,7 @@ class GateOnlyRemoteMoE(RemoteFFNProxy):
                 config=self.config,
                 top_k=self.top_k,
                 hidden_states=hidden_states,
+                cam_router=self.cam_router,
             )
         )
         return self._send_and_receive(

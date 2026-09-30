@@ -51,6 +51,13 @@ def _stage_type(kind: str):
 
 @pytest.fixture
 def construction_env(monkeypatch):
+    from afd_plugin.model_executor.models.npu import deepseek_v2_attention_gate
+
+    monkeypatch.setattr(
+        deepseek_v2_attention_gate,
+        "create_gate_router",
+        lambda **kwargs: SimpleNamespace(gate=kwargs["gate"]),
+    )
     calls: dict[str, list[str]] = {
         "attention": [],
         "dense": [],
@@ -64,7 +71,7 @@ def construction_env(monkeypatch):
         # vLLM 0.30 resolves MoE layers with isinstance() (e.g.
         # is_model_fused_shared_expert_compatible), so the native stand-ins
         # must be real classes, not callable factories.
-        class _BoundStage(stage_type):
+        class _BoundStage(stage_type):  # type: ignore[valid-type,misc]
             def __init__(self, *args, **kwargs):
                 super().__init__(calls, *args, **kwargs)
 
@@ -85,7 +92,7 @@ def construction_env(monkeypatch):
     )
     monkeypatch.setattr(adapter.native, "DeepseekV2MLP", bind(dense_type))
     monkeypatch.setattr(adapter.native, "DeepseekV2MoE", bind(moe_type))
-    monkeypatch.setattr(adapter, "ReplicatedLinear", bind(gate_type))
+    monkeypatch.setattr(adapter.native, "GateLinear", bind(gate_type))
     monkeypatch.setattr(adapter.native, "RMSNorm", bind(norm_type))
     monkeypatch.setattr(
         adapter.native,
@@ -267,6 +274,58 @@ def test_attention_gate_keeps_dense_local_and_gate_at_mlp_path(
     assert "mlp.gate.e_score_correction_bias" in _parameter_names(moe)
     assert not any("experts" in name for name in _parameter_names(moe))
     assert not isinstance(dense.mlp, adapter.RemoteFFNProxy)
+
+
+def test_npu_gate_only_uses_native_gate_precision_and_checkpoint_name(
+    monkeypatch,
+    construction_env,
+):
+    gate_calls = []
+
+    class _FakeGate(nn.Module):
+        def __init__(self, input_size, output_size, **kwargs):
+            super().__init__()
+            gate_calls.append((input_size, output_size, kwargs))
+            self.weight = nn.Parameter(
+                torch.empty(output_size, input_size, dtype=torch.float32),
+            )
+
+    monkeypatch.setattr(adapter.native, "GateLinear", _FakeGate)
+    vllm_config = _vllm_config()
+    vllm_config.model_config.hf_config.moe_router_dtype = "float32"
+
+    layer = _make_layer(
+        monkeypatch,
+        role="attention",
+        layer_idx=1,
+        attention_gate=True,
+        vllm_config=vllm_config,
+    )
+
+    gate = layer.mlp.gate
+    assert layer.mlp.gate_router.gate is gate
+    assert gate_calls == [
+        (
+            8,
+            4,
+            {
+                "out_dtype": torch.float32,
+                "prefix": "model.layers.1.mlp.gate",
+            },
+        ),
+    ]
+    assert construction_env["gate"] == []
+    assert gate.weight.dtype == torch.float32
+    assert "mlp.gate.weight" in _parameter_names(layer)
+
+    checkpoint_weight = torch.ones_like(gate.weight, dtype=torch.bfloat16)
+    result = layer.load_state_dict(
+        {"mlp.gate.weight": checkpoint_weight},
+        strict=False,
+    )
+    assert "mlp.gate.weight" not in result.unexpected_keys
+    assert gate.weight.dtype == torch.float32
+    assert torch.equal(gate.weight, checkpoint_weight.float())
 
 
 def test_cuda_attention_gate_uses_native_gate_contract(

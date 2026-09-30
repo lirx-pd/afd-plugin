@@ -7,9 +7,12 @@ import ast
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
+
+if TYPE_CHECKING:
+    from torch import Tensor
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
@@ -654,7 +657,7 @@ def test_deepseek_afd_ffn_path_reuses_ascend_moe_mlp_after_attention_gate():
     assert "fusion=use_gmmswigluquant_fusion" in compute_moe
     assert "_compute_w8a8_shared_experts_from_int8(" in compute_moe
     assert "shared_input.dtype == torch.int8" in compute_moe
-    assert 'getattr(layer.mlp, "swiglu_limit", None)' in compute_moe
+    assert "swiglu_limit=moe_config.swiglu_limit" in compute_moe
     assert "fusion=False" not in compute_moe
     assert "output_dtype=torch.int32" in gate_source
     assert "npu_dequant_swiglu_quant(" in gate_source
@@ -687,7 +690,7 @@ def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
 
-    routed_calls = []
+    routed_calls: list[Tensor] = []
 
     def fake_apply_moe_mlp(*, mlp_compute_input, quant_method):
         assert mlp_compute_input.quant.quant_type == FakeQuantType.W8A8
@@ -780,6 +783,13 @@ def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
     )
     experts = SimpleNamespace(
         quant_type=FakeQuantType.W8A8,
+        moe_config=SimpleNamespace(
+            swiglu_limit=None,
+            swiglu_alpha=None,
+            swiglu_beta=None,
+            activation_situ_beta=None,
+            activation_situ_linear_beta=None,
+        ),
         shared_experts=SimpleNamespace(_layer=shared_experts),
         routed_experts=routed_experts,
     )

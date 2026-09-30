@@ -714,6 +714,106 @@ def test_async_send_ffn_work_item_output_notifies_empty_rank(
     ]
 
 
+def test_async_select_experts_uses_native_router_factory(monkeypatch):
+    router_module = pytest.importorskip(
+        "vllm_ascend.ops.fused_moe.router.router_factory"
+    )
+    connector = CAMAsyncAFDConnector(
+        0,
+        0,
+        _vllm_config(),
+        _afd_config(role="attention"),
+        0,
+    )
+    router_logits = torch.tensor(
+        [
+            [1.0, 1.0 + 1e-7, 0.0, -1.0, 0.0, -1.0, -2.0, -3.0],
+            [-1.0, -2.0, -3.0, -4.0, 1.0, 1.0 - 1e-7, 0.0, -1.0],
+        ],
+    )
+    correction_bias = torch.tensor(
+        [-1e-7, 1e-7, 0.0, 0.0, 1e-7, -1e-7, 0.0, 0.0],
+    )
+    captured = {}
+
+    class NativeRouterStub:
+        def select_experts(
+            self,
+            hidden_states,
+            logits,
+            *,
+            topk_indices_dtype,
+        ):
+            captured["hidden_states"] = hidden_states
+            captured["router_logits"] = logits
+            captured["topk_indices_dtype"] = topk_indices_dtype
+            return (
+                torch.tensor([[1.5, 0.5], [0.25, 1.75]]),
+                torch.tensor([[0, 4], [3, 7]], dtype=topk_indices_dtype),
+            )
+
+    def create_router(**kwargs):
+        captured["factory_kwargs"] = kwargs
+        return NativeRouterStub()
+
+    monkeypatch.setattr(
+        router_module,
+        "create_ascend_fused_moe_router",
+        create_router,
+    )
+    router_options = dict(
+        router_logits=router_logits,
+        top_k=2,
+        use_grouped_topk=True,
+        renormalize=True,
+        scoring_func="softmax",
+        num_expert_group=4,
+        topk_group=2,
+        routed_scaling_factor=2.0,
+        e_score_correction_bias=correction_bias,
+        num_logical_experts=8,
+        num_shared_experts=1,
+        num_experts=9,
+    )
+    weights, ids = connector.select_experts(
+        hidden_states=torch.zeros(2, 16),
+        mix_placement=False,
+        **router_options,
+    )
+
+    factory_kwargs = captured["factory_kwargs"]
+    assert factory_kwargs.pop("e_score_correction_bias") is correction_bias
+    assert factory_kwargs == {
+        "top_k": 2,
+        "global_num_experts": 8,
+        "use_grouped_topk": True,
+        "renormalize": True,
+        "scoring_func": "softmax",
+        "num_expert_group": 4,
+        "topk_group": 2,
+        "routed_scaling_factor": 2.0,
+    }
+    assert captured["router_logits"] is router_logits
+    assert captured["topk_indices_dtype"] is torch.int32
+    assert ids.shape == weights.shape == (2, 2)
+    assert torch.equal(ids, torch.tensor([[0, 4], [3, 7]], dtype=torch.int32))
+    torch.testing.assert_close(weights.sum(dim=-1), torch.tensor([2.0, 2.0]))
+
+    cached_router = NativeRouterStub()
+    monkeypatch.setattr(
+        router_module,
+        "create_ascend_fused_moe_router",
+        lambda **kwargs: pytest.fail("cached router must be reused"),
+    )
+    connector.select_experts(
+        hidden_states=torch.zeros(2, 16),
+        mix_placement=False,
+        router=cached_router,
+        **router_options,
+    )
+    assert captured["router_logits"] is router_logits
+
+
 @pytest.mark.parametrize("with_bias", [False, True])
 @pytest.mark.parametrize("renormalize,hidden_size", [(False, 16), (True, 4)])
 def test_async_select_experts_native_fallback(with_bias, renormalize, hidden_size):
@@ -802,7 +902,8 @@ def test_async_select_experts_fused_group_scores(scoring_func, renormalize, with
     torch.testing.assert_close(weights.gather(1, order), expected * 2.0)
 
 
-def test_async_select_experts_rejects_mix_placement():
+@pytest.mark.parametrize("router", [None, SimpleNamespace()])
+def test_async_select_experts_rejects_mix_placement(router):
     with pytest.raises(RuntimeError, match="routed-only.*mix_placement"):
         async_cam_module.select_cam_experts(
             hidden_states=torch.zeros(1, 16),
@@ -819,6 +920,7 @@ def test_async_select_experts_rejects_mix_placement():
             num_logical_experts=8,
             num_shared_experts=1,
             num_experts=9,
+            router=router,
         )
 
 

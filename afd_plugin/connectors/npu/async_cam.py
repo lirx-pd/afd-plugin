@@ -104,12 +104,18 @@ def select_cam_experts(
     num_shared_experts: int,
     num_experts: int,
 ) -> tuple[Tensor, Tensor]:
-    """Route CAM tokens through the target Ascend grouped-topk contract."""
-    from vllm_ascend.ops.fused_moe.router.grouped_topk_router import (
-        AscendGroupedTopKRouter,
+    """Select routed-only CAM experts using Ascend's native router policy."""
+    from vllm_ascend.ops.fused_moe.router.router_factory import (
+        create_ascend_fused_moe_router,
     )
 
-    router = AscendGroupedTopKRouter(
+    if mix_placement:
+        raise RuntimeError(
+            "Async CAM uses routed-only expert IDs and does not support mix_placement"
+        )
+    # No EPLB state or fused shared experts: CAM dispatch consumes logical
+    # routed IDs. Ascend owns fused/fallback selection and weight scaling.
+    router = create_ascend_fused_moe_router(
         top_k=top_k,
         global_num_experts=router_logits.shape[-1],
         num_expert_group=num_expert_group,
@@ -125,25 +131,6 @@ def select_cam_experts(
         router_logits,
         topk_indices_dtype=torch.int32,
     )
-    # TODO: Async CAM currently rejects mix_placement in feature validation.
-    # Before enabling it, verify these shared IDs and weights against actual
-    # expert placement and the CAM dispatch/combine payload contract.
-    if mix_placement:
-        shared_ids = torch.arange(
-            num_logical_experts,
-            num_logical_experts + num_shared_experts,
-            dtype=topk_ids.dtype,
-            device=topk_ids.device,
-        ).expand(topk_ids.shape[0], -1)
-        if num_experts < num_logical_experts + num_shared_experts:
-            raise ValueError("CAM shared expert IDs exceed the expert world")
-        shared_weights = torch.ones(
-            (topk_weights.shape[0], num_shared_experts),
-            dtype=topk_weights.dtype,
-            device=topk_weights.device,
-        )
-        topk_ids = torch.cat((topk_ids, shared_ids), dim=1)
-        topk_weights = torch.cat((topk_weights, shared_weights), dim=1)
     return topk_weights, topk_ids
 
 

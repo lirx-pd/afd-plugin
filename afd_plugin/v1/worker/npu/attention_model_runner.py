@@ -986,6 +986,9 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             and not is_profile
             and not skip_gdn_state_update
         ):
+            # Native dummy execution is unsplit: veto DBO in the DP vote and
+            # discard previous stage slices before its forward-context collective.
+            self.ubatch_slices = None
             try:
                 return super()._dummy_run(
                     num_tokens,
@@ -995,7 +998,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     uniform_decode=uniform_decode,
                     is_profile=is_profile,
                     create_mixed_batch=create_mixed_batch,
-                    allow_microbatching=allow_microbatching,
+                    allow_microbatching=False,
                     skip_eplb=skip_eplb,
                     remove_lora=remove_lora,
                     is_graph_capturing=is_graph_capturing,
@@ -1759,6 +1762,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         is_draft_model: bool = False,
         cudagraph_mode: CUDAGraphMode | None = None,
         allow_dp_padding: bool = False,
+        allow_microbatching: bool = True,
     ) -> tuple[bool, int, torch.Tensor | None, CUDAGraphMode]:
         if cudagraph_mode is None:
             cudagraph_mode = CUDAGraphMode.NONE
@@ -1766,7 +1770,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             num_tokens_padded = num_tokens_unpadded
 
         if self.dp_size == 1:
-            should_ubatch = check_enable_ubatch(
+            should_ubatch = allow_microbatching and check_enable_ubatch(
                 num_tokens_unpadded,
                 num_tokens_padded,
                 uniform_decode=uniform_decode,
@@ -1780,7 +1784,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 device="cpu",
                 dtype=torch.int32,
             )
-            should_ubatch = check_enable_ubatch(
+            should_ubatch = allow_microbatching and check_enable_ubatch(
                 num_tokens_unpadded,
                 num_tokens_padded,
                 uniform_decode=uniform_decode,
@@ -1811,7 +1815,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 device="cpu",
                 dtype=torch.int32,
             )
-            should_ubatch = check_enable_ubatch(
+            should_ubatch = allow_microbatching and check_enable_ubatch(
                 num_tokens_unpadded,
                 num_tokens_padded,
                 uniform_decode=uniform_decode,
@@ -1823,19 +1827,26 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 num_tokens_after_padding,
                 cudagraph_mode,
             )
-        packed_tensor = torch.zeros(3, self.dp_size, device="cpu", dtype=torch.int32)
+        # Include local decode and execution eligibility in the existing vote.
+        # Token counts alone cannot align ranks with different DBO thresholds
+        # or a peer executing a non-microbatched dummy step.
+        packed_tensor = torch.zeros(5, self.dp_size, device="cpu", dtype=torch.int32)
         packed_tensor[0][self.dp_rank] = num_tokens_unpadded
         packed_tensor[1][self.dp_rank] = num_tokens_padded
         packed_tensor[2][self.dp_rank] = cudagraph_mode.value
+        packed_tensor[3][self.dp_rank] = uniform_decode
+        packed_tensor[4][self.dp_rank] = allow_microbatching
         dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
 
         num_tokens_unpadded_across_dp = packed_tensor[0, :]
         num_tokens_padded_across_dp = packed_tensor[1, :]
         max_tokens_across_dp = int(num_tokens_padded_across_dp.max().item())
         min_tokens_across_dp = int(num_tokens_unpadded_across_dp.min().item())
-        synced_cudagraph_mode = CUDAGraphMode(int(packed_tensor[-1, :].min().item()))
+        synced_cudagraph_mode = CUDAGraphMode(int(packed_tensor[2, :].min().item()))
+        uniform_decode = bool(packed_tensor[3, :].all().item())
+        allow_microbatching = bool(packed_tensor[4, :].all().item())
 
-        should_ubatch = check_enable_ubatch(
+        should_ubatch = allow_microbatching and check_enable_ubatch(
             min_tokens_across_dp,
             max_tokens_across_dp,
             uniform_decode=uniform_decode,
@@ -1945,6 +1956,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                     num_tokens_padded=num_tokens_padded,
                     uniform_decode=uniform_decode,
                     cudagraph_mode=cudagraph_mode,
+                    allow_microbatching=allow_microbatching or self._afd_live_execution,
                     allow_dp_padding=(cudagraph_mode != CUDAGraphMode.NONE)
                     or enable_sp(self.vllm_config)
                     or oproj_tp_enable()

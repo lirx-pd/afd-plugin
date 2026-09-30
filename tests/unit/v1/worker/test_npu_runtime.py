@@ -327,21 +327,41 @@ def test_npu_v1_runner_signatures_match_pinned_ascend():
 
 def test_npu_dummy_gdn_skip_uses_native_runner(monkeypatch):
     _require_npu_runtime()
+    import torch
+    from vllm.v1.worker.ubatch_utils import UBatchSlice
     from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
     runner = _new_attention_runner()
     runner.vllm_config = _vllm_config(use_ubatching=True)
     runner._afd_is_graph_capturing = False
+    runner._is_warmup = False
+    runner.connector = _RecordingConnector()
+    # The idle step can follow a two-stage graph capture or live batch.
+    runner.ubatch_slices = [
+        UBatchSlice(slice(0, 1), slice(0, 4)),
+        UBatchSlice(slice(1, 2), slice(4, 8)),
+    ]
     native_calls = []
+
+    def unexpected_stage_collective(_slices):
+        pytest.fail("native unsplit dummy must not enter a stage-count collective")
+
+    runner._build_ubatch_dp_metadata = unexpected_stage_collective
 
     def native_dummy_run(self, num_tokens, **kwargs):
         native_calls.append((num_tokens, kwargs))
+        sent = self._send_dp_metadata(
+            _FakeDPMetadata(torch.tensor([num_tokens, num_tokens])),
+            self.ubatch_slices,
+        )
+        assert list(sent) == [0]
         return "native", "dummy"
 
     monkeypatch.setattr(NPUModelRunner, "_dummy_run", native_dummy_run)
     assert runner._dummy_run(4, skip_gdn_state_update=True) == ("native", "dummy")
     assert native_calls[0][0] == 4
     assert native_calls[0][1]["skip_gdn_state_update"] is True
+    assert native_calls[0][1]["allow_microbatching"] is False
     assert runner._afd_is_graph_capturing is False
 
 
@@ -672,7 +692,7 @@ def test_npu_eager_camp2p_aligns_uneven_dp_tokens(
     monkeypatch.setattr(module, "get_dp_group", lambda: SimpleNamespace(cpu_group=None))
 
     def sync_dp_counts(packed_counts, group):
-        packed_counts[:, 0] = torch.tensor([8, 8, CUDAGraphMode.NONE.value])
+        packed_counts[:, 0] = torch.tensor([8, 8, CUDAGraphMode.NONE.value, 1, 1])
 
     monkeypatch.setattr(module.dist, "all_reduce", sync_dp_counts)
     _, descriptor, should_ubatch, token_counts, _ = (
@@ -687,6 +707,168 @@ def test_npu_eager_camp2p_aligns_uneven_dp_tokens(
     assert should_ubatch is False
     assert token_counts.tolist() == expected_counts
     assert descriptor.num_tokens == expected_counts[1]
+
+
+def _run_npu_dp_stage_protocol(rank, rendezvous):
+    """Exercise real Gloo collectives and final control payloads without a model."""
+    from datetime import timedelta
+
+    import numpy as np
+    import torch.distributed as dist
+    import vllm_ascend.ops  # noqa: F401 - spawn does not run tests/conftest.py
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import BatchDescriptor, DPMetadata
+
+    from afd_plugin.v1.worker.npu import attention_model_runner as module
+    from afd_plugin.v1.worker.npu.ubatch_utils import maybe_create_ubatch_slices
+
+    dist.init_process_group(
+        "gloo",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(
+                module,
+                "get_dp_group",
+                lambda: SimpleNamespace(cpu_group=dist.group.WORLD),
+            )
+            patch.setattr(
+                module, "should_skip_allreduce_across_dp_group", lambda *_: True
+            )
+            for name in ("enable_sp", "oproj_tp_enable", "embedding_tp_enable"):
+                patch.setattr(module, name, lambda *_: False)
+            patch.setattr(
+                module.NPUModelRunner,
+                "_build_attention_metadata",
+                lambda *a, **k: ({}, None),
+            )
+            all_reduce = dist.all_reduce
+            collective_shapes = []
+
+            def record_all_reduce(tensor, **kwargs):
+                collective_shapes.append(tuple(tensor.shape))
+                return all_reduce(tensor, **kwargs)
+
+            patch.setattr(module.dist, "all_reduce", record_all_reduce)
+            # Scheduled requests, live-execution flags, expected per-stage DP counts.
+            # Mixed below/at prefill threshold; decode below/at its threshold;
+            # an idle rank; a dummy veto; and unequal request-boundary splits.
+            cases = [
+                (([1] * 6, [3, 3]), (True, True), [[6, 6]]),
+                (([1] * 8, [3, 5]), (True, True), [[4, 3], [4, 5]]),
+                (([1] * 3, [1] * 3), (True, True), [[3, 3]]),
+                (([1] * 4, [1] * 4), (True, True), [[2, 2], [2, 2]]),
+                (([1] * 8, [1]), (True, False), [[8, 8]]),
+                (([1] * 8, [1] * 8), (True, False), [[8, 8]]),
+                (([3, 5], [8]), (True, True), [[3, 4], [5, 4]]),
+                (([3, 5], [4, 6]), (True, True), [[3, 4], [5, 6]]),
+            ]
+            for requests, live, expected_counts in cases:
+                collective_shapes.clear()
+                scheduled = np.array(requests[rank], dtype=np.int32)
+                num_tokens = int(scheduled.sum())
+                runner = _new_attention_runner()
+                runner.dp_size, runner.dp_rank = 2, rank
+                runner._afd_transaction_counter = 0
+                runner.connector = _RecordingConnector()
+                runner.afd_config = SimpleNamespace(connector="CAMP2pAFDConnector")
+                runner.parallel_config = _parallel_config(
+                    data_parallel_size=2,
+                    data_parallel_rank=rank,
+                    is_moe_model=True,
+                    enable_dbo=True,
+                    use_ubatching=True,
+                    num_ubatches=2,
+                    dbo_decode_token_threshold=4,
+                    dbo_prefill_token_threshold=8,
+                )
+                runner.vllm_config = SimpleNamespace(
+                    parallel_config=runner.parallel_config,
+                    observability_config=SimpleNamespace(cudagraph_metrics=False),
+                )
+                runner._afd_live_execution = live[rank]
+                runner._is_warmup = runner._afd_is_graph_capturing = False
+                runner.afd_async_extra_info = SimpleNamespace(async_moe_ubatching=False)
+                runner._pad_for_sequence_parallelism = lambda n: n
+                runner.input_batch = SimpleNamespace(
+                    num_computed_tokens_cpu=np.ones(len(scheduled), dtype=np.int32),
+                    lora_id_to_lora_request={},
+                )
+                runner.speculative_config = None
+                runner.uniform_decode_query_len = 1
+                runner.model_config = SimpleNamespace(is_encoder_decoder=False)
+                runner.cudagraph_dispatcher = SimpleNamespace(
+                    dispatch=lambda **kw: (
+                        CUDAGraphMode.NONE,
+                        BatchDescriptor(kw["num_tokens"]),
+                    )
+                )
+                mode, desc, split, counts, _ = (
+                    runner._determine_batch_execution_and_padding(
+                        num_tokens=num_tokens,
+                        num_reqs=len(scheduled),
+                        num_scheduled_tokens_np=scheduled,
+                        max_num_scheduled_tokens=int(scheduled.max()),
+                        use_cascade_attn=False,
+                        allow_microbatching=False,
+                    )
+                )
+                assert split is (len(expected_counts) == 2)
+                slices, _ = maybe_create_ubatch_slices(
+                    split,
+                    scheduled,
+                    desc.num_tokens,
+                    len(scheduled),
+                    runner.vllm_config,
+                )
+                # Stub only device attention metadata, retaining the production
+                # request-boundary adjustment and final AFD metadata builder.
+                runner._build_attention_metadata_with_ubatches = lambda **kw: ({}, None)
+                runner._build_attention_metadata(
+                    num_tokens=num_tokens,
+                    num_reqs=len(scheduled),
+                    max_query_len=int(scheduled.max()),
+                    num_tokens_padded=desc.num_tokens,
+                    num_reqs_padded=len(scheduled),
+                    ubatch_slices=slices,
+                    num_scheduled_tokens_np=scheduled,
+                    cudagraph_runtime_mode=mode,
+                )
+                runner._send_dp_metadata(
+                    DPMetadata.make(runner.parallel_config, desc.num_tokens, counts),
+                    runner.ubatch_slices,
+                )
+                payload = runner.connector.sent_dp_metadata_payloads[-1]
+                assert list(payload.dp_metadata_list) == list(
+                    range(len(expected_counts))
+                )
+                assert [
+                    m.num_tokens_across_dp_cpu.tolist()
+                    for m in payload.dp_metadata_list.values()
+                ] == expected_counts
+                assert runner._afd_pending_metadata.num_stages == len(expected_counts)
+                assert len(collective_shapes) == (2 if split else 1)
+                assert collective_shapes[0][1] == 2
+                if split:
+                    assert collective_shapes[1] == (2, 2)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_npu_dp_final_stage_protocol_two_processes(tmp_path):
+    _require_npu_runtime()
+    import torch.multiprocessing as mp
+
+    mp.spawn(
+        _run_npu_dp_stage_protocol,
+        args=(f"file://{tmp_path / 'dp-rendezvous'}",),
+        nprocs=2,
+        join=True,
+    )
 
 
 @pytest.mark.parametrize(

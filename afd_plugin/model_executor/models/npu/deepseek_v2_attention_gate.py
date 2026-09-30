@@ -87,6 +87,8 @@ def compute_gate_topk(
     gate_router: FusedMoERouter | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute routing payloads for a native-path gate proxy."""
+    # Keep optional Ascend imports at the NPU execution boundary.
+    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
     router_logits, _ = gate(hidden_states)
     afd_metadata = get_afd_metadata_from_forward_context()
@@ -129,7 +131,9 @@ def compute_gate_topk(
         num_experts=num_experts,
         router=gate_router,
     )
-    if force_balanced_topk_ids_enabled():
+    # This proxy bypasses AscendRoutedExperts, which balances dummy profile
+    # routing. Reuse the logical-ID layout without changing live routing.
+    if force_balanced_topk_ids_enabled() or _EXTRA_CTX.in_profile_run:
         topk_ids = _force_balanced_topk_ids(
             topk_ids,
             num_logical_experts=router_logits.shape[1],

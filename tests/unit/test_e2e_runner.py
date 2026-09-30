@@ -21,6 +21,9 @@ from tests.conftest import REPO_ROOT, RUNNER_CLEANUP_TIMEOUT_S, run_runner
 from tests.e2e import runner
 from tests.e2e.accuracy import gsm8k as helpers_gsm8k
 from tests.e2e.models.deepseek_v2_lite import (
+    test_async_cam_npu as async_cam_e2e,
+)
+from tests.e2e.models.deepseek_v2_lite import (
     test_deepseek_v2_lite as deepseek_v2_lite_e2e,
 )
 from tests.e2e.models.qwen3_6 import test_qwen3_6 as qwen3_6_e2e
@@ -542,6 +545,65 @@ def test_async_cam_scenario_builds_dp1tp2_attention_and_dp2tp1_ffn():
     assert "--enable-expert-parallel" in ffn_command
 
 
+@pytest.mark.parametrize(
+    ("scenario", "devices", "attention_dp", "attention_tp", "ffn_dp"),
+    [
+        ("afd-npu-v2-eager-async-cam-1a1f", "2,4", "1", "1", "1"),
+        ("afd-npu-v2-eager-async-cam-dp2", "2,4,6,8", "2", "1", "2"),
+        ("afd-npu-v2-eager-async-cam-tp2", "2,4,6,8", "1", "2", "2"),
+    ],
+)
+def test_npu_v2_async_cam_entrypoint_selects_exact_roles(
+    monkeypatch, scenario, devices, attention_dp, attention_tp, ffn_dp
+):
+    monkeypatch.setenv("AFD_E2E_BACKEND", "npu")
+    monkeypatch.setenv("AFD_E2E_DEVICES", devices)
+    monkeypatch.setenv("AFD_NPU_E2E_MODEL", "/models/DeepSeek-V2-Lite")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    entrypoint = async_cam_e2e.build_runner_command(scenario)
+    monkeypatch.setattr(sys, "argv", ["runner", *entrypoint[3:]])
+    args = runner.parse_args()
+    runner.configure_scenario(args)
+    attention_devices = runner.parse_csv(args.attention_devices)
+    ffn_devices = runner.parse_csv(args.ffn_devices)
+    runner.validate_topology(args, attention_devices, ffn_devices)
+
+    assert attention_devices + ffn_devices == devices.split(",")
+    assert args.gsm8k_output_path is None
+    assert runner.uses_npu_async_process_cleanup(args)
+    for role, dp_size, tp_size, model_runner in (
+        ("attention", attention_dp, attention_tp, "1"),
+        ("ffn", ffn_dp, "1", "0"),
+    ):
+        command = runner.build_vllm_command(args, role=role)
+        assert command[command.index("--data-parallel-size") + 1] == dp_size
+        assert command[command.index("--tensor-parallel-size") + 1] == tp_size
+        assert "--enforce-eager" in command
+        assert "--enable-dbo" not in command
+        assert "--compilation-config" not in command
+        assert ("--block-size=128" in command) is (role == "attention")
+        config = json.loads(command[command.index("--additional-config") + 1])["afd"]
+        assert config["connector"] == runner.ASYNC_AFD_CONNECTOR
+        assert config["async"] is True
+        assert config["compute_gate_on_attention"] is True
+        assert config["connector_extra_config"]["attn_ranks_per_dp"] == int(
+            attention_tp
+        )
+        env = runner.build_env("0", args, role=role)
+        assert env["VLLM_USE_V2_MODEL_RUNNER"] == model_runner
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "0"
+
+
+@pytest.mark.parametrize("scenario", runner.NPU_V2_ASYNC_CAM_SCENARIOS)
+def test_npu_v2_async_cam_scenarios_reject_local_moe_ubatching(scenario):
+    args = _args()
+    args.scenario = scenario
+    args.afd_connector_extra_config = ['{"async_moe_ubatching":true}']
+
+    with pytest.raises(ValueError, match="async_moe_ubatching=false"):
+        runner.configure_scenario(args)
+
+
 def test_async_ubatch_scenario_enforces_token_split_moe_ubatching():
     args = _args()
     args.scenario = "afd-async-ubatch"
@@ -705,7 +767,11 @@ def test_validate_topology_accepts_four_baseline_ranks_without_ffn_ranks():
 
 @pytest.mark.parametrize(
     "scenario",
-    [runner.ASYNC_CAM_SCENARIO, runner.ASYNC_UBATCH_SCENARIO],
+    [
+        runner.ASYNC_CAM_SCENARIO,
+        runner.ASYNC_UBATCH_SCENARIO,
+        *runner.NPU_V2_ASYNC_CAM_SCENARIOS,
+    ],
 )
 def test_validate_topology_rejects_async_cam_scenarios_on_gpu(scenario):
     args = _args()
@@ -713,9 +779,12 @@ def test_validate_topology_rejects_async_cam_scenarios_on_gpu(scenario):
     args.device_backend = "gpu"
     runner.configure_scenario(args)
 
-    ffn_devices = ["2", "3"] if scenario == runner.ASYNC_CAM_SCENARIO else ["2"]
+    attention_devices = [str(rank) for rank in range(args.num_attention_ranks)]
+    ffn_devices = [
+        str(rank + args.num_attention_ranks) for rank in range(args.num_ffn_ranks)
+    ]
     with pytest.raises(ValueError, match="require NPU"):
-        runner.validate_topology(args, ["0", "1"], ffn_devices)
+        runner.validate_topology(args, attention_devices, ffn_devices)
 
 
 @pytest.mark.parametrize(

@@ -332,3 +332,56 @@ def test_decoder_inherits_native_forward_without_override():
         adapter.AFDDeepseekV2DecoderLayer.forward
         is adapter.native.DeepseekV2DecoderLayer.forward
     )
+
+
+def test_attention_gate_balances_only_profile_routing(monkeypatch):
+    pytest.importorskip("vllm_ascend")
+    from vllm.forward_context import override_forward_context
+
+    from afd_plugin.model_executor.models.npu import (
+        deepseek_v2_attention_gate as gate_module,
+    )
+
+    monkeypatch.delenv("AFD_FORCE_BALANCED_TOPK_IDS", raising=False)
+    logits = torch.zeros(3, 4)
+    weights = torch.full((3, 2), 0.5)
+    hot_ids = torch.tensor([[0, 1], [0, 1], [0, 1]], dtype=torch.int32)
+
+    class Gate(nn.Module):
+        e_score_correction_bias = None
+
+        def forward(self, hidden_states):
+            return logits, None
+
+    connector = SimpleNamespace(
+        select_experts=lambda **kwargs: (weights.clone(), hot_ids.clone())
+    )
+    monkeypatch.setattr(
+        gate_module,
+        "get_afd_metadata_from_forward_context",
+        lambda: SimpleNamespace(connector=connector),
+    )
+    config = SimpleNamespace(n_routed_experts=4, n_shared_experts=0)
+    vllm_config = SimpleNamespace(
+        additional_config={},
+        parallel_config=SimpleNamespace(
+            eplb_config=SimpleNamespace(num_redundant_experts=0)
+        ),
+    )
+    for is_profile in (False, True, False):
+        context = SimpleNamespace(
+            in_profile_run=is_profile,
+            additional_kwargs={"in_profile_run": is_profile},
+        )
+        with override_forward_context(context):
+            actual_weights, actual_ids, actual_logits = gate_module.compute_gate_topk(
+                gate=Gate(),
+                vllm_config=vllm_config,
+                config=config,
+                top_k=2,
+                hidden_states=torch.zeros(3, 4),
+            )
+        expected_ids = torch.tensor([[0, 1], [2, 3], [0, 1]]) if is_profile else hot_ids
+        torch.testing.assert_close(actual_ids, expected_ids.to(torch.int32))
+        torch.testing.assert_close(actual_weights, weights)
+        assert actual_logits is logits

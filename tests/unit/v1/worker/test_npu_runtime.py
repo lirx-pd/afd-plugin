@@ -231,6 +231,7 @@ def _vllm_config(
     connector="CAMP2pAFDConnector",
     extra_config=None,
     use_mla=False,
+    use_v2_model_runner=False,
     cudagraph_mode="FULL",
     speculative_config=None,
     **parallel_overrides,
@@ -242,6 +243,7 @@ def _vllm_config(
     num_attention_ranks = int(parallel_overrides.pop("num_attention_ranks", 1))
     num_ffn_ranks = int(parallel_overrides.pop("num_ffn_ranks", 1))
     return SimpleNamespace(
+        use_v2_model_runner=use_v2_model_runner,
         additional_config={
             "afd": {
                 "role": role,
@@ -269,6 +271,7 @@ def _vllm_config(
             fast_moe_cold_start=False,
         ),
         speculative_config=speculative_config,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
     )
 
 
@@ -1260,9 +1263,7 @@ def test_npu_attention_ubatch_dp_metadata_keeps_each_rank_stage_count(monkeypatc
         attention_model_runner,
         "DPMetadata",
         SimpleNamespace(
-            make=lambda _config, _local_count, counts: _FakeDPMetadata(
-                counts.clone()
-            ),
+            make=lambda _config, _local_count, counts: _FakeDPMetadata(counts.clone()),
         ),
     )
 
@@ -2239,6 +2240,8 @@ def test_npu_ffn_worker_consumes_chunks_across_runner_steps(
     worker.model_runner = runner
     worker.device = SimpleNamespace(type="cpu")
     worker._ffn_shutdown_event = event
+    bound_devices: list[SimpleNamespace] = []
+    monkeypatch.setattr(ffn_worker.torch.npu, "set_device", bound_devices.append)
     monkeypatch.setattr(
         ffn_worker.torch.npu,
         "synchronize",
@@ -2258,6 +2261,7 @@ def test_npu_ffn_worker_consumes_chunks_across_runner_steps(
         (item, f"npu-ffn({item.hidden_states}, layer={item.layer_idx})")
         for item in work_items
     ]
+    assert bound_devices == [worker.device]
     assert step_boundaries == ([1] if len(layer_sequence) == 1 else [2, 4])
     assert context_calls[0]["num_tokens"] == 5
     assert context_calls[0]["skip_mc2_mask"] is True
@@ -2832,10 +2836,12 @@ def test_npu_ffn_worker_preserves_live_thread_after_shutdown_timeout(monkeypatch
     ]
 
 
-def test_npu_ffn_worker_uses_connector_driven_loop_for_async_connector():
+def test_npu_ffn_worker_uses_connector_driven_loop_for_async_connector(monkeypatch):
     worker = _new_ffn_worker()
+    from afd_plugin.v1.worker.npu import ffn_worker
+
     event = threading.Event()
-    calls = []
+    calls: list[str | tuple[str, SimpleNamespace]] = []
 
     def execute_connector_driven_step():
         calls.append("step")
@@ -2848,9 +2854,17 @@ def test_npu_ffn_worker_uses_connector_driven_loop_for_async_connector():
         execute_connector_driven_step=execute_connector_driven_step,
     )
 
+    monkeypatch.setattr(
+        ffn_worker.torch.npu,
+        "set_device",
+        lambda device: calls.append(("bind", device)),
+    )
+    monkeypatch.setattr(
+        ffn_worker.torch.npu, "synchronize", lambda: calls.append("sync")
+    )
     worker._run_ffn_server_loop()
 
-    assert calls == ["step"]
+    assert calls == [("bind", worker.device), "step", "sync"]
 
 
 def test_npu_feature_validation_rejects_unsupported_switches():
@@ -2971,9 +2985,12 @@ def test_npu_ubatch_wrapper_reuses_synchronized_stage_dp_metadata(
     wrapper.runnable = object()
     wrapper.cudagraphs = {}
     observed = []
-    wrapper._make_ubatch_metadata = lambda *args, **_kwargs: observed.append(
-        args[7]
-    ) or []
+
+    def make_ubatch_metadata(*args, **_kwargs):
+        observed.append(args[7])
+        return []
+
+    wrapper._make_ubatch_metadata = make_ubatch_metadata
     wrapper._run_ubatches = lambda _metadata, _model: "ran"
 
     model_inputs = dict(
@@ -3479,3 +3496,83 @@ def test_npu_attention_runner_afd_ubatching_does_not_install_native_wrapper(
     runner.load_model()
 
     assert events == ["model_load", "connector_init"]
+
+
+@pytest.mark.parametrize(
+    "extra_config,additional_config,model_type,use_mla,error",
+    [
+        ({"async_moe_ubatching": True}, {}, "deepseek_v2", True, "async_moe_ubatching"),
+        (
+            {},
+            {"enable_shared_expert_dp": True},
+            "deepseek_v2",
+            True,
+            "shared-expert DP",
+        ),
+        *[
+            (
+                {},
+                {"finegrained_tp_config": {key: 2}},
+                "deepseek_v2",
+                True,
+                "finegrained TP",
+            )
+            for key in (
+                "oproj_tensor_parallel_size",
+                "mlp_tensor_parallel_size",
+                "embedding_tensor_parallel_size",
+                "lmhead_tensor_parallel_size",
+            )
+        ],
+        ({}, {}, "deepseek_v4", True, "DeepSeek-V2/V3 MLA"),
+        ({}, {}, "deepseek_v2", False, "DeepSeek-V2/V3 MLA"),
+    ],
+)
+def test_npu_async_mrv2_feature_boundaries(
+    extra_config, additional_config, model_type, use_mla, error
+):
+    config = _vllm_config(
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+        use_v2_model_runner=True,
+        use_mla=use_mla,
+        extra_config=extra_config,
+    )
+    config.additional_config.update(additional_config)
+    config.model_config.hf_text_config.model_type = model_type
+    with pytest.raises(RuntimeError, match=error):
+        fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_npu_async_mrv2_features_allow_plain_tp(tp_size):
+    fail_if_unsupported_npu_afd_features(
+        _vllm_config(
+            connector="CAMAsyncAFDConnector",
+            async_dp=True,
+            compute_gate_on_attention=True,
+            use_v2_model_runner=True,
+            use_mla=True,
+            tensor_parallel_size=tp_size,
+            num_attention_ranks=2 * tp_size,
+            data_parallel_size=2,
+            extra_config={"attn_ranks_per_dp": tp_size},
+        )
+    )
+
+
+def test_npu_async_mrv2_rejects_fractional_tp_capacity():
+    config = _vllm_config(
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+        use_v2_model_runner=True,
+        use_mla=True,
+        tensor_parallel_size=2,
+        num_attention_ranks=2,
+        extra_config={"attn_ranks_per_dp": 2},
+    )
+    config.scheduler_config.max_num_batched_tokens = 5
+    with pytest.raises(RuntimeError, match="divisible by attn_ranks_per_dp"):
+        fail_if_unsupported_npu_afd_features(config)

@@ -16,7 +16,8 @@ pytest.importorskip("vllm")
 pytest.importorskip("vllm_ascend")
 
 from vllm.config import CUDAGraphMode  # noqa: E402
-from vllm.v1.worker.gpu import cudagraph_utils  # noqa: E402
+from vllm.v1.worker.dp_utils import should_skip_dp_coordination  # noqa: E402
+from vllm.v1.worker.gpu import cudagraph_utils, dp_utils  # noqa: E402
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner  # noqa: E402
 from vllm_ascend.worker.v2 import model_runner as native_ascend_v2  # noqa: E402
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner  # noqa: E402
@@ -29,10 +30,13 @@ from afd_plugin.v1.worker.npu import attention_model_runner_v2 as npu_v2  # noqa
 Runner = npu_v2.AFDNPUAttentionModelRunnerV2
 
 
-def _runner():
+def _runner(*, async_dp=False):
     runner = object.__new__(Runner)
     runner.vllm_config = SimpleNamespace(
         compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE)
+    )
+    runner.afd_config = SimpleNamespace(
+        async_dp=async_dp, num_attention_ranks=2, num_ffn_ranks=2
     )
     runner.cudagraph_manager = None
     runner.prof = object()
@@ -68,11 +72,12 @@ def test_execute_and_capture_match_vllm_030_signatures():
     )
 
 
+@pytest.mark.parametrize("async_dp", [False, True])
 @pytest.mark.parametrize("raise_in_native", [False, True])
 def test_execute_forwards_dummy_profile_and_context_then_restores(
-    monkeypatch, raise_in_native
+    monkeypatch, raise_in_native, async_dp
 ):
-    runner = _runner()
+    runner = _runner(async_dp=async_dp)
     original_state = _state(runner)
     step_calls: list[object] = []
     monkeypatch.setattr(npu_v2, "step_afd_npu_profiler", step_calls.append)
@@ -87,6 +92,7 @@ def test_execute_forwards_dummy_profile_and_context_then_restores(
 
     def native_execute(self, *args, **kwargs):
         forwarded.append((args, kwargs))
+        assert should_skip_dp_coordination() is async_dp
         assert forward_module.create_forward_context().additional_kwargs == {
             "afd_metadata": "installed"
         }
@@ -127,6 +133,7 @@ def test_execute_forwards_dummy_profile_and_context_then_restores(
             },
         )
     ]
+    assert not should_skip_dp_coordination()
     assert step_calls == [runner.prof]
     assert _state(runner) == original_state
     assert forward_module.create_forward_context is original_factory
@@ -232,8 +239,9 @@ def test_capture_forwards_new_inputs_and_restores(
     assert original_prepare is not native_prepare
 
 
-def test_native_dummy_run_reaches_afd_execute_with_context_state(monkeypatch):
-    runner = _runner()
+@pytest.mark.parametrize("async_dp", [False, True])
+def test_native_dummy_run_reaches_afd_execute_with_context_state(monkeypatch, async_dp):
+    runner = _runner(async_dp=async_dp)
     runner.adaptive_verification = None
     runner.max_num_reqs = 2
     runner.lora_config = None
@@ -247,6 +255,7 @@ def test_native_dummy_run_reaches_afd_execute_with_context_state(monkeypatch):
 
     def native_execute(self, scheduler_output, intermediate_tensors=None, **kwargs):
         calls.append((scheduler_output.total_num_scheduled_tokens, kwargs))
+        assert should_skip_dp_coordination() is async_dp
         return None
 
     monkeypatch.setattr(NPUModelRunner, "execute_model", native_execute)
@@ -269,3 +278,38 @@ def test_native_dummy_run_reaches_afd_execute_with_context_state(monkeypatch):
             },
         )
     ]
+
+
+@pytest.mark.parametrize("num_tokens", [0, 1, 7])
+@pytest.mark.parametrize("dp_rank", [0, 1])
+def test_async_execute_uses_native_local_dp_dispatch(monkeypatch, num_tokens, dp_rank):
+    runner = _runner(async_dp=True)
+    runner.afd_config.num_ffn_ranks = 1
+
+    monkeypatch.setattr(npu_v2, "step_afd_npu_profiler", lambda _prof: None)
+    monkeypatch.setattr(
+        dp_utils, "get_dp_group", lambda: SimpleNamespace(cpu_group=None)
+    )
+
+    def unexpected_collective(*args, **kwargs):
+        pytest.fail("Async Attention must not coordinate with an idle DP replica")
+
+    monkeypatch.setattr(dp_utils.dist, "all_reduce", unexpected_collective)
+
+    def native_execute(self, scheduler_output, *args, **kwargs):
+        desc = cudagraph_utils.BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.NONE,
+            num_tokens=num_tokens,
+            num_reqs=int(num_tokens > 0),
+        )
+        return dp_utils.sync_cudagraph_and_dp_padding(
+            None, desc, num_tokens, desc.num_reqs, None, 2, dp_rank
+        )
+
+    monkeypatch.setattr(NPUModelRunner, "execute_model", native_execute)
+    desc, sync = runner.execute_model(
+        SimpleNamespace(total_num_scheduled_tokens=num_tokens)
+    )
+    assert desc.num_tokens == num_tokens
+    assert (sync is None) is (num_tokens == 0)
+    assert not should_skip_dp_coordination()

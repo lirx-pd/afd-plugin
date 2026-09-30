@@ -213,7 +213,7 @@ class AFDMetadataProviderMixin:
         self,
         forward_context: ForwardContext,
     ) -> None:
-        """Install transaction metadata and publish its matching control.
+        """Install transaction metadata and publish control for synchronous connectors.
 
         On the ordinary eager path, the method creates a pending transaction from
         the current context, writes it to ``ForwardContext.additional_kwargs``,
@@ -246,6 +246,8 @@ class AFDMetadataProviderMixin:
             forward_context.additional_kwargs["afd_metadata"] = (
                 self._afd_pending_metadata
             )
+        if self.connector.control_plane is None:
+            return
         if getattr(self, "_afd_suppress_metadata_send", False):
             return
         dp_metadata = forward_context.dp_metadata

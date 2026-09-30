@@ -7,7 +7,12 @@ from __future__ import annotations
 import importlib
 from typing import TYPE_CHECKING, Any, Final
 
-from afd_plugin.config import AFDConfig, parse_afd_config
+from afd_plugin.config import (
+    AFD_ASYNC_CONNECTOR,
+    CAMP2P_CONNECTOR,
+    AFDConfig,
+    parse_afd_config,
+)
 from afd_plugin.v1.worker.cuda_graph import (
     cudagraph_mode_name,
     validate_cuda_graph_mode,
@@ -120,14 +125,24 @@ def validate_npu_model_runner_v2_config(
     """Validate the supported Ascend NPU ModelRunnerV2 deployment."""
 
     afd_config = parse_afd_config(vllm_config, expected_role=expected_role)
-    if (
-        device_type != "npu"
-        or afd_config.connector != "CAMP2pAFDConnector"
-        or afd_config.compute_gate_on_attention
+    if device_type != "npu":
+        raise RuntimeError("AFD NPU ModelRunnerV2 requires NPU")
+    if afd_config.connector == AFD_ASYNC_CONNECTOR:
+        if not afd_config.async_dp or not afd_config.compute_gate_on_attention:
+            raise RuntimeError(
+                "AFD NPU ModelRunnerV2 Async CAM requires async DP and "
+                "compute_gate_on_attention=true",
+            )
+        if not vllm_config.model_config.enforce_eager:
+            raise RuntimeError(
+                "AFD NPU ModelRunnerV2 Async CAM requires eager execution"
+            )
+    elif (
+        afd_config.connector != CAMP2P_CONNECTOR or afd_config.compute_gate_on_attention
     ):
         raise RuntimeError(
-            "AFD NPU ModelRunnerV2 requires NPU, synchronous "
-            "CAMP2pAFDConnector, and compute_gate_on_attention=false",
+            "AFD NPU ModelRunnerV2 requires synchronous CAMP2pAFDConnector "
+            "with compute_gate_on_attention=false, or Async CAM",
         )
 
     parallel = vllm_config.parallel_config

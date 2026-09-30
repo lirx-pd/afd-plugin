@@ -17,6 +17,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker import utils as v2_worker_utils
+from vllm.v1.worker.dp_utils import skip_dp_coordination
 from vllm.v1.worker.gpu import cudagraph_utils as v2_cudagraph_utils
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBuffers
@@ -142,14 +143,11 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             expected_role="attention",
             device_type=device.type,
         )
+        fail_if_unsupported_npu_afd_features(vllm_config)
         super().__init__(vllm_config, device)
         connector: AFDConnectorBase | None = None
         try:
             self.afd_config = self.parse_config(self.vllm_config)
-            fail_if_unsupported_npu_afd_features(
-                self.vllm_config,
-                afd_config=self.afd_config,
-            )
             rank, _ = _resolve_world_ranks()
             local_rank = int(device.index)
             connector = AFDConnectorFactory.create_connector(
@@ -162,7 +160,7 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             # The connector rendezvous is deferred to the end of ``load_model()``
             # so Attention and FFN weight loading overlap, matching the V1
             # Attention runner lifecycle.
-            if connector.control_plane is None:
+            if connector.control_plane is None and not self.afd_config.async_dp:
                 raise RuntimeError(
                     "AFD ModelRunnerV2 requires a control-plane-driven connector",
                 )
@@ -353,6 +351,8 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     # ced6857afa0ea7b2e3f0846a62e1394e90f15607.
     # Delegation exception: the upstream method is intentionally not copied;
     # only this narrow provider/profiler wrapper is AFD-specific.
+    # Async CAM uses the v0.30 native DP opt-out for requests and profile/dummy
+    # execution. The scope leaves TP collectives and the configured topology intact.
     # Removal/upstream plan: delete this wrapper when vLLM exposes a plugin
     # ForwardContext/set_forward_context sidecar/provider hook.
     @torch.inference_mode()
@@ -392,6 +392,7 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         )
         try:
             with (
+                skip_dp_coordination() if self.afd_config.async_dp else nullcontext(),
                 replay_scope,
                 use_afd_metadata_provider(
                     self.install_afd_metadata_on_forward_context,

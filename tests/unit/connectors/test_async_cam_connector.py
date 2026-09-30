@@ -459,6 +459,73 @@ def test_async_connector_calls_cam_shaped_ops(monkeypatch):
     assert isinstance(context.states, AFDTransferState)
 
 
+def test_async_explicit_receive_consumes_matching_pending_dispatch(monkeypatch):
+    fake_torch = _FakeTorch()
+    monkeypatch.setattr(async_cam_module, "torch", fake_torch)
+    connector = CAMAsyncAFDConnector(
+        0, 0, _vllm_config(), _afd_config(role="attention"), 0
+    )
+    connector._initialized = True
+    connector.comm_args = _FakeTensor((1,), dtype="fp16")
+    hidden_states = _FakeTensor((3, 16))
+    contexts = []
+    payloads = []
+    for layer_idx in (2, 3):
+        context = AFDTransferContext(
+            metadata=AFDTransferMetadata.create_attention_metadata(
+                layer_idx=layer_idx, stage_idx=0, seq_len=3
+            )
+        )
+        payload = _topk_payload(3)
+        connector.send_attn_output(hidden_states, context, **payload)
+        contexts.append(context)
+        payloads.append(payload)
+
+    with pytest.raises(RuntimeError, match="does not match the next pending"):
+        connector.recv_ffn_output(hidden_states, ubatch_idx=0, context=contexts[1])
+    assert len(fake_torch.ops.afd_ascend.calls) == 2
+    assert len(connector._pending_attention_payloads[0]) == 2
+
+    connector.recv_ffn_output(
+        hidden_states,
+        ubatch_idx=0,
+        context=contexts[0],
+        **payloads[1],
+    )
+    assert len(connector._pending_attention_payloads[0]) == 1
+    assert connector._pending_attention_payloads[0][0][0] is contexts[1]
+    assert fake_torch.ops.afd_ascend.calls[-1][1][1] is payloads[0]["topk_ids"]
+
+    connector.recv_ffn_output(hidden_states, ubatch_idx=0)
+    assert connector._pending_attention_payloads == {}
+    assert fake_torch.ops.afd_ascend.calls[-1][1][1] is payloads[1]["topk_ids"]
+
+
+def test_async_ffn_work_item_rejects_count_above_receive_capacity(monkeypatch):
+    connector = CAMAsyncAFDConnector(0, 0, _vllm_config(), _afd_config(role="ffn"), 0)
+
+    def fake_recv_attn_output(*, stage_idx, layer_idx, batch_size, ubatch_idx):
+        metadata = AFDTransferMetadata.create_ffn_metadata(
+            layer_idx=layer_idx, stage_idx=stage_idx, seq_lens=[batch_size]
+        )
+        states = AFDAsyncTransferState(
+            batch_size=batch_size,
+            hidden_size=16,
+            topk=2,
+            layer_idx=layer_idx,
+            token_nums_rankid_layeridx=torch.tensor([3, 0, 2], dtype=torch.int64),
+            group_list=torch.tensor([2, 1], dtype=torch.int64),
+        )
+        return AFDA2FTransferPayload(
+            hidden_states=_FakeTensorLike("hidden", shape=(2, 16)),
+            context=AFDTransferContext(metadata=metadata, states=states),
+        )
+
+    monkeypatch.setattr(connector, "recv_attn_output", fake_recv_attn_output)
+    with pytest.raises(RuntimeError, match="outside dispatch-recv capacity"):
+        connector.recv_ffn_work_item(stage_idx=0, max_num_tokens=16)
+
+
 def test_async_ffn_side_dispatch_recv_and_combine_send(monkeypatch):
     logs = []
     monkeypatch.setattr(
@@ -569,7 +636,7 @@ def test_async_ffn_work_item_uses_cam_layer_and_token_metadata(monkeypatch):
             dynamic_scales=_FakeTensorLike("scales"),
         )
         return AFDA2FTransferPayload(
-            hidden_states=_FakeTensorLike("hidden"),
+            hidden_states=_FakeTensorLike("hidden", shape=(16, 16)),
             context=AFDTransferContext(metadata=metadata, states=states),
         )
 
@@ -627,7 +694,7 @@ def test_async_ffn_work_item_uses_expert_counts_for_routed_tokens(monkeypatch):
             group_list=group_list,
         )
         return AFDA2FTransferPayload(
-            hidden_states=_FakeTensorLike("hidden"),
+            hidden_states=_FakeTensorLike("hidden", shape=(16, 16)),
             context=AFDTransferContext(metadata=metadata, states=states),
         )
 

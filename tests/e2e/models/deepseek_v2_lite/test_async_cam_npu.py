@@ -25,6 +25,7 @@ from tests.e2e.runner import (
     ASYNC_UBATCH_ATTENTION_RANKS,
     ASYNC_UBATCH_FFN_RANKS,
     ASYNC_UBATCH_SCENARIO,
+    NPU_V2_ASYNC_CAM_SCENARIOS,
 )
 
 CAM_HCCL_BUFFER_SIZE_MB = 4096
@@ -59,12 +60,15 @@ def _connector_extra_config(model: str) -> str:
     )
 
 
-def build_runner_command() -> list[str]:
+def build_runner_command(scenario: str = ASYNC_CAM_SCENARIO) -> list[str]:
     backend = _required_env("AFD_E2E_BACKEND")
     if backend != "npu":
         raise RuntimeError("async CAM E2E requires AFD_E2E_BACKEND=npu")
 
-    device_count = ASYNC_CAM_ATTENTION_RANKS + ASYNC_CAM_FFN_RANKS
+    single_rank = scenario == "afd-npu-v2-eager-async-cam-1a1f"
+    attention_ranks = 1 if single_rank else ASYNC_CAM_ATTENTION_RANKS
+    ffn_ranks = 1 if single_rank else ASYNC_CAM_FFN_RANKS
+    device_count = attention_ranks + ffn_ranks
     devices = _devices("AFD_E2E_DEVICES", device_count)
     model = _required_env("AFD_NPU_E2E_MODEL")
     common_arguments = (
@@ -88,11 +92,11 @@ def build_runner_command() -> list[str]:
         "--device-backend",
         "npu",
         "--attention-devices",
-        ",".join(devices[:ASYNC_CAM_ATTENTION_RANKS]),
+        ",".join(devices[:attention_ranks]),
         "--ffn-devices",
-        ",".join(devices[ASYNC_CAM_ATTENTION_RANKS:]),
+        ",".join(devices[attention_ranks:]),
         "--scenario",
-        ASYNC_CAM_SCENARIO,
+        scenario,
         "--served-model-name-prefix",
         "cam-async",
         "--afd-connector-extra-config",
@@ -105,6 +109,8 @@ def build_runner_command() -> list[str]:
         os.environ.get("AFD_NPU_E2E_STARTUP_TIMEOUT", "900"),
         *(f"--common-vllm-arg={argument}" for argument in common_arguments),
     ]
+    if scenario in NPU_V2_ASYNC_CAM_SCENARIOS:
+        command.append("--attention-vllm-arg=--block-size=128")
     max_model_len = os.environ.get("AFD_NPU_ASYNC_CAM_E2E_MAX_MODEL_LEN")
     if max_model_len:
         command.extend(
@@ -121,6 +127,14 @@ def build_runner_command() -> list[str]:
 @pytest.mark.slow
 def test_deepseek_v2_lite_async_cam() -> None:
     run_runner(build_runner_command(), env=_async_cam_env())
+
+
+@pytest.mark.npu
+@pytest.mark.e2e
+@pytest.mark.slow
+@pytest.mark.parametrize("scenario", NPU_V2_ASYNC_CAM_SCENARIOS)
+def test_deepseek_v2_lite_mrv2_async_cam(scenario: str) -> None:
+    run_runner(build_runner_command(scenario), env=_async_cam_env())
 
 
 def build_ubatch_runner_command(gsm8k_output_path: Path) -> list[str]:

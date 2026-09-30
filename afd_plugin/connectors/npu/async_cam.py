@@ -418,6 +418,10 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             )
         )
         total_num_tokens, layer_idx, num_tokens = control.cpu().tolist()
+        if not 0 <= num_tokens <= recv_output.hidden_states.shape[0]:
+            raise RuntimeError(
+                "AFD async CAM routed chunk count is outside dispatch-recv capacity"
+            )
 
         metadata.layer_idx = layer_idx
         metadata.stage_idx = stage_idx
@@ -601,50 +605,34 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
     ) -> Tensor:
         """Receive and combine expert output on an Attention rank.
 
-        Routing tensors may be supplied explicitly via ``kwargs`` or recovered
-        FIFO from the matching stage's pending dispatch. ``ref_tensor``
-        selects the output device and dtype used to construct the CAM receive
-        placeholder.
+        The optional context must match the oldest pending dispatch for the
+        stage. Routing tensors always come from that dispatch. ``ref_tensor``
+        selects the output device and dtype for the CAM receive placeholder.
 
         Args:
             ref_tensor: Tensor from which device/dtype are taken for the CAM
                 combine-recv placeholder.
-            ubatch_idx: Stage/microbatch index used to pop the pending
-                Attention dispatch payload when routing tensors are not
-                supplied explicitly. Defaults to ``0``.
-            **kwargs: Optional CAM-specific arguments:
-
-                * ``context``: ``AFDTransferContext`` from the matching
-                  dispatch. Recovered from the pending queue when omitted.
-                * ``topk_ids``: Expert routing indices. Recovered from the
-                  pending queue when omitted.
-                * ``topk_weights``: Expert routing weights. Recovered from
-                  the pending queue when omitted.
+            ubatch_idx: Stage/microbatch index of the pending Attention
+                dispatch payload. Defaults to ``0``.
+            **kwargs: Optional ``context`` from the matching dispatch. Uses
+                FIFO order when omitted.
         """
         self._require_initialized()
         context = kwargs.get("context")
-        topk_ids = kwargs.get("topk_ids")
-        topk_weights = kwargs.get("topk_weights")
-        if context is None or topk_ids is None or topk_weights is None:
-            payloads = self._pending_attention_payloads.get(ubatch_idx)
-            if not payloads:
-                raise RuntimeError(
-                    "CAMAsyncAFDConnector recv_ffn_output is missing pending "
-                    "Attention metadata",
-                )
-            (
-                pending_context,
-                pending_topk_ids,
-                pending_topk_weights,
-            ) = payloads.pop(0)
-            if not payloads:
-                self._pending_attention_payloads.pop(ubatch_idx, None)
-            if context is None:
-                context = pending_context
-            if topk_ids is None:
-                topk_ids = pending_topk_ids
-            if topk_weights is None:
-                topk_weights = pending_topk_weights
+        payloads = self._pending_attention_payloads.get(ubatch_idx)
+        if not payloads:
+            raise RuntimeError(
+                "CAMAsyncAFDConnector recv_ffn_output is missing pending "
+                "Attention metadata",
+            )
+        if context is not None and context is not payloads[0][0]:
+            raise RuntimeError(
+                "CAMAsyncAFDConnector recv_ffn_output context does not match "
+                "the next pending Attention dispatch",
+            )
+        context, topk_ids, topk_weights = payloads.pop(0)
+        if not payloads:
+            self._pending_attention_payloads.pop(ubatch_idx, None)
 
         states = _require_async_transfer_state(context)
         _validate_topk_payload(

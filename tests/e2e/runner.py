@@ -49,6 +49,17 @@ ASYNC_UBATCH_FFN_RANKS = 1
 ASYNC_UBATCH_ATTENTION_TP_SIZE = 2
 ASYNC_UBATCH_NUM_STAGES = 2
 ASYNC_UBATCH_BATCH_SIZE = 2
+NPU_V2_ASYNC_CAM_SCENARIOS = (
+    "afd-npu-v2-eager-async-cam-1a1f",
+    "afd-npu-v2-eager-async-cam-dp2",
+    "afd-npu-v2-eager-async-cam-tp2",
+)
+ASYNC_CAM_SCENARIOS = (ASYNC_CAM_SCENARIO, *NPU_V2_ASYNC_CAM_SCENARIOS)
+NPU_ASYNC_SCENARIOS = (
+    *ASYNC_CAM_SCENARIOS,
+    ASYNC_UBATCH_SCENARIO,
+    DSV4_ASYNC_CAM_SCENARIO,
+)
 V2_SYNC_CONNECTOR = "P2pNcclAFDConnector"
 V2_SCENARIOS = (
     "afd-v2-eager-1a1f",
@@ -199,7 +210,7 @@ def main() -> int:
         wait_for_openai_api(args, processes)
         ensure_processes_alive(processes)
 
-        if args.scenario == ASYNC_CAM_SCENARIO:
+        if args.scenario in ASYNC_CAM_SCENARIOS:
             run_completion_evaluation(args)
         elif args.scenario == DSV4_ASYNC_CAM_SCENARIO:
             run_concurrent_completion_evaluation(args)
@@ -298,6 +309,7 @@ def parse_args() -> argparse.Namespace:
             ASYNC_UBATCH_SCENARIO,
             DSV4_ASYNC_CAM_SCENARIO,
             *V2_SCENARIOS,
+            *NPU_V2_ASYNC_CAM_SCENARIOS,
         ],
         required=True,
         help="Fixed E2E scenario to run.",
@@ -408,7 +420,8 @@ def parse_args() -> argparse.Namespace:
 
 def configure_scenario(args: argparse.Namespace) -> None:
     """Set topology and features for the selected fixed scenario."""
-    is_async_cam = args.scenario == ASYNC_CAM_SCENARIO
+    is_npu_v2_async_cam = args.scenario in NPU_V2_ASYNC_CAM_SCENARIOS
+    is_async_cam = args.scenario in ASYNC_CAM_SCENARIOS
     is_async_ubatch = args.scenario == ASYNC_UBATCH_SCENARIO
     is_dsv4 = args.scenario == DSV4_ASYNC_CAM_SCENARIO
     scenario_settings = {
@@ -440,6 +453,9 @@ def configure_scenario(args: argparse.Namespace) -> None:
             DSV4_ATTENTION_RANKS,
             DSV4_FFN_RANKS,
         ),
+        "afd-npu-v2-eager-async-cam-1a1f": (False, False, False, 1, 1),
+        "afd-npu-v2-eager-async-cam-dp2": (False, False, False, 2, 2),
+        "afd-npu-v2-eager-async-cam-tp2": (False, False, False, 2, 2),
         "afd-v2-eager-1a1f": (False, False, False, 1, 1),
         "afd-v2-eager-dp2": (False, False, False, 2, 2),
         "afd-v2-eager-tp2": (False, False, False, 2, 2),
@@ -458,6 +474,10 @@ def configure_scenario(args: argparse.Namespace) -> None:
     args.tp_size = 1
     if is_dsv4:
         args.attention_tp_size = DSV4_ATTENTION_TP_SIZE
+    elif is_npu_v2_async_cam:
+        args.attention_tp_size = (
+            2 if args.scenario == "afd-npu-v2-eager-async-cam-tp2" else 1
+        )
     elif is_async_cam:
         args.attention_tp_size = ASYNC_CAM_ATTENTION_TP_SIZE
     elif is_async_ubatch:
@@ -467,8 +487,8 @@ def configure_scenario(args: argparse.Namespace) -> None:
     else:
         args.attention_tp_size = 1
     args.ffn_tp_size = 2 if args.scenario in V2_TENSOR_PARALLEL_SCENARIOS else 1
-    args.use_v2_model_runner = args.scenario in V2_SCENARIOS
-    if args.use_v2_model_runner:
+    args.use_v2_model_runner = args.scenario in V2_SCENARIOS or is_npu_v2_async_cam
+    if args.scenario in V2_SCENARIOS:
         if args.afd_async or args.afd_connector == ASYNC_AFD_CONNECTOR:
             raise ValueError("ModelRunnerV2 E2E scenarios require synchronous AFD")
         if args.compute_gate_on_attention:
@@ -496,7 +516,11 @@ def configure_scenario(args: argparse.Namespace) -> None:
         extra_config = parse_afd_connector_extra_config(
             args.afd_connector_extra_config,
         )
-        extra_config["attn_ranks_per_dp"] = ASYNC_CAM_ATTENTION_TP_SIZE
+        extra_config["attn_ranks_per_dp"] = args.attention_tp_size
+        if is_npu_v2_async_cam and extra_config.get("async_moe_ubatching", False):
+            raise ValueError(
+                "NPU ModelRunnerV2 async CAM requires async_moe_ubatching=false"
+            )
         args.afd_connector_extra_config = [
             json.dumps(extra_config, separators=(",", ":")),
         ]
@@ -578,17 +602,9 @@ def validate_topology(
         if role_tp_size(args, "attention") != 1:
             raise ValueError("baseline E2E requires Attention TP=1")
         return
-    if args.use_v2_model_runner and args.device_backend != "gpu":
+    if args.scenario in V2_SCENARIOS and args.device_backend != "gpu":
         raise ValueError("ModelRunnerV2 E2E scenarios require GPU")
-    if (
-        args.scenario
-        in (
-            ASYNC_CAM_SCENARIO,
-            ASYNC_UBATCH_SCENARIO,
-            DSV4_ASYNC_CAM_SCENARIO,
-        )
-        and args.device_backend != "npu"
-    ):
+    if args.scenario in NPU_ASYNC_SCENARIOS and args.device_backend != "npu":
         raise ValueError("async CAM scenarios require NPU")
     for role, rank_count in (
         ("attention", args.num_attention_ranks),
@@ -789,11 +805,7 @@ def uses_async_connector(args: argparse.Namespace) -> bool:
 
 def uses_npu_async_process_cleanup(args: argparse.Namespace) -> bool:
     """Return whether E2E teardown must find and kill every FFN process."""
-    return args.device_backend == "npu" and args.scenario in (
-        ASYNC_CAM_SCENARIO,
-        ASYNC_UBATCH_SCENARIO,
-        DSV4_ASYNC_CAM_SCENARIO,
-    )
+    return args.device_backend == "npu" and args.scenario in NPU_ASYNC_SCENARIOS
 
 
 def decode_bench_connector_config() -> str:
@@ -967,6 +979,8 @@ def build_env(
     elif role == "ffn":
         # FFN still owns an MRV1 runner independently of Attention's selection.
         env["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+    elif args.use_v2_model_runner:
+        env["VLLM_USE_V2_MODEL_RUNNER"] = "1"
     else:
         env.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
     if args.baseline:

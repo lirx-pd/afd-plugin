@@ -13,6 +13,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
+from torch import device as torch_device  # noqa: E402
 from vllm.config import CUDAGraphMode  # noqa: E402
 from vllm.forward_context import (  # noqa: E402
     BatchDescriptor,
@@ -88,7 +89,7 @@ class _StepProfiler:
 
 
 class _RunnerRecorder:
-    instances = []
+    instances: list[tuple[SimpleNamespace, torch_device]] = []
 
     def __init__(self, vllm_config, device):
         type(self).instances.append((vllm_config, device))
@@ -494,6 +495,98 @@ def test_v2_validator_rejects_non_cuda_device():
             _v2_config(),
             expected_role="attention",
             device_type="npu",
+        )
+
+
+@pytest.mark.parametrize("local_ubatching", [False, True])
+def test_npu_async_v2_constructor_validates_before_native_and_connector_init(
+    monkeypatch, local_ubatching
+):
+    pytest.importorskip("vllm_ascend")
+    from afd_plugin.v1.worker.npu import attention_model_runner_v2 as module
+
+    config = _v2_config()
+    config.model_config.hf_text_config = config.model_config.hf_config
+    config.model_config.use_mla = True
+    config.additional_config["afd"].update(
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+        connector_extra_config={"async_moe_ubatching": local_ubatching},
+    )
+    events = []
+
+    def native_init(self, vllm_config, device):
+        events.append("native")
+        self.vllm_config = vllm_config
+
+    connector = SimpleNamespace(control_plane=None)
+
+    def create_connector(*args):
+        events.append("connector")
+        return connector
+
+    monkeypatch.setattr(module.NPUModelRunnerV2, "__init__", native_init)
+    monkeypatch.setattr(module, "_resolve_world_ranks", lambda: (0, 0))
+    monkeypatch.setattr(
+        module.AFDConnectorFactory, "create_connector", create_connector
+    )
+    monkeypatch.setattr(module, "create_afd_npu_profiler", lambda _role: None)
+    if local_ubatching:
+        with pytest.raises(RuntimeError, match="async_moe_ubatching"):
+            module.AFDNPUAttentionModelRunnerV2(
+                config, SimpleNamespace(type="npu", index=0)
+            )
+        assert events == []
+    else:
+        runner = module.AFDNPUAttentionModelRunnerV2(
+            config, SimpleNamespace(type="npu", index=0)
+        )
+        assert runner.connector is connector
+        assert events == ["native", "connector"]
+
+
+@pytest.mark.parametrize("dp_size,tp_size", [(1, 1), (2, 1), (1, 2), (2, 2)])
+def test_npu_v2_validator_accepts_async_cam(dp_size, tp_size):
+    config = _v2_config(
+        num_attention_ranks=dp_size * tp_size,
+        data_parallel_size=dp_size,
+        tensor_parallel_size=tp_size,
+    )
+    config.additional_config["afd"].update(
+        connector="CAMAsyncAFDConnector", async_dp=True, compute_gate_on_attention=True
+    )
+    validate_npu_model_runner_v2_config(
+        config, expected_role="attention", device_type="npu"
+    )
+
+
+@pytest.mark.parametrize(
+    "target,field,value,error",
+    [
+        ("afd", "async_dp", False, "async DP"),
+        ("afd", "compute_gate_on_attention", False, "compute_gate_on_attention"),
+        ("model", "enforce_eager", False, "eager"),
+        ("parallel", "pipeline_parallel_size", 2, "PP or CP"),
+        ("parallel", "prefill_context_parallel_size", 2, "PP or CP"),
+        ("parallel", "decode_context_parallel_size", 2, "PP or CP"),
+        ("parallel", "enable_dbo", True, "DBO"),
+        ("parallel", "use_ubatching", True, "ubatching"),
+        ("parallel", "use_sequence_parallel_moe", True, "static expert"),
+    ],
+)
+def test_npu_v2_validator_rejects_unsupported_async_cam(target, field, value, error):
+    config = _v2_config()
+    config.additional_config["afd"].update(
+        connector="CAMAsyncAFDConnector", async_dp=True, compute_gate_on_attention=True
+    )
+    if target == "afd":
+        config.additional_config["afd"][field] = value
+    else:
+        setattr(getattr(config, f"{target}_config"), field, value)
+    with pytest.raises(RuntimeError, match=error):
+        validate_npu_model_runner_v2_config(
+            config, expected_role="attention", device_type="npu"
         )
 
 
@@ -1030,7 +1123,7 @@ def test_v2_dp2_repeated_fullgraph_replay_sends_local_real_and_padded_tokens(
     descriptor = SimpleNamespace(num_tokens=8)
     payloads = []
     metadata_seen = []
-    replay_returns = []
+    replay_returns: list[str] = []
 
     class ReplayConnector(_RecordingConnector):
         def send_dp_metadata_list(self, payload):
@@ -1163,7 +1256,11 @@ def test_v2_graph_miss_uses_provider_once_without_replay_control(monkeypatch):
     runner.vllm_config.compilation_config.cudagraph_mode = (
         CUDAGraphMode.FULL_DECODE_ONLY
     )
-    replay_calls = []
+
+    def unexpected_replay(_desc):
+        pytest.fail("graph miss must not replay a captured graph")
+
+    monkeypatch.setattr(runner.cudagraph_manager, "run_fullgraph", unexpected_replay)
     context = ForwardContext(
         no_compile_layers={},
         attn_metadata={},
@@ -1203,7 +1300,6 @@ def test_v2_graph_miss_uses_provider_once_without_replay_control(monkeypatch):
         )
         == "eager-result"
     )
-    assert replay_calls == []
     assert events == ["control_update", "control_send", "data"]
     assert cudagraph_utils.CudaGraphManager.run_fullgraph is class_replay
 
@@ -1655,7 +1751,7 @@ def test_v2_shutdown_runs_all_cleanup_layers_when_each_layer_fails(
         if failure == "connector":
             raise RuntimeError("connector failed")
 
-    runner.connector.close = close_connector
+    monkeypatch.setattr(runner.connector, "close", close_connector)
     monkeypatch.setattr(
         "afd_plugin.v1.worker.attention_model_runner_v2.stop_afd_gpu_profiler",
         stop_profiler,

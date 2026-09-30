@@ -155,14 +155,14 @@ def test_gate_proxy_sends_routing_payload(monkeypatch):
     proxy.vllm_config = object()
     proxy.config = object()
     proxy.top_k = 2
-    proxy.cam_router = object()
+    proxy.gate_router = object()
     hidden_states = torch.ones(1, 4)
 
     output = proxy(hidden_states)
 
     assert len(gate_calls) == 1
     assert gate_calls[0]["gate"] is proxy.gate
-    assert gate_calls[0]["cam_router"] is proxy.cam_router
+    assert gate_calls[0]["gate_router"] is proxy.gate_router
     assert [event[0] for event in events] == ["send", "yield", "recv"]
     send_kwargs = events[0][3]
     assert send_kwargs["router_logits"] is router_logits

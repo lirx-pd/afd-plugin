@@ -245,7 +245,7 @@ class GateOnlyRemoteMoE(RemoteFFNProxy):
             create_gate_router,
         )
 
-        self.cam_router = create_gate_router(
+        self.gate_router = create_gate_router(
             gate=self.gate,
             vllm_config=vllm_config,
             config=config,
@@ -264,7 +264,7 @@ class GateOnlyRemoteMoE(RemoteFFNProxy):
                 config=self.config,
                 top_k=self.top_k,
                 hidden_states=hidden_states,
-                cam_router=self.cam_router,
+                gate_router=self.gate_router,
             )
         )
         return self._send_and_receive(

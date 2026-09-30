@@ -303,7 +303,7 @@ def test_npu_gate_only_uses_native_gate_precision_and_checkpoint_name(
     )
 
     gate = layer.mlp.gate
-    assert layer.mlp.cam_router.gate is gate
+    assert layer.mlp.gate_router.gate is gate
     assert gate_calls == [
         (
             8,

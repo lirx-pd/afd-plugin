@@ -73,7 +73,7 @@ def compute_attention_gate_topk(
         config=layer.config,
         top_k=layer.top_k,
         hidden_states=hidden_states,
-        cam_router=layer.mlp.cam_router,
+        gate_router=layer.mlp.gate_router,
     )
 
 
@@ -84,7 +84,7 @@ def compute_gate_topk(
     config: _DeepseekAdapterConfig,
     top_k: int,
     hidden_states: torch.Tensor,
-    cam_router: FusedMoERouter | None = None,
+    gate_router: FusedMoERouter | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute routing payloads for a native-path gate proxy."""
 
@@ -127,7 +127,7 @@ def compute_gate_topk(
         num_logical_experts=router_logits.shape[1],
         num_shared_experts=config.n_shared_experts,
         num_experts=num_experts,
-        router=cam_router,
+        router=gate_router,
     )
     if force_balanced_topk_ids_enabled():
         topk_ids = _force_balanced_topk_ids(

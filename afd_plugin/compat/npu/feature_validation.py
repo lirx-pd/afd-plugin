@@ -192,10 +192,6 @@ def _fail_if_unsupported_npu_afd_async_features(
             "CAMAsyncAFDConnector does not support vLLM native ubatching/DBO",
         )
     if vllm_config.use_v2_model_runner and afd_config.is_attention_server:
-        if extra_info.async_moe_ubatching:
-            raise RuntimeError(
-                "AFD NPU ModelRunnerV2 Async CAM does not support async_moe_ubatching",
-            )
         # CAM's per-rank window uses integer division, while replicated TP
         # input layout rounds up; reject capacities whose profile batch overflows.
         if (
@@ -207,12 +203,13 @@ def _fail_if_unsupported_npu_afd_async_features(
                 "divisible by attn_ranks_per_dp",
             )
         model_config = vllm_config.model_config
-        if (
+        if not _is_dsv4_target(vllm_config) and (
             model_config.hf_text_config.model_type not in {"deepseek_v2", "deepseek_v3"}
             or not model_config.use_mla
         ):
             raise RuntimeError(
-                "AFD NPU ModelRunnerV2 Async CAM requires DeepSeek-V2/V3 MLA",
+                "AFD NPU ModelRunnerV2 Async CAM requires DeepSeek-V2/V3 MLA "
+                "or DeepSeek-V4",
             )
         additional_config = vllm_config.additional_config
         if additional_config.get("enable_shared_expert_dp", False) or any(

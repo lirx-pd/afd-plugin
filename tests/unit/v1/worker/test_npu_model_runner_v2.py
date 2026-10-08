@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import inspect
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -38,9 +38,13 @@ def _runner(*, async_dp=False):
     runner.afd_config = SimpleNamespace(
         async_dp=async_dp, num_attention_ranks=2, num_ffn_ranks=2
     )
+    runner.connector = SimpleNamespace(
+        extra_info=SimpleNamespace(async_moe_ubatching=False)
+    )
     runner.cudagraph_manager = None
     runner.prof = object()
     runner._afd_pending_metadata = object()
+    runner._afd_async_moe_ubatch_metadata = None
     runner._afd_suppress_metadata_send = True
     runner._is_warmup = True
     runner._afd_is_graph_capturing = True
@@ -52,6 +56,7 @@ def _runner(*, async_dp=False):
 def _state(runner):
     return (
         runner._afd_pending_metadata,
+        runner._afd_async_moe_ubatch_metadata,
         runner._afd_suppress_metadata_send,
         runner._is_warmup,
         runner._afd_is_graph_capturing,
@@ -137,6 +142,55 @@ def test_execute_forwards_dummy_profile_and_context_then_restores(
     assert step_calls == [runner.prof]
     assert _state(runner) == original_state
     assert forward_module.create_forward_context is original_factory
+
+
+@pytest.mark.parametrize("async_dp", [False, True])
+@pytest.mark.parametrize("stages_enabled", [False, True])
+@pytest.mark.parametrize("raise_in_native", [False, True])
+def test_execute_installs_local_stages_without_control_and_restores(
+    monkeypatch, async_dp, stages_enabled, raise_in_native
+):
+    runner = _runner(async_dp=async_dp)
+    runner.connector.control_plane = None
+    runner.connector.extra_info.async_moe_ubatching = stages_enabled
+    previous = object()
+    current = object()
+    runner._afd_async_moe_ubatch_metadata = previous
+    context = SimpleNamespace(additional_kwargs={}, ubatch_slices=None)
+    events = []
+
+    @contextmanager
+    def stage_scope(self):
+        events.append("enter")
+        self._afd_async_moe_ubatch_metadata = current
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    monkeypatch.setattr(npu_v2, "use_async_cam_stage_metadata", stage_scope)
+    monkeypatch.setattr(npu_v2, "step_afd_npu_profiler", lambda _: None)
+    monkeypatch.setattr(
+        afd_context.forward_context_module, "create_forward_context", lambda: context
+    )
+
+    def native_execute(self, *args, **kwargs):
+        ctx = afd_context.forward_context_module.create_forward_context()
+        assert ctx.additional_kwargs["afd_metadata"] is self._afd_pending_metadata
+        stage_plan = ctx.additional_kwargs.get(npu_v2.ASYNC_MOE_UBATCH_METADATA_KEY)
+        assert stage_plan is (current if async_dp and stages_enabled else None)
+        if raise_in_native:
+            raise RuntimeError("native failed")
+        return "result"
+
+    monkeypatch.setattr(NPUModelRunner, "execute_model", native_execute)
+    if raise_in_native:
+        with pytest.raises(RuntimeError, match="native failed"):
+            runner.execute_model(None)
+    else:
+        assert runner.execute_model(None) == "result"
+    assert events == (["enter", "exit"] if async_dp and stages_enabled else [])
+    assert runner._afd_async_moe_ubatch_metadata is previous
 
 
 @pytest.mark.parametrize("profile_only", [False, True])

@@ -536,22 +536,16 @@ def test_npu_async_v2_constructor_validates_before_native_and_connector_init(
         module.AFDConnectorFactory, "create_connector", create_connector
     )
     monkeypatch.setattr(module, "create_afd_npu_profiler", lambda _role: None)
-    if local_ubatching:
-        with pytest.raises(RuntimeError, match="async_moe_ubatching"):
-            module.AFDNPUAttentionModelRunnerV2(
-                config, SimpleNamespace(type="npu", index=0)
-            )
-        assert events == []
-    else:
-        runner = module.AFDNPUAttentionModelRunnerV2(
-            config, SimpleNamespace(type="npu", index=0)
-        )
-        assert runner.connector is connector
-        assert events == ["native", "connector"]
+    runner = module.AFDNPUAttentionModelRunnerV2(
+        config, SimpleNamespace(type="npu", index=0)
+    )
+    assert runner.connector is connector
+    assert events == ["native", "connector"]
 
 
 @pytest.mark.parametrize("dp_size,tp_size", [(1, 1), (2, 1), (1, 2), (2, 2)])
-def test_npu_v2_validator_accepts_async_cam(dp_size, tp_size):
+@pytest.mark.parametrize("use_sp", [False, True])
+def test_npu_v2_validator_accepts_async_cam(dp_size, tp_size, use_sp):
     config = _v2_config(
         num_attention_ranks=dp_size * tp_size,
         data_parallel_size=dp_size,
@@ -560,9 +554,25 @@ def test_npu_v2_validator_accepts_async_cam(dp_size, tp_size):
     config.additional_config["afd"].update(
         connector="CAMAsyncAFDConnector", async_dp=True, compute_gate_on_attention=True
     )
+    config.parallel_config.use_sequence_parallel_moe = use_sp
+    config.compilation_config.pass_config.enable_sp = use_sp
     validate_npu_model_runner_v2_config(
         config, expected_role="attention", device_type="npu"
     )
+
+
+@pytest.mark.parametrize("layout", ["moe_sp", "pass_sp"])
+def test_npu_v2_validator_keeps_synchronous_sp_rejection(layout):
+    config = _v2_config()
+    config.additional_config["afd"]["connector"] = "CAMP2pAFDConnector"
+    if layout == "moe_sp":
+        config.parallel_config.use_sequence_parallel_moe = True
+    else:
+        config.compilation_config.pass_config.enable_sp = True
+    with pytest.raises(RuntimeError, match="static expert"):
+        validate_npu_model_runner_v2_config(
+            config, expected_role="attention", device_type="npu"
+        )
 
 
 @pytest.mark.parametrize(
@@ -576,7 +586,8 @@ def test_npu_v2_validator_accepts_async_cam(dp_size, tp_size):
         ("parallel", "decode_context_parallel_size", 2, "PP or CP"),
         ("parallel", "enable_dbo", True, "DBO"),
         ("parallel", "use_ubatching", True, "ubatching"),
-        ("parallel", "use_sequence_parallel_moe", True, "static expert"),
+        ("parallel", "enable_elastic_ep", True, "static expert"),
+        ("parallel", "enable_eplb", True, "static expert"),
     ],
 )
 def test_npu_v2_validator_rejects_unsupported_async_cam(target, field, value, error):

@@ -168,8 +168,13 @@ def validate_npu_model_runner_v2_config(
         not parallel.enable_expert_parallel
         or parallel.enable_elastic_ep
         or parallel.enable_eplb
-        or parallel.use_sequence_parallel_moe
-        or vllm_config.compilation_config.pass_config.enable_sp
+        or (
+            afd_config.connector != AFD_ASYNC_CONNECTOR
+            and (
+                parallel.use_sequence_parallel_moe
+                or vllm_config.compilation_config.pass_config.enable_sp
+            )
+        )
     ):
         raise RuntimeError("AFD ModelRunnerV2 requires static expert parallelism")
     if parallel.enable_dbo or parallel.use_ubatching:

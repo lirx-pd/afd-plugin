@@ -7,7 +7,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from types import MethodType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
@@ -36,11 +36,17 @@ from afd_plugin.connectors import (
     AFDConnectorFactory,
     AFDForwardContextMetadata,
 )
+from afd_plugin.connectors.npu.async_cam import AFDAsyncExtraInfo
 from afd_plugin.model_executor.models.forward_context import use_afd_metadata_provider
+from afd_plugin.model_executor.models.npu.async_cam_layout import (
+    ASYNC_MOE_UBATCH_METADATA_KEY,
+    AsyncMoeUbatchMetadata,
+)
 from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
     _resolve_world_ranks,
 )
+from afd_plugin.v1.worker.npu.async_cam_metadata_v2 import use_async_cam_stage_metadata
 from afd_plugin.validation import validate_npu_model_runner_v2_config
 
 if TYPE_CHECKING:
@@ -169,6 +175,7 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             self._afd_is_profile = False
             self._afd_is_graph_replaying = False
             self._afd_pending_metadata: AFDForwardContextMetadata | None = None
+            self._afd_async_moe_ubatch_metadata: AsyncMoeUbatchMetadata | None = None
             self._afd_suppress_metadata_send = False
             self._afd_transaction_counter = 0
             self.prof = create_afd_npu_profiler("attention")
@@ -195,6 +202,16 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                 "AFD ModelRunnerV2 requires a native eager BatchDescriptor",
             )
         return int(batch_descriptor.num_tokens)
+
+    def install_afd_metadata_on_forward_context(
+        self, forward_context: ForwardContext
+    ) -> None:
+        super().install_afd_metadata_on_forward_context(forward_context)
+        if self._afd_async_moe_ubatch_metadata is not None:
+            assert forward_context.additional_kwargs is not None
+            forward_context.additional_kwargs[ASYNC_MOE_UBATCH_METADATA_KEY] = (
+                self._afd_async_moe_ubatch_metadata
+            )
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
@@ -374,6 +391,8 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             and self.cudagraph_manager is not None
         )
         previous_metadata = self._afd_pending_metadata
+        previous_stage_metadata = self._afd_async_moe_ubatch_metadata
+        self._afd_async_moe_ubatch_metadata = None
         previous_suppress_send = self._afd_suppress_metadata_send
         previous_is_warmup = self._is_warmup
         previous_is_graph_capturing = self._afd_is_graph_capturing
@@ -394,6 +413,12 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             with (
                 skip_dp_coordination() if self.afd_config.async_dp else nullcontext(),
                 replay_scope,
+                use_async_cam_stage_metadata(self)
+                if self.afd_config.async_dp
+                and cast(
+                    AFDAsyncExtraInfo, self.connector.extra_info
+                ).async_moe_ubatching
+                else nullcontext(),
                 use_afd_metadata_provider(
                     self.install_afd_metadata_on_forward_context,
                 ),
@@ -409,6 +434,7 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                 )
         finally:
             self._afd_pending_metadata = previous_metadata
+            self._afd_async_moe_ubatch_metadata = previous_stage_metadata
             self._afd_suppress_metadata_send = previous_suppress_send
             self._is_warmup = previous_is_warmup
             self._afd_is_graph_capturing = previous_is_graph_capturing

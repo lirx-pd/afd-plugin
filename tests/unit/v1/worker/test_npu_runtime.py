@@ -3498,7 +3498,6 @@ def test_npu_attention_runner_afd_ubatching_does_not_install_native_wrapper(
 @pytest.mark.parametrize(
     "extra_config,additional_config,model_type,use_mla,error",
     [
-        ({"async_moe_ubatching": True}, {}, "deepseek_v2", True, "async_moe_ubatching"),
         (
             {},
             {"enable_shared_expert_dp": True},
@@ -3521,7 +3520,7 @@ def test_npu_attention_runner_afd_ubatching_does_not_install_native_wrapper(
                 "lmhead_tensor_parallel_size",
             )
         ],
-        ({}, {}, "deepseek_v4", True, "DeepSeek-V2/V3 MLA"),
+        ({}, {}, "qwen3_moe", True, "DeepSeek-V2/V3 MLA"),
         ({}, {}, "deepseek_v2", False, "DeepSeek-V2/V3 MLA"),
     ],
 )
@@ -3542,21 +3541,35 @@ def test_npu_async_mrv2_feature_boundaries(
         fail_if_unsupported_npu_afd_features(config)
 
 
-@pytest.mark.parametrize("tp_size", [1, 2])
-def test_npu_async_mrv2_features_allow_plain_tp(tp_size):
-    fail_if_unsupported_npu_afd_features(
-        _vllm_config(
-            connector="CAMAsyncAFDConnector",
-            async_dp=True,
-            compute_gate_on_attention=True,
-            use_v2_model_runner=True,
-            use_mla=True,
-            tensor_parallel_size=tp_size,
-            num_attention_ranks=2 * tp_size,
-            data_parallel_size=2,
-            extra_config={"attn_ranks_per_dp": tp_size},
-        )
+@pytest.mark.parametrize(
+    "model_type,use_mla",
+    [("deepseek_v2", True), ("deepseek_v3", True), ("deepseek_v4", False)],
+)
+@pytest.mark.parametrize("tp_size,use_sp", [(1, False), (2, False), (2, True)])
+@pytest.mark.parametrize("local_ubatching", [False, True])
+def test_npu_async_mrv2_features_allow_model_layouts(
+    model_type, use_mla, tp_size, use_sp, local_ubatching
+):
+    config = _vllm_config(
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+        use_v2_model_runner=True,
+        use_mla=use_mla,
+        tensor_parallel_size=tp_size,
+        use_sequence_parallel_moe=use_sp,
+        num_attention_ranks=2 * tp_size,
+        data_parallel_size=2,
+        extra_config={
+            "attn_ranks_per_dp": tp_size,
+            "dynamicQuant": 1,
+            "async_moe_ubatching": local_ubatching,
+            "async_moe_split": "token" if tp_size > 1 else "request",
+        },
     )
+    config.model_config.hf_text_config.model_type = model_type
+    config.additional_config["enable_flashcomm1"] = use_sp
+    fail_if_unsupported_npu_afd_features(config)
 
 
 def test_npu_async_mrv2_rejects_fractional_tp_capacity():

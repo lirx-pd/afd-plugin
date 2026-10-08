@@ -254,7 +254,18 @@ def test_remote_moe_without_context_ids_raises_instead_of_sending_activations_on
         ("softmax", "_compute_standard_topk"),
     ],
 )
-def test_dsv4_router_uses_model_gate(monkeypatch, scoring_func, selector):
+@pytest.mark.parametrize("in_profile_run", [False, True])
+def test_dsv4_router_uses_model_gate(
+    monkeypatch, scoring_func, selector, in_profile_run
+):
+    extra_context = types.ModuleType("vllm_ascend.ascend_forward_context")
+    extra_context._EXTRA_CTX = types.SimpleNamespace(  # type: ignore[attr-defined]
+        in_profile_run=in_profile_run
+    )
+    monkeypatch.setitem(
+        sys.modules, "vllm_ascend.ascend_forward_context", extra_context
+    )
+    monkeypatch.setenv("AFD_FORCE_BALANCED_TOPK_IDS", "1")
     hidden = torch.tensor([[1.0, 0.25]], dtype=torch.bfloat16)
     router_input = torch.tensor([[1.0, 1.001953125]], dtype=torch.float32)
     router_logits = router_input
@@ -282,5 +293,6 @@ def test_dsv4_router_uses_model_gate(monkeypatch, scoring_func, selector):
     )
 
     assert torch.equal(captured[0], router_logits)
-    assert ids.tolist() == [[1]]
+    assert ids.tolist() == [[0 if in_profile_run else 1]]
+    assert weights.tolist() == [[1.0]]
     assert weights.dtype == torch.float32

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Final
 
@@ -35,7 +36,8 @@ class AsyncMoeUbatchMetadata:
     padded layout restored after both stages.
     """
 
-    attn_metadata: list[dict[str, AttentionMetadata]]
+    # Native memory profiling skips Attention but still executes CAM and FFN.
+    attn_metadata: Sequence[dict[str, AttentionMetadata] | None]
     stages: tuple[AsyncMoeStage, ...]
     parent_input_tokens: int
     use_sequence_parallel: bool

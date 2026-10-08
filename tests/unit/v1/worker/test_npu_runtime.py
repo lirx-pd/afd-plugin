@@ -3109,6 +3109,88 @@ def test_npu_async_feature_validation_rejects_native_ubatching(
         )
 
 
+@pytest.mark.parametrize("use_v2_model_runner", [False, True])
+@pytest.mark.parametrize(
+    ("method", "rejected"),
+    [
+        ("mtp", True),
+        ("eagle3", True),
+        ("draft_model", True),
+        ("ngram", False),
+        ("ngram_gpu", False),
+        ("suffix", False),
+    ],
+)
+def test_npu_async_feature_validation_rejects_native_draft_models(
+    use_v2_model_runner,
+    method,
+    rejected,
+):
+    _require_npu_runtime()
+    from vllm.config.speculative import SpeculativeConfig
+
+    # Use the pinned classifiers without loading a draft model's HF config.
+    speculative_config = object.__new__(SpeculativeConfig)
+    speculative_config.method = method
+    config = _vllm_config(
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        use_mla=True,
+        use_v2_model_runner=use_v2_model_runner,
+        speculative_config=speculative_config,
+    )
+    if rejected:
+        with pytest.raises(RuntimeError, match="native draft models or MTP"):
+            fail_if_unsupported_npu_afd_features(config)
+    else:
+        fail_if_unsupported_npu_afd_features(config)
+
+
+@pytest.mark.parametrize("use_v2_model_runner", [False, True])
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+@pytest.mark.parametrize(
+    ("factor", "max_num_batched_tokens", "rejected"),
+    [
+        ("0.015625", 8192, True),
+        ("0.015625", 4096, False),
+        ("0.5", 8192, False),
+        (None, 262144, False),
+        ("0", 16, True),
+        ("nan", 16, True),
+        ("invalid", 16, True),
+        ("0.01_5625", 4096, True),
+    ],
+)
+def test_npu_async_feature_validation_checks_receive_capacity(
+    monkeypatch,
+    use_v2_model_runner,
+    role,
+    factor,
+    max_num_batched_tokens,
+    rejected,
+):
+    if factor is None:
+        monkeypatch.delenv("BATCH_SIZE_FACTOR", raising=False)
+    else:
+        monkeypatch.setenv("BATCH_SIZE_FACTOR", factor)
+    config = _vllm_config(
+        role=role,
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        use_mla=True,
+        use_v2_model_runner=use_v2_model_runner,
+        num_attention_ranks=2,
+        tensor_parallel_size=2 if role == "attention" else 1,
+        extra_config={"attn_ranks_per_dp": 2},
+    )
+    config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
+    if rejected:
+        with pytest.raises(RuntimeError, match="BATCH_SIZE_FACTOR"):
+            fail_if_unsupported_npu_afd_features(config)
+    else:
+        fail_if_unsupported_npu_afd_features(config)
+
+
 def test_npu_async_feature_validation_allows_dynamic_quant_zero_or_one():
     fail_if_unsupported_npu_afd_features(
         _vllm_config(

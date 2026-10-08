@@ -363,8 +363,10 @@ def run_async_moe_ubatch_afd_forward(
         stage_forward_context.attn_metadata = async_moe_ubatch_metadata.attn_metadata[
             stage_idx
         ]
+        # Ascend MRV2 reads its token count from kwargs, while MRV1 uses the attribute.
         stage_forward_context.additional_kwargs = dict(
             forward_context.additional_kwargs or {},
+            num_tokens=stage.actual_tokens,
         )
         stage_forward_context.ubatch_idx = stage_idx
         stage_forward_context.num_ubatches = len(

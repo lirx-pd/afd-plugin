@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 from afd_plugin.config import (
@@ -19,6 +20,10 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
     from afd_plugin.connectors.base import ConnectorExtraInfo
+
+
+# Match MAX_SEQUENCE_LENGTH in csrc/npu/pybind/torch_binding_cam_async.cpp.
+_CAM_MAX_RECEIVE_TOKENS = 1024 * 256
 
 
 def fail_if_unsupported_npu_afd_features(
@@ -190,6 +195,39 @@ def _fail_if_unsupported_npu_afd_async_features(
     if bool(parallel_config.enable_dbo) or bool(parallel_config.use_ubatching):
         raise RuntimeError(
             "CAMAsyncAFDConnector does not support vLLM native ubatching/DBO",
+        )
+    speculative_config = vllm_config.speculative_config
+    # Native draft MoE still uses Attention-side cross-DP collectives.
+    if (
+        afd_config.is_attention_server
+        and speculative_config is not None
+        and (speculative_config.use_eagle() or speculative_config.uses_draft_model())
+    ):
+        raise RuntimeError(
+            "CAMAsyncAFDConnector does not support native draft models or MTP",
+        )
+
+    factor_value = os.environ.get("BATCH_SIZE_FACTOR", "1")
+    try:
+        # Python accepts underscores and Unicode digits that std::stof does not.
+        if not factor_value.isascii() or "_" in factor_value:
+            raise ValueError("Not a native floating-point literal")
+        batch_size_factor = float(factor_value)
+    except ValueError as exc:
+        raise RuntimeError(
+            "BATCH_SIZE_FACTOR must be a decimal number in (0, 1]",
+        ) from exc
+    if not 0 < batch_size_factor <= 1:
+        raise RuntimeError("BATCH_SIZE_FACTOR must be a decimal number in (0, 1]")
+    receive_capacity = int(_CAM_MAX_RECEIVE_TOKENS * batch_size_factor)
+    max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+    # whole-expert chunks need a full TP group's batch; smaller
+    # buffers require native sub-expert chunking.
+    if receive_capacity < max_num_batched_tokens:
+        raise RuntimeError(
+            "CAMAsyncAFDConnector requires BATCH_SIZE_FACTOR to allocate at least "
+            f"max_num_batched_tokens={max_num_batched_tokens} "
+            f"rows; got {receive_capacity}",
         )
     if vllm_config.use_v2_model_runner and afd_config.is_attention_server:
         # CAM's per-rank window uses integer division, while replicated TP

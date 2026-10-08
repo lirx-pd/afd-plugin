@@ -1393,6 +1393,7 @@ def test_v2_graph_miss_uses_provider_once_without_replay_control(monkeypatch):
     runner.vllm_config.compilation_config.cudagraph_mode = (
         CUDAGraphMode.FULL_DECODE_ONLY
     )
+
     def unexpected_replay(_desc):
         pytest.fail("graph miss must not replay a captured graph")
 

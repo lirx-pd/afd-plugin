@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +14,7 @@ from torch import Tensor  # noqa: E402
 pytest.importorskip("vllm")
 
 from vllm.config import ParallelConfig  # noqa: E402
+from vllm.forward_context import override_forward_context  # noqa: E402
 
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
 from afd_plugin.model_executor.models.npu import (  # noqa: E402
@@ -111,7 +111,12 @@ def test_decoder_first_and_later_moe_own_collectives(monkeypatch, num_tokens, tp
 
 
 @pytest.mark.parametrize("use_sp", [False, True])
-def test_two_stages_preserve_dense_prefix_and_restore_once(monkeypatch, use_sp):
+@pytest.mark.parametrize("use_mrv2", [False, True])
+def test_two_stages_preserve_dense_prefix_and_restore_once(
+    monkeypatch, use_sp, use_mrv2
+):
+    ascend_context = pytest.importorskip("vllm_ascend.ascend_forward_context")
+    monkeypatch.setattr(ascend_context.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", use_mrv2)
     tp_size = 2
     hidden = torch.arange(12, dtype=torch.float32).reshape(6, 2)
     metadata = layout.AsyncMoeUbatchMetadata(
@@ -128,13 +133,15 @@ def test_two_stages_preserve_dense_prefix_and_restore_once(monkeypatch, use_sp):
     monkeypatch.setattr(
         schedule, "get_tensor_model_parallel_world_size", lambda: tp_size
     )
-    context = SimpleNamespace(additional_kwargs={})
+    context = SimpleNamespace(
+        num_tokens=4, additional_kwargs={"num_tokens": 4, "in_profile_run": False}
+    )
     monkeypatch.setattr(schedule, "get_forward_context", lambda: context)
     active: list[int] = []
 
     def override(stage_context):
         active[:] = [stage_context.ubatch_idx]
-        return nullcontext()
+        return override_forward_context(stage_context)
 
     monkeypatch.setattr(schedule, "override_forward_context", override)
     monkeypatch.setattr(schedule, "log_async_moe_stage_attention", lambda *args: None)
@@ -162,6 +169,7 @@ def test_two_stages_preserve_dense_prefix_and_restore_once(monkeypatch, use_sp):
         ):
             stage_idx = active[0]
             stage = metadata.stages[stage_idx]
+            assert ascend_context._EXTRA_CTX.num_tokens == stage.actual_tokens
             assert already_sequence_parallel is (use_sp and self.layer_idx == 2)
             expected_rows = stage.actual_tokens if use_sp else stage.input_tokens
             if already_sequence_parallel:
@@ -221,24 +229,27 @@ def test_two_stages_preserve_dense_prefix_and_restore_once(monkeypatch, use_sp):
         return complete_stages[stage_idx]
 
     monkeypatch.setattr(layout, "tensor_model_parallel_all_gather", gather)
-    output, residual = schedule.run_async_moe_ubatch_afd_forward(
-        SimpleNamespace(
-            layers=[Dense(), MoE(1), MoE(2)],
-            start_layer=0,
-            end_layer=3,
-            vllm_config=SimpleNamespace(
-                parallel_config=SimpleNamespace(
-                    use_sequence_parallel_moe=use_sp, pipeline_parallel_size=1
-                )
+    with override_forward_context(context):
+        output, residual = schedule.run_async_moe_ubatch_afd_forward(
+            SimpleNamespace(
+                layers=[Dense(), MoE(1), MoE(2)],
+                start_layer=0,
+                end_layer=3,
+                vllm_config=SimpleNamespace(
+                    parallel_config=SimpleNamespace(
+                        use_sequence_parallel_moe=use_sp, pipeline_parallel_size=1
+                    )
+                ),
             ),
-        ),
-        hidden,
-        None,
-        torch.arange(6),
-        SimpleNamespace(connector=connector),
-        metadata,
-        torch.ones(1, 6),
-    )
+            hidden,
+            None,
+            torch.arange(6),
+            SimpleNamespace(connector=connector),
+            metadata,
+            torch.ones(1, 6),
+        )
+        assert ascend_context._EXTRA_CTX.num_tokens == 4
+    assert context.additional_kwargs == {"num_tokens": 4, "in_profile_run": False}
     assert events[0] == "dense"
     assert gathers == ([0, 1] if use_sp else [])
     torch.testing.assert_close(output[:4], hidden[:4] + 10)

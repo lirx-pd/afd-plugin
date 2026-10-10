@@ -271,8 +271,19 @@ def test_layered_switch_rejects_other_roles_connectors_and_models(
         )
 
 
-@pytest.mark.parametrize("eligible", [False, True])
-def test_runner_initializes_ops_before_executor(eligible):
+@pytest.mark.parametrize(
+    "eligible,use_v2_model_runner,use_aclgraph",
+    [
+        (False, False, False),
+        (True, False, False),
+        (True, True, False),
+        (True, False, True),
+        (True, True, True),
+    ],
+)
+def test_runner_initializes_ops_before_executor(
+    eligible, use_v2_model_runner, use_aclgraph
+):
     events: list[str] = []
 
     class Connector:
@@ -288,8 +299,8 @@ def test_runner_initializes_ops_before_executor(eligible):
                 ([layer], "") if eligible else ([], "mixed quantization")
             )
         ),
-        use_aclgraph=False,
-        vllm_config=SimpleNamespace(use_v2_model_runner=False),
+        use_aclgraph=use_aclgraph,
+        vllm_config=SimpleNamespace(use_v2_model_runner=use_v2_model_runner),
         _layered_executor=None,
     )
 
@@ -310,6 +321,12 @@ def test_runner_initializes_ops_before_executor(eligible):
             "logger": SimpleNamespace(info=lambda *args: None),
         },
     )
+    if use_aclgraph:
+        with pytest.raises(ValueError, match="requires eager"):
+            method(runner)
+        assert events == []
+        assert runner._layered_executor is None
+        return
     method(runner)
     assert events == (["ops", "executor"] if eligible else [])
     assert (runner._layered_executor is not None) == eligible

@@ -124,10 +124,8 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                         raise ValueError("layered W4A8 GMM requires Ascend 910C/A3")
                     if self.connector.dynamic_quant != 1:
                         raise ValueError("layered W4A8 GMM requires dynamicQuant=1")
-                    if self.use_aclgraph or self.vllm_config.use_v2_model_runner:
-                        raise ValueError(
-                            "layered W4A8 GMM requires eager ModelRunnerV1"
-                        )
+                    if self.use_aclgraph:
+                        raise ValueError("layered W4A8 GMM requires eager execution")
                     if tuple(sorted(layer.layer_idx for layer in layers)) != tuple(
                         _ffn_layer_indices(self)
                     ):

@@ -365,9 +365,10 @@ AFD_ASYNC_CAM_LAYERED_GMM=1 bash <W4A8-FFN-launch-script>
 ```
 
 The intended configuration is Ascend 910C / `ascend910_93`, async CAM FFN,
-Attention-side gate, `dynamicQuant=1`, eager ModelRunnerV1, and static expert
-placement. This path applies only to Ascend DeepSeek V4; enabling the switch
-for another model fails at startup. All remote MoE layers must share geometry,
+Attention-side gate, `dynamicQuant=1`, eager execution, and static expert
+placement. `VLLM_USE_V2_MODEL_RUNNER=1` may be set on both roles; FFN still uses
+its connector-driven runner. This path applies only to Ascend DeepSeek V4;
+enabling the switch for another model fails at startup. All remote MoE layers must share geometry,
 SiLU activation, quantization layout, and scaling semantics. The extractor
 can represent per-channel and per-group parameters, but the pinned Ascend
 loader rejects positive `group_size`; the current target is limited to

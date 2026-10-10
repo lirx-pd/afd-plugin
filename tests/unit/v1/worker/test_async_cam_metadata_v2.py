@@ -7,21 +7,23 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import torch
 
+torch = pytest.importorskip("torch")
 pytest.importorskip("vllm_ascend")
 
-from vllm.config import (
+from vllm.config import (  # noqa: E402
     CUDAGraphMode,
     get_current_vllm_config,
     set_current_vllm_config,
 )
-from vllm.v1.worker.utils import AttentionGroup
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
+from vllm.v1.worker.utils import AttentionGroup  # noqa: E402
+from vllm_ascend.attention.attention_v1 import AscendAttentionState  # noqa: E402
+from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder  # noqa: E402
 
-from afd_plugin.model_executor.models.npu.async_cam_layout import AsyncMoeUbatchMetadata
-from afd_plugin.v1.worker.npu import async_cam_metadata_v2 as module
+from afd_plugin.model_executor.models.npu.async_cam_layout import (  # noqa: E402
+    AsyncMoeUbatchMetadata,
+)
+from afd_plugin.v1.worker.npu import async_cam_metadata_v2 as module  # noqa: E402
 
 
 def _batch(scheduled=(2, 6, 2), parent_padding=2):

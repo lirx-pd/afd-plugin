@@ -11,7 +11,11 @@ import torch
 
 pytest.importorskip("vllm_ascend")
 
-from vllm.config import CUDAGraphMode
+from vllm.config import (
+    CUDAGraphMode,
+    get_current_vllm_config,
+    set_current_vllm_config,
+)
 from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
@@ -108,6 +112,37 @@ def _group(layer_name, *, dsa=False, group_id=0):
     group = AttentionGroup(backend, [layer_name], spec, group_id)
     group.metadata_builders = [builder_cls(spec, group.layer_names, None, "cpu")]
     return group
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_lazy_stage_builders_scope_and_restore_current_config(monkeypatch, raises):
+    runner = _runner()
+    parent_config = _runner().vllm_config
+    group = _group("layer")
+    batch = _batch()
+    table = torch.ones((3, 1), dtype=torch.int32)
+    slots = torch.arange(12, dtype=torch.int64).reshape(1, 12)
+    create = AttentionGroup.create_metadata_builders
+
+    def create_builders(self, *args, **kwargs):
+        assert get_current_vllm_config() is runner.vllm_config
+        if raises:
+            raise RuntimeError("lazy builder failed")
+        return create(self, *args, **kwargs)
+
+    monkeypatch.setattr(AttentionGroup, "create_metadata_builders", create_builders)
+    with set_current_vllm_config(parent_config):
+        if raises:
+            with pytest.raises(RuntimeError, match="lazy builder failed"):
+                module.build_async_cam_stage_metadata(
+                    runner, batch, (table,), slots, [[group]]
+                )
+        else:
+            result = module.build_async_cam_stage_metadata(
+                runner, batch, (table,), slots, [[group]]
+            )
+            assert len(result.stages) == 2
+        assert get_current_vllm_config() is parent_config
 
 
 @pytest.mark.parametrize("sp", [False, True])

@@ -12,7 +12,7 @@ from types import MethodType
 from typing import TYPE_CHECKING, cast
 
 import torch
-from vllm.config import CUDAGraphMode
+from vllm.config import CUDAGraphMode, set_current_vllm_config
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -114,12 +114,14 @@ def build_async_cam_stage_metadata(
             if len(group.metadata_builders) < len(stages) + 1:
                 # Preserve native builder zero and its kernel/storage block sizes.
                 stage_group = copy(group)
-                stage_group.create_metadata_builders(
-                    runner.vllm_config,
-                    runner.device,
-                    kernel_block_size=runner.kernel_block_sizes[group_idx],
-                    num_metadata_builders=len(stages),
-                )
+                # Backend selection reads the current config before construction.
+                with set_current_vllm_config(runner.vllm_config):
+                    stage_group.create_metadata_builders(
+                        runner.vllm_config,
+                        runner.device,
+                        kernel_block_size=runner.kernel_block_sizes[group_idx],
+                        num_metadata_builders=len(stages),
+                    )
                 group.metadata_builders.extend(stage_group.metadata_builders)
             for stage_idx, stage_common in enumerate(
                 split_attn_metadata(slices, common)

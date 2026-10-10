@@ -216,11 +216,11 @@ def run_async_moe_ubatch_forward(
                 None,
                 use_sequence_parallel=metadata.use_sequence_parallel,
             )
-        stage_shared_outputs[stage_idx] = (
-            layer.mlp.shared_experts(stage_hidden)
-            if layer.mlp.shared_experts is not None
-            else None
-        )
+            stage_shared_outputs[stage_idx] = (
+                layer.mlp.shared_experts(stage_hidden)
+                if layer.mlp.shared_experts is not None
+                else None
+            )
         stage_pending_dispatches[stage_idx] = dispatch
         stage_ffn_state[stage_idx] = (ffn_residual, ffn_post, ffn_comb)
 

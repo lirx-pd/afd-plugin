@@ -12,9 +12,9 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
-from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.models.deepseek_v4.model import DeepseekV2MLP
 from vllm_ascend.quantization.method_adapters import AscendLinearMethod
 from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import (
@@ -75,7 +75,7 @@ class AFDDeepseekV4SharedExperts(DeepseekV2MLP):
 
         if self.is_sequence_parallel:
             x = tensor_model_parallel_all_gather(x, dim=0)
-            x = x[: get_forward_context().num_tokens]
+            x = x[: _EXTRA_CTX.num_tokens]
 
         output = self._run_local_mlp(x)
         if not self.is_sequence_parallel:

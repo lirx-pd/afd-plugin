@@ -382,12 +382,17 @@ def test_deepseek_afd_attention_gate_can_force_balanced_topk_ids():
     assert "def _force_balanced_topk_ids(" in gate_source
     assert "topk_ids.copy_(balanced_topk_ids)" in gate_source
     assert "topk_weights, topk_ids = afd_connector.select_experts(" in (gate_source)
-    assert "if force_balanced_topk_ids_enabled():" in gate_source
+    assert (
+        "if force_balanced_topk_ids_enabled() or _EXTRA_CTX.in_profile_run:"
+        in gate_source
+    )
     assert (
         gate_source.index(
             "topk_weights, topk_ids = afd_connector.select_experts(",
         )
-        < gate_source.index("if force_balanced_topk_ids_enabled():")
+        < gate_source.index(
+            "if force_balanced_topk_ids_enabled() or _EXTRA_CTX.in_profile_run:"
+        )
         < gate_source.index("topk_weights = topk_weights.to(torch.float32)")
     )
 

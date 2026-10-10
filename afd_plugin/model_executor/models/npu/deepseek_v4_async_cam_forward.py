@@ -144,7 +144,10 @@ def run_async_moe_ubatch_forward(
         stage = metadata.stages[stage_idx]
         context = copy(parent_context)
         context.attn_metadata = metadata.attn_metadata[stage_idx]
-        context.additional_kwargs = dict(parent_context.additional_kwargs or {})
+        # Ascend MRV2 reads its token count from kwargs, while MRV1 uses the attribute.
+        context.additional_kwargs = dict(
+            parent_context.additional_kwargs or {}, num_tokens=stage.actual_tokens
+        )
         context.ubatch_idx = stage_idx
         context.num_ubatches = len(metadata.stages)
         context.dbo_enabled = False
@@ -213,11 +216,11 @@ def run_async_moe_ubatch_forward(
                 None,
                 use_sequence_parallel=metadata.use_sequence_parallel,
             )
-        stage_shared_outputs[stage_idx] = (
-            layer.mlp.shared_experts(stage_hidden)
-            if layer.mlp.shared_experts is not None
-            else None
-        )
+            stage_shared_outputs[stage_idx] = (
+                layer.mlp.shared_experts(stage_hidden)
+                if layer.mlp.shared_experts is not None
+                else None
+            )
         stage_pending_dispatches[stage_idx] = dispatch
         stage_ffn_state[stage_idx] = (ffn_residual, ffn_post, ffn_comb)
 

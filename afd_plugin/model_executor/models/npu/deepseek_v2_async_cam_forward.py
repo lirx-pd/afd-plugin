@@ -15,6 +15,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import (
+    ForwardContext,
     get_forward_context,
     override_forward_context,
 )
@@ -322,6 +323,25 @@ def run_async_moe_ubatch_afd_forward(
         None for _ in stage_hidden_states
     ]
 
+    def make_stage_forward_context(stage_idx: int) -> ForwardContext:
+        stage = async_moe_ubatch_metadata.stages[stage_idx]
+        stage_forward_context = copy(forward_context)
+        stage_forward_context.attn_metadata = async_moe_ubatch_metadata.attn_metadata[
+            stage_idx
+        ]
+        # Ascend MRV2 reads its token count from kwargs, while MRV1 uses the attribute.
+        stage_forward_context.additional_kwargs = dict(
+            forward_context.additional_kwargs or {},
+            num_tokens=stage.actual_tokens,
+        )
+        stage_forward_context.ubatch_idx = stage_idx
+        stage_forward_context.num_ubatches = len(
+            async_moe_ubatch_metadata.stages,
+        )
+        stage_forward_context.dbo_enabled = False
+        stage_forward_context.num_tokens = stage.actual_tokens
+        return stage_forward_context
+
     def compute_stage_attention(
         layer: AFDDeepseekV2DecoderLayer,
         stage_idx: int,
@@ -359,19 +379,7 @@ def run_async_moe_ubatch_afd_forward(
                 f"sequence_parallel="
                 f"{async_moe_ubatch_metadata.use_sequence_parallel}",
             )
-        stage_forward_context = copy(forward_context)
-        stage_forward_context.attn_metadata = async_moe_ubatch_metadata.attn_metadata[
-            stage_idx
-        ]
-        stage_forward_context.additional_kwargs = dict(
-            forward_context.additional_kwargs or {},
-        )
-        stage_forward_context.ubatch_idx = stage_idx
-        stage_forward_context.num_ubatches = len(
-            async_moe_ubatch_metadata.stages,
-        )
-        stage_forward_context.dbo_enabled = False
-        stage_forward_context.num_tokens = stage.actual_tokens
+        stage_forward_context = make_stage_forward_context(stage_idx)
         expected_tokens = expected_local_tokens
         log_async_moe_stage_attention(
             stage_idx,
@@ -432,9 +440,10 @@ def run_async_moe_ubatch_afd_forward(
             topk_ids=dispatch_payload.topk_ids,
             router_logits=dispatch_payload.router_logits,
         )
-        stage_shared_outputs[stage_idx] = compute_shared_output(
-            layer, stage_hidden_states[stage_idx]
-        )
+        with override_forward_context(make_stage_forward_context(stage_idx)):
+            stage_shared_outputs[stage_idx] = compute_shared_output(
+                layer, stage_hidden_states[stage_idx]
+            )
         stage_dispatch_layouts[stage_idx] = dispatch_payload.layout
         stage_dispatch_refs[stage_idx] = dispatch_payload.hidden_states
 

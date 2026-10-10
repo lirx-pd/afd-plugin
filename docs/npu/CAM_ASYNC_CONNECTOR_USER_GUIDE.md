@@ -15,8 +15,9 @@ v0.30 evidence covers V2-Lite ordinary Async CAM and DSV4 Flash W4A8 layered
 off/on, each with a representative 300-question comparison. See the
 [NPU validation record](https://github.com/vllm-project/afd-plugin/pull/425#issuecomment-6063910923).
 
-DSV2 model SP with TP-sharded shared experts has a known correctness defect
-tracked separately from the upgrade; see the [runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix).
+The linked upgrade record predates MRV2 Async CAM support and records a DSV2
+SP defect with TP-sharded shared experts. Its results retain that baseline
+scope; see the [runtime matrix](../design/module/execution_platforms.md#tested-runtime-matrix).
 
 > [!WARNING]
 > CAM async remains experimental. The following evidence is historical v0.26. The linked PCP8 recipe and
@@ -42,6 +43,40 @@ the models and configurations recorded above:
 CAM async currently does not support ACL graph execution or vLLM native DBO.
 When a decode batch cannot form two non-empty AFD stages, it runs through the
 normal unsplit attention path.
+
+## ModelRunnerV2 deployment
+
+Attention supports both ModelRunnerV1 and ModelRunnerV2. To select V2, set
+`VLLM_USE_V2_MODEL_RUNNER=1` and `VLLM_PLUGINS=ascend,afd` on both roles.
+Only Attention uses the native V2 model runner; FFN keeps its connector-driven
+runner. Use the pinned vLLM/vLLM-Ascend pair in the installation instructions.
+
+The V2 Async CAM contract is:
+
+- registered DeepSeek-V2/V3 MLA or DeepSeek-V4 models;
+- `--enforce-eager` and `--enable-expert-parallel` on both roles, with
+  `async=true` and `compute_gate_on_attention=true`;
+- PP=PCP=DCP=1, static expert placement, and each role's configured rank count
+  equal to its DP x TP size;
+- `attn_ranks_per_dp` equal to Attention TP, and Attention
+  `--max-num-batched-tokens` divisible by that TP size;
+- `dynamicQuant=1` for DeepSeek-V4 Flash W4A8.
+
+Attention-local FlashComm1/SP is supported. Set
+`VLLM_ASCEND_ENABLE_FLASHCOMM1=1` only on Attention and `0` on FFN;
+shared-expert DP and finegrained TP are unsupported. For V2-Lite MLA Attention,
+explicitly set `--block-size=128`; do not apply this setting to V4.
+
+V2 reuses the existing model-local `async_moe_ubatching` pipeline: exactly two
+request or token stages, with Attention TP > 1 for token splitting. This is
+independent of native DBO, which remains unsupported. For DeepSeek-V2/V3 token
+splitting, pass `--enable-chunked-prefill` so a request crossing the stage
+boundary can attend to its prefix KV. Native draft-model/MTP paths are also
+unsupported.
+
+These are configuration and implementation limits, not accuracy or performance
+guarantees for every model and topology. Historical V1 and layered-GMM results
+above retain their original scope.
 
 ## CAM async data flow
 
@@ -305,9 +340,8 @@ actual vendor library path. Missing source operators fail startup.
 - vLLM native DBO/ubatching is unsupported.
 - AFD-managed MoE ubatching supports exactly two request-boundary or
   token-balanced DP+TP/SP stages.
-- PCP is unsupported by the CAM async model-runner-v1 path.
-- Prefill and decode context parallelism are unsupported with async MoE
-  ubatching.
+- ModelRunnerV2 rejects PP, PCP, and DCP; V1 PCP and async MoE context
+  parallelism remain unsupported.
 - Routed experts should divide evenly across FFN ranks.
 - Historical v0.26 post-fix full-model token-split accuracy reached `0.9522`
   strict match on the complete GSM8K evaluation. Other Ascend hardware, model families,

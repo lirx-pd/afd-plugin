@@ -204,7 +204,8 @@ upstream construction. During device initialization they:
 1. validate Ascend-specific feature combinations;
 2. apply the non-sequence-parallel all-to-all backend correction when needed,
    including legacy explicit-worker launches;
-3. validate the synchronous CAMP2P ModelRunnerV2 subset when V2 is selected;
+3. validate the synchronous CAMP2P or eager Async CAM ModelRunnerV2 subset
+   when V2 is selected;
 4. call `NPUWorker._init_device()`;
 5. initialize the vLLM workspace manager for one or two ubatches;
 6. construct the matching V1 or V2 Attention runner, or the connector-driven
@@ -279,11 +280,13 @@ and compressor (DSA) backends implement `update_graph_params()` as a no-op and
 register no FIA workspace, so those models, DeepSeek V4 among them, take the
 generic two-stage path with no MLA registries.
 
-The NPU V2 runner supports eager, `FULL`, and `FULL_DECODE_ONLY`. Like CUDA V2,
+With synchronous CAMP2P, the NPU V2 runner supports eager, `FULL`, and
+`FULL_DECODE_ONLY`; Async CAM is eager-only. Like CUDA V2,
 it publishes descriptor-matched warmup/capture control outside formal graph
 capture and installs an instance-scoped pre-replay hook because native full
 replay creates no `ForwardContext`. V2 does not use `AscendUBatchWrapper` and
-rejects DBO/ubatching.
+rejects native DBO/ubatching. Async CAM may use its model-local two-stage MoE
+pipeline instead.
 
 The FFN runner owns a separate ACL graph cache keyed by stage token counts and
 A/F topology. Warmup runs the eager FFN path. Formal capture updates connector
@@ -343,6 +346,13 @@ an expansion of the supported runtime contract.
 | Ascend V1 + `CAMP2pAFDConnector` | Eager or current ACL Graph path | Native DBO, exactly two ubatches | Common and connector-local `compute_gate_on_attention=false`; `connector_extra_config.quant_mode=0`; plugin CANN ops required | V2-Lite 2A2F graph 300-question comparison, 2A1F/2A2F functional checks, and Legacy DBO regressions; runtime, graph, ops, connector, and profiler unit tests |
 | Ascend V2 + `CAMP2pAFDConnector` | Eager, `FULL`, or `FULL_DECODE_ONLY` native V2 ACL Graph | DBO and ubatching rejected | `compute_gate_on_attention=false`; PP/CP, elastic EP, EPLB, SP MoE, and compile SP rejected; role ranks equal DP x TP | V2-Lite 2A2F FULL 300-question comparison and 2A1F eager/FULL_DECODE_ONLY/FULL functional checks; focused runner, context, validation, and device-contract unit tests |
 | Ascend + `CAMAsyncAFDConnector` | Eager only | Native DBO rejected; optional AFD-managed MoE ubatching uses exactly two request or token-balanced stages | Experimental async path; `async=true`; documented path uses common `compute_gate_on_attention=true`; token mode requires Attention TP > 1; model runner v1 PCP is unsupported; prefill and decode context parallelism are unsupported; `connector_extra_config.dynamicQuant` is 0 or 1; plugin-owned async CAM ops required | V2-Lite ordinary Async and DSV4 Flash W4A8 layered off/on 300-question comparisons, MoE ubatching functional checks, real operator traces, and focused unit coverage; V3.2 v0.26 results remain historical |
+
+The Async CAM row also supports an MRV2 Attention runner for DeepSeek-V2/V3
+MLA and DeepSeek-V4, with static EP, PP=PCP=DCP=1, and Attention-local SP.
+Finegrained TP, shared-expert DP, and native draft-model/MTP paths are excluded.
+FFN remains connector-driven. The row's upgrade evidence retains its original
+scope; MRV2 deployment settings are documented in the
+[CAM async guide](../../npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#modelrunnerv2-deployment).
 
 The NPU results below were collected with the CAMP input-padding and FFN
 context repair included. That repair is being reviewed separately from the

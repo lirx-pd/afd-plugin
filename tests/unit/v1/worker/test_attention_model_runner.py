@@ -406,6 +406,7 @@ def test_ubatch_missing_metadata_uses_complete_public_installer():
     wrapper._install_missing_afd_metadata(forward_context)
 
     metadata = forward_context.additional_kwargs["afd_metadata"]
+    assert metadata is runner._afd_pending_metadata
     assert metadata is not None
     assert metadata.transaction_id == "afd-0"
     assert metadata.tokens_lens == [3, 5]
@@ -798,7 +799,10 @@ def test_attention_runner_preserves_native_shutdown(monkeypatch):
     assert runner.connector.closed is True
 
 
-def test_attention_warmup_preserves_profile_seq_lens():
+def test_attention_warmup_preserves_profile_seq_lens(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
     runner = object.__new__(AFDAttentionModelRunner)
     runner.compilation_config = SimpleNamespace(cudagraph_num_of_warmups=1)
     runner._is_warmup = False
@@ -820,13 +824,18 @@ def test_attention_warmup_preserves_profile_seq_lens():
     assert [kwargs["profile_seq_lens"] for _, kwargs in dummy_runs] == [7, 7]
 
 
-def test_forward_context_provider_installs_metadata_before_model_forward(monkeypatch):
+@pytest.mark.parametrize("has_control_plane", [False, True])
+def test_forward_context_provider_installs_metadata_before_model_forward(
+    monkeypatch, has_control_plane
+):
     runner = object.__new__(AFDAttentionModelRunner)
     runner.afd_config = AFDConfig(role="attention")
     runner.vllm_config = SimpleNamespace(
         parallel_config=_parallel_config(),
     )
     runner.connector = _RecordingConnector()
+    if not has_control_plane:
+        monkeypatch.setattr(runner.connector, "control_plane", None)
     runner._is_warmup = False
     runner._afd_is_graph_capturing = False
     runner._afd_pending_metadata = None
@@ -848,7 +857,8 @@ def test_forward_context_provider_installs_metadata_before_model_forward(monkeyp
     assert metadata is not None
     assert metadata.tokens_lens == [1]
     assert forward_context.additional_kwargs["afd_metadata"] is metadata
-    assert runner.connector.sent_dp_metadata_lists
+    assert bool(runner.connector.sent_dp_metadata_lists) is has_control_plane
+    assert bool(runner.connector.dp_metadata_updates) is has_control_plane
     assert fake_forward_context.create_forward_context is original_create
 
 

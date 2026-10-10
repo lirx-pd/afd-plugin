@@ -14,7 +14,10 @@ from torch import Tensor  # noqa: E402
 pytest.importorskip("vllm")
 
 from vllm.config import ParallelConfig  # noqa: E402
-from vllm.forward_context import override_forward_context  # noqa: E402
+from vllm.forward_context import (  # noqa: E402
+    get_forward_context,
+    override_forward_context,
+)
 
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
 from afd_plugin.model_executor.models.npu import (  # noqa: E402
@@ -116,7 +119,7 @@ def test_two_stages_preserve_dense_prefix_and_restore_once(
     monkeypatch, use_sp, use_mrv2
 ):
     ascend_context = pytest.importorskip("vllm_ascend.ascend_forward_context")
-    monkeypatch.setattr(ascend_context.envs_vllm, "VLLM_USE_V2_MODEL_RUNNER", use_mrv2)
+    monkeypatch.setattr(ascend_context, "_USE_V2_EXTRA_KWARGS", use_mrv2)
     tp_size = 2
     hidden = torch.arange(12, dtype=torch.float32).reshape(6, 2)
     metadata = layout.AsyncMoeUbatchMetadata(
@@ -147,6 +150,23 @@ def test_two_stages_preserve_dense_prefix_and_restore_once(
     monkeypatch.setattr(schedule, "log_async_moe_stage_attention", lambda *args: None)
     events: list[str | tuple[str, int] | tuple[str, int, int]] = []
     complete_stages = {}
+    shared_calls = []
+
+    def shared_experts(states):
+        stage_context = get_forward_context()
+        assert stage_context is not context
+        stage_idx = stage_context.ubatch_idx
+        stage = metadata.stages[stage_idx]
+        assert stage_context.attn_metadata is metadata.attn_metadata[stage_idx]
+        assert stage_context.num_tokens == stage.actual_tokens
+        assert ascend_context._EXTRA_CTX.num_tokens == stage.actual_tokens
+        assert stage_context.additional_kwargs["num_tokens"] == stage.actual_tokens
+        assert states.shape[0] == (
+            stage.input_tokens // tp_size if use_sp else stage.input_tokens
+        )
+        assert events[-1] == ("send", stage_idx)
+        shared_calls.append(stage_idx)
+        return torch.zeros_like(states)
 
     class Dense:
         is_moe_layer = False
@@ -159,7 +179,7 @@ def test_two_stages_preserve_dense_prefix_and_restore_once(
 
     class MoE:
         is_moe_layer = True
-        mlp = SimpleNamespace(shared_experts=None)
+        mlp = SimpleNamespace(shared_experts=shared_experts)
 
         def __init__(self, index):
             self.layer_idx = index
@@ -250,6 +270,7 @@ def test_two_stages_preserve_dense_prefix_and_restore_once(
         )
         assert ascend_context._EXTRA_CTX.num_tokens == 4
     assert context.additional_kwargs == {"num_tokens": 4, "in_profile_run": False}
+    assert shared_calls == [0, 1, 0, 1]
     assert events[0] == "dense"
     assert gathers == ([0, 1] if use_sp else [])
     torch.testing.assert_close(output[:4], hidden[:4] + 10)

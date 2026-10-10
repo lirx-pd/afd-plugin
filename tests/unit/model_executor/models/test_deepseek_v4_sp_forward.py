@@ -46,7 +46,7 @@ def test_two_stage_sp_keeps_ids_and_attention_positions_aligned(monkeypatch, tp_
         "get_pp_group",
         lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
     )
-    context = SimpleNamespace(additional_kwargs={}, input_ids=ids)
+    context = SimpleNamespace(additional_kwargs={"num_tokens": 13}, input_ids=ids)
     active = [context]
     monkeypatch.setattr(forward, "get_forward_context", lambda: active[-1])
 
@@ -109,8 +109,21 @@ def test_two_stage_sp_keeps_ids_and_attention_positions_aligned(monkeypatch, tp_
     monkeypatch.setattr(forward.native, "sp_all_gather", gather_attention)
     monkeypatch.setattr(forward.native, "sp_reduce_scatter", reduce_attention)
 
+    shared_calls = []
+
+    def compute_shared_experts(hidden):
+        child = active[-1]
+        assert child is not context
+        stage_idx = child.ubatch_idx
+        stage = metadata.stages[stage_idx]
+        assert child.additional_kwargs["num_tokens"] == stage.actual_tokens
+        assert child.num_tokens == stage.actual_tokens
+        assert hidden.shape[0] == stage.input_tokens // group.world_size
+        shared_calls.append((layer_index[0], stage_idx, stage.actual_tokens))
+        return torch.zeros_like(hidden)
+
     class LocalMoE:
-        shared_experts = None
+        shared_experts = staticmethod(compute_shared_experts)
 
     monkeypatch.setattr(forward, "AFDDeepseekV4AttentionGateRemoteMoE", LocalMoE)
 
@@ -202,4 +215,7 @@ def test_two_stage_sp_keeps_ids_and_attention_positions_aligned(monkeypatch, tp_
     assert len(routed_ids) == 4
     assert len(attention_collectives) == 8
     assert len(final_gathers) == 2
+    assert shared_calls == [(0, 0, 5), (0, 1, 7), (1, 0, 5), (1, 1, 7)]
+    assert active == [context]
+    assert context.additional_kwargs == {"num_tokens": 13}
     assert not pending

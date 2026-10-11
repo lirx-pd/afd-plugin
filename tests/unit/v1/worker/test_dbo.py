@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import builtins
@@ -14,7 +17,7 @@ from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 
 def test_maybe_apply_dbo_yield_uses_custom_op(monkeypatch):
-    calls = []
+    calls: list[str | tuple[str, object]] = []
     tensor = object()
 
     monkeypatch.setattr(

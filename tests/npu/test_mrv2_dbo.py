@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Real NPU streams/events and native thread handoff, isolated on each fault.
 
 This checks the executor primitives, not checkpoint or CAMP2P correctness.
@@ -65,7 +66,7 @@ def _exercise(fault):
     parent = ubatching.forward_context._forward_context
     inputs = torch.arange(8, dtype=torch.float32, device=runner.device)
     trace = []
-    injected = []
+    injected: list[str] = []
     if fault == "device_init":
         # Native threads initialize before entering UBatchContext/barrier.
         set_device = torch.accelerator.set_device_index

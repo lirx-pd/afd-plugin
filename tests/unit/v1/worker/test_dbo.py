@@ -81,8 +81,9 @@ def test_maybe_apply_dbo_yield_does_not_probe_ascend(monkeypatch):
     assert maybe_apply_dbo_yield(tensor, role="attention") is tensor
 
 
-def test_dbo_yield_prefers_plugin_ascend_context(monkeypatch):
+def test_dbo_yield_keeps_legacy_ascend_context(monkeypatch):
     calls = []
+    monkeypatch.setattr(dbo, "dbo_enabled", lambda: False)
 
     monkeypatch.setitem(
         sys.modules,
@@ -105,28 +106,25 @@ def test_dbo_yield_prefers_plugin_ascend_context(monkeypatch):
     assert calls == ["ascend"]
 
 
-def test_dbo_yield_falls_back_to_vllm_context(monkeypatch):
+def test_dbo_yield_prefers_native_context_without_importing_legacy(monkeypatch):
     calls = []
 
     monkeypatch.setitem(
         sys.modules,
         "afd_plugin.v1.worker.npu.ubatching",
         SimpleNamespace(
-            dbo_enabled=lambda: False,
-            dbo_yield=lambda: calls.append("ascend"),
-        ),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.v1.worker.ubatching",
-        SimpleNamespace(
             dbo_enabled=lambda: True,
-            dbo_yield=lambda: calls.append("vllm"),
+            dbo_yield=lambda: calls.append("ascend"),
         ),
     )
     monkeypatch.setattr(dbo, "dbo_enabled", lambda: True)
     monkeypatch.setattr(dbo, "dbo_yield", lambda: calls.append("vllm"))
+    real_import = builtins.__import__
 
+    def check_import(name, *args, **kwargs):
+        assert name != "afd_plugin.v1.worker.npu.ubatching"
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", check_import)
     dbo._yield_if_dbo_enabled()
-
     assert calls == ["vllm"]

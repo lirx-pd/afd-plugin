@@ -575,6 +575,35 @@ def test_npu_v2_validator_keeps_synchronous_sp_rejection(layout):
         )
 
 
+@pytest.mark.parametrize("invalid", [None, "graph", "dp1", "stages", "speculative"])
+def test_npu_v2_dbo_is_sync_eager_dp2_only(invalid):
+    config = _v2_config(num_attention_ranks=2, data_parallel_size=2)
+    config.additional_config["afd"]["connector"] = "CAMP2pAFDConnector"
+    config.parallel_config.enable_dbo = True
+    config.parallel_config.use_ubatching = True
+    config.parallel_config.num_ubatches = 2
+    if invalid == "graph":
+        config.model_config.enforce_eager = False
+    elif invalid == "dp1":
+        config.parallel_config.data_parallel_size = 1
+        config.additional_config["afd"]["num_attention_ranks"] = (
+            config.parallel_config.tensor_parallel_size
+        )
+    elif invalid == "stages":
+        config.parallel_config.num_ubatches = 3
+    elif invalid == "speculative":
+        config.speculative_config = object()
+    if invalid is None:
+        validate_npu_model_runner_v2_config(
+            config, expected_role="attention", device_type="npu"
+        )
+    else:
+        with pytest.raises(RuntimeError, match="DBO"):
+            validate_npu_model_runner_v2_config(
+                config, expected_role="attention", device_type="npu"
+            )
+
+
 @pytest.mark.parametrize(
     "target,field,value,error",
     [

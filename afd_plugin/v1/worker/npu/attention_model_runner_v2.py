@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
 from types import MethodType
 from typing import TYPE_CHECKING, cast
@@ -33,6 +33,7 @@ from afd_plugin.compat.npu.profiler import (
     step_afd_npu_profiler,
     stop_afd_npu_profiler,
 )
+from afd_plugin.compat.patches.npu.mrv2_ubatching import use_npu_ubatch_factory
 from afd_plugin.config import AFDConfig, parse_afd_config
 from afd_plugin.connectors import (
     AFDConnectorBase,
@@ -49,6 +50,7 @@ from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
     _resolve_world_ranks,
 )
+from afd_plugin.v1.worker.attention_model_runner_v2 import _use_afd_ubatch_preparation
 from afd_plugin.v1.worker.npu.async_cam_metadata_v2 import use_async_cam_stage_metadata
 from afd_plugin.validation import validate_npu_model_runner_v2_config
 
@@ -299,6 +301,19 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         if not self.connector.is_initialized:
             self.connector.init_afd_connector()
 
+    # Native MRV2 imports its factory by value; scope that exact binding while
+    # preserving Ascend's KV initialization (too large to copy). Eager DBO only.
+    # Signature matches Ascend 8d4409d6; restore the alias even on failure.
+    def initialize_kv_cache(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kv_cache_allocation_context: AbstractContextManager | None = None,
+    ) -> None:
+        # ### PATCH START: create the native NPU ubatch adapter.
+        with use_npu_ubatch_factory(self):
+            super().initialize_kv_cache(kv_cache_config, kv_cache_allocation_context)
+        # ### PATCH END: create the native NPU ubatch adapter.
+
     # Patch reason: vLLM v0.30.0 prepares FULL graph inputs before each warmup
     # and formal capture forward, outside torch.cuda.graph, but does not expose
     # that lifecycle to AFD's control plane.
@@ -488,6 +503,7 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                 and self.afd_config.num_attention_ranks > self.afd_config.num_ffn_ranks
                 else nullcontext(),
                 replay_scope,
+                _use_afd_ubatch_preparation(self),
                 use_async_cam_stage_metadata(self)
                 if self.afd_config.async_dp
                 and cast(

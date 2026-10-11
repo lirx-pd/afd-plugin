@@ -9,6 +9,7 @@ import inspect
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -17,16 +18,22 @@ pytest.importorskip("vllm_ascend")
 
 from vllm.config import CUDAGraphMode  # noqa: E402
 from vllm.v1.worker.dp_utils import should_skip_dp_coordination  # noqa: E402
-from vllm.v1.worker.gpu import cudagraph_utils, dp_utils  # noqa: E402
+from vllm.v1.worker.gpu import cudagraph_utils, dp_utils, ubatch_utils  # noqa: E402
 from vllm.v1.worker.gpu import model_runner as native_v2  # noqa: E402
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner  # noqa: E402
 from vllm_ascend.worker.v2 import model_runner as native_ascend_v2  # noqa: E402
+from vllm_ascend.worker.v2.input_batch import (  # noqa: E402
+    AscendInputBatch,
+    AscendInputBuffers,
+)
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner  # noqa: E402
 
+from afd_plugin.compat.patches.npu import mrv2_ubatching as patches  # noqa: E402
 from afd_plugin.model_executor.models import (  # noqa: E402
     forward_context as afd_context,
 )
 from afd_plugin.v1.worker.npu import attention_model_runner_v2 as npu_v2  # noqa: E402
+from afd_plugin.v1.worker.npu import ubatch_runner as npu_ubatch  # noqa: E402
 
 Runner = npu_v2.AFDNPUAttentionModelRunnerV2
 
@@ -43,6 +50,7 @@ def _runner(*, async_dp=False):
         extra_info=SimpleNamespace(async_moe_ubatching=False)
     )
     runner.cudagraph_manager = None
+    runner.ubatch_runner = None
     runner.prof = object()
     runner._afd_pending_metadata = object()
     runner._afd_async_moe_ubatch_metadata = None
@@ -533,3 +541,160 @@ def test_camp2p_dispatch_wrapper_matches_native_signature():
             inspect.signature(native_v2.dispatch_cg_and_sync_dp, eval_str=True)
             == original
         )
+
+
+def _ascend_batch(real=5, padded=8):
+    buffers = AscendInputBuffers(2, padded, torch.device("cpu"))
+    batch = AscendInputBatch.make_dummy(1, real, buffers)
+    batch.num_tokens_after_padding = padded
+    batch.input_ids = torch.arange(padded)
+    batch.positions = torch.arange(padded)
+    batch.is_padding = torch.arange(padded) >= real
+    batch.seq_lens += 12
+    batch.seq_lens_cpu_upper_bound += 12
+    batch.seq_lens_np = np.array([real + 12], dtype=np.int32)
+    return batch
+
+
+@pytest.mark.parametrize("real", [2, 5, 7])
+def test_native_slices_keep_exact_ascend_lengths_and_padding(real, monkeypatch):
+    # make_dummy's RoPE initialization is unrelated to CPU input slicing.
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.input_batch.update_cos_sin", lambda _: None
+    )
+    batch = _ascend_batch(real)
+    slices = ubatch_utils.create_ubatch_slices(batch, 2)
+    original = ubatch_utils._slice_input_batch
+    with patches.use_npu_input_batch_slicing():
+        children = [
+            ubatch_utils._slice_input_batch(
+                batch,
+                stage,
+                torch.zeros(3, dtype=torch.int32),
+                torch.zeros(2, dtype=torch.int32),
+            )
+            for stage in slices
+        ]
+    assert ubatch_utils._slice_input_batch is original
+    assert all(isinstance(child, AscendInputBatch) for child in children)
+    assert [child.num_tokens_after_padding for child in children] == [4, 4]
+    assert [child.num_tokens for child in children] == [min(real, 4), max(0, real - 4)]
+    assert children[0].seq_lens_np.tolist() == [12 + min(real, 4)]
+    assert children[1].seq_lens_np.tolist() == [12 + real]
+    assert children[1].query_start_loc_np.tolist() == [0, max(0, real - 4)]
+    assert all(
+        child.is_dummy and child.attn_state == batch.attn_state for child in children
+    )
+    assert batch.seq_lens_np.tolist() == [12 + real]
+    assert children[0].seq_lens_np is not children[1].seq_lens_np
+
+
+def test_stage_prepare_uses_independent_builders_and_detaches_cache(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.input_batch.update_cos_sin", lambda _: None
+    )
+    batch = _ascend_batch()
+    runner = object.__new__(npu_ubatch.NPUUBatchRunner)
+    runner.stage_attn_groups = [object(), object()]
+    runner.model_state = SimpleNamespace(max_model_len=128)
+    runner.parallel_config = object()
+    runner.vllm_config = object()
+    calls = []
+    reusable = torch.empty(5)
+
+    def build(**kwargs):
+        calls.append(kwargs)
+        reusable.fill_(len(calls))
+        kwargs["block_tables"][0].zero_()
+        return {"layer": SimpleNamespace(cos=reusable)}
+
+    def materialize(metadata, positions, count):
+        assert positions is batch.positions and count == batch.num_tokens
+        metadata["layer"].cos = metadata["layer"].cos.clone()
+
+    monkeypatch.setattr(npu_ubatch, "build_attn_metadata", build)
+    monkeypatch.setattr(npu_ubatch, "build_attn_state", lambda *args: "child-state")
+    monkeypatch.setattr(
+        npu_ubatch, "materialize_deepseek_attention_metadata_by_layer", materialize
+    )
+    table = torch.ones((1, 2))
+    metadata = [
+        runner._prepare_attn(
+            batch,
+            CUDAGraphMode.NONE,
+            (table,),
+            torch.empty(1, 8),
+            [],
+            None,
+            ubatch_idx=i,
+        )
+        for i in range(2)
+    ]
+    assert [call["attn_groups"] for call in calls] == runner.stage_attn_groups
+    assert all(call["attn_state"] == "child-state" for call in calls)
+    assert metadata[0]["layer"].cos.tolist() == [1] * 5
+    assert metadata[1]["layer"].cos.tolist() == [2] * 5
+    assert table.tolist() == [[1, 1]]
+    assert (
+        runner._prepare_attn(
+            SimpleNamespace(num_tokens=0),
+            CUDAGraphMode.NONE,
+            (),
+            None,
+            [],
+            None,
+            ubatch_idx=1,
+        )
+        is None
+    )
+    assert len(calls) == 2
+
+
+def test_native_child_contexts_preserve_dp_and_own_ascend_kwargs(monkeypatch):
+    runner = object.__new__(npu_ubatch.NPUUBatchRunner)
+    runner.vllm_config = object()
+    slices = [SimpleNamespace(num_tokens=4), SimpleNamespace(num_tokens=4)]
+    dp = [object(), object()]
+    contexts = [
+        SimpleNamespace(attn_metadata={"stage": i}, dp_metadata=dp[i]) for i in range(2)
+    ]
+    contexts[1].attn_metadata = None
+    monkeypatch.setattr(
+        ubatch_utils.UBatchRunner, "_make_forward_contexts", lambda *args: contexts
+    )
+    shared_mask = torch.ones(4, dtype=torch.bool)
+    monkeypatch.setattr(
+        npu_ubatch.current_platform,
+        "set_additional_forward_context",
+        lambda *args, **kwargs: {
+            "mc2_mask": shared_mask,
+            "num_tokens": kwargs["num_tokens"],
+        },
+    )
+    assert runner._make_forward_contexts(slices, [], [], []) is contexts
+    assert [ctx.dp_metadata for ctx in contexts] == dp
+    assert contexts[1].attn_metadata is None
+    assert contexts[1].additional_kwargs["num_tokens"] == 4
+    assert contexts[1].additional_kwargs["dbo_enabled"]
+    assert [ctx.additional_kwargs["ubatch_idx"] for ctx in contexts] == [0, 1]
+    contexts[1].additional_kwargs["mc2_mask"].zero_()
+    assert contexts[0].additional_kwargs["mc2_mask"].all()
+
+
+def test_scope_restores_native_bindings_after_failure():
+    context = patches.ubatching.UBatchContext
+    stream = patches.ubatching.current_stream
+    runner_stream = patches.ubatch_utils.current_stream
+    factory = patches.model_runner.maybe_build_ubatch_runner
+    sm_control = patches.ubatch_utils.create_sm_control_context
+    with (
+        pytest.raises(RuntimeError, match="injected"),
+        patches.use_npu_ubatch_factory(SimpleNamespace()),
+        patches.use_npu_ubatch_contexts(),
+    ):
+        raise RuntimeError("injected")
+    assert patches.ubatching.UBatchContext is context
+    assert patches.ubatching.current_stream is stream
+    assert patches.ubatch_utils.current_stream is runner_stream
+    assert patches.model_runner.maybe_build_ubatch_runner is factory
+    assert patches.ubatch_utils.create_sm_control_context is sm_control

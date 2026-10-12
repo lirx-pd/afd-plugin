@@ -37,12 +37,13 @@ the models and configurations recorded above:
 - Attention performs MoE gating before dispatch to FFN ranks;
 - execution is eager and AFD async-DP is enabled; **`async=true` is required**;
 - regular prefill and autoregressive decode steps use the same CAM path;
-- optional MoE ubatching is managed by AFD as two stages: request boundaries
-  or token-balanced DP+TP/SP stages.
+- optional ubatching uses exactly two native DBO microbatches in MRV1 and MRV2,
+  including Attention DP1.
 
-CAM async currently does not support ACL graph execution or vLLM native DBO.
-When a decode batch cannot form two non-empty AFD stages, it runs through the
-normal unsplit attention path.
+CAM async supports eager execution. Native DBO requires Attention-side gating,
+PP=PCP=DCP=1, and two ubatches. A step below the native DBO threshold runs
+unsplit locally. Both token thresholds must be at least two.
+Attention DP replicas make that decision independently; FFN is connector-driven.
 
 ## ModelRunnerV2 deployment
 
@@ -67,11 +68,12 @@ Attention-local FlashComm1/SP is supported. Set
 shared-expert DP and finegrained TP are unsupported. For V2-Lite MLA Attention,
 explicitly set `--block-size=128`; do not apply this setting to V4.
 
-V2 reuses the existing model-local `async_moe_ubatching` pipeline: exactly two
-request or token stages, with Attention TP > 1 for token splitting. This is
-independent of native DBO, which remains unsupported. For DeepSeek-V2/V3 token
-splitting, pass `--enable-chunked-prefill` so a request crossing the stage
-boundary can attend to its prefix KV. Native draft-model/MTP paths are also
+At every Attention DP size, `async_moe_ubatching=true` enables native DBO: native
+child preparation, ordinary per-ubatch model forwards, and native output merge.
+There is no separate Async splitting policy or model-local stage loop. Native
+splitting can divide one request across microbatches. For DeepSeek-V2/V3, pass
+`--enable-chunked-prefill` so a request crossing the microbatch boundary can
+attend to its prefix KV. Native draft-model/MTP paths are also
 unsupported.
 
 These are configuration and implementation limits, not accuracy or performance
@@ -174,7 +176,6 @@ There is no separate `--afd-config` option.
       "attn_ranks_per_dp": 2,
       "async_moe_ubatching": true,
       "async_moe_num_ubatches": 2,
-      "async_moe_split": "request",
       "hccl_buffer_size": 4096
     }
   }
@@ -206,9 +207,9 @@ spelling used by the recipes.
 | --- | --- | --- | --- |
 | `dynamicQuant` | `int` | `0` | Enables CAM dispatch/combine dynamic-quant metadata. Only `0` and `1` are accepted. With `1`, FFN receives quantized routed activations plus scale tensors and must return output compatible with combine-send. |
 | `attn_ranks_per_dp` | `int` | `1` | Positive Attention TP rank count per DP replica. It is the CAM Attention grouping width and is independent of the FFN process's local TP size. |
-| `async_moe_ubatching` | `bool` | `false` | Enables AFD-managed asynchronous MoE-only ubatching. |
-| `async_moe_num_ubatches` | `int` | `2` | Number of asynchronous MoE stages. Only `2` is supported. |
-| `async_moe_split` | `str` | `"request"` | `"request"` requires two scheduled requests and preserves their boundaries. `"token"` balances flattened real tokens and requires Attention TP greater than one. Both modes reject context parallelism; FFN may independently use TP1. |
+| `async_moe_ubatching` | `bool` | `false` | Compatibility alias for native DBO on Attention, including DP1. Prefer `--enable-dbo`. |
+| `async_moe_num_ubatches` | `int` | `2` | Legacy compatibility validation; only `2` is accepted. Native DBO owns the microbatch count. |
+| `async_moe_split` | `str` | `"request"` | Deprecated compatibility field: accepts `"request"` or `"token"` but has no effect on splitting and logs a warning when supplied. Native DBO owns request/token boundaries. |
 | `hccl_buffer_size` | `int` | unset | Positive CAM HCCL buffer size in MB. The override applies only to the `afd_async_cam` communication domain. When unset, HCCL uses `HCCL_BUFFSIZE`, then its built-in default. Configure the same value on every Attention and FFN rank in the domain. |
 
 For a DP+SP deployment such as DP3TP2 Attention + DP2TP1/EP2 FFN, set
@@ -217,11 +218,12 @@ For a DP+SP deployment such as DP3TP2 Attention + DP2TP1/EP2 FFN, set
 DP+TP Attention, leave FlashComm1 disabled on both roles. In either case, FFN
 consumes expert-routed CAM work items and may independently use TP1.
 
-## Native DBO and async MoE ubatching are different
+## Native DBO and Async CAM ubatching
 
 ### vLLM native DBO
 
-Do not pass any of these options to a CAM async process:
+For eager DeepSeek-V2/V3 MLA or DeepSeek-V4 Attention at any DP size, enable
+native DBO explicitly or retain `async_moe_ubatching=true` as its alias:
 
 ```bash
 --enable-dbo
@@ -229,21 +231,32 @@ Do not pass any of these options to a CAM async process:
 --dbo-prefill-token-threshold <N>
 ```
 
-They enable vLLM's native dual-batch overlap/ubatching. Runtime validation
-rejects native DBO with `CAMAsyncAFDConnector`; those flags belong to supported
-synchronous connector deployments.
+`--ubatch-size 2` is also normalized to DBO on this Async Attention path.
+Do not enable native DBO on FFN. FFN consumes independent CAM work items and
+never joins Attention's DBO thread schedule. Native thresholds select eligible
+prefill/decode batches and must be at least the microbatch count, including when
+using the legacy alias. Native slicing determines token and request ranges,
+including parent padding and requests crossing a microbatch boundary. The model
+owns SP padding and each owner's layout restoration/TP collectives.
 
-### AFD-managed asynchronous MoE ubatching
+CAM has one physical window per Attention rank. Before another ubatch sends,
+a native peer receive hook completes the preceding raw receive with its owner's
+explicit transfer context. The resumed owner restores layout and adds shared
+expert output. The final native context exit drains any remaining receive hook.
+Each call sends and receives once; transfer errors require restarting the A/F
+group rather than retrying inside the executor.
 
-`async_moe_ubatching` pipelines only the MoE portion of CAM async execution.
-Work is divided into exactly two stages. Request splitting requires at least
-two requests and keeps every request wholly within one stage. Token splitting
-supports a single long request and balances real tokens independently of parent
-padding. SP uses stage-local TP shards; plain TP shards only at the CAM
-boundary and all-gathers each FFN result. A DP replica that cannot form two
-non-empty stages runs that step without stage pipelining. This decision is not
-synchronized across DP replicas. The feature does not enable native DBO or use
-DBO threshold flags.
+### Attention DP1 compatibility
+
+DP1 uses the same native slicing, child attention metadata, execution and merge
+as DP > 1. The Ascend adapter extends native factory and threshold selection to
+DP1 because upstream otherwise returns early there. Async child contexts start
+with `dp_metadata=None`; FFN DP coordination belongs to the connector. The old
+Async planner, metadata sidecar and model-local two-stage schedule are removed.
+
+This migration changes the legacy `request` boundary policy to native DBO
+boundaries. The current refactor has local checks only; earlier hardware and
+accuracy results below do not validate this DP1 migration.
 
 For shape-only runtime diagnostics, set
 `AFD_ASYNC_MOE_LAYOUT_LOG=1` on Attention. The log reports the parent token
@@ -268,21 +281,20 @@ The second result validates the corrected metadata path on that v0.26
 full-model deployment and dataset; it does not validate the integrated v0.30
 runtime.
 
-When `async_moe_ubatching=true`, all roles must set:
+For the legacy alias, Attention can use:
 
 ```json
 {
   "compute_gate_on_attention": true,
   "connector_extra_config": {
     "async_moe_ubatching": true,
-    "async_moe_num_ubatches": 2,
-    "async_moe_split": "request"
+    "async_moe_num_ubatches": 2
   }
 }
 ```
 
 Prefill or decode context parallel size greater than one is rejected because
-the current async MoE metadata path supports DP+TP/SP, not PCP/DCP.
+the current Async CAM path supports DP+TP/SP, not PCP/DCP.
 
 ## Requirements
 
@@ -337,9 +349,10 @@ actual vendor library path. Missing source operators fail startup.
 - Eager execution only; ACL graph mode is unsupported.
 - Regular prefill and autoregressive decode steps are supported; context
   parallel execution remains outside the supported Async CAM topology.
-- vLLM native DBO/ubatching is unsupported.
-- AFD-managed MoE ubatching supports exactly two request-boundary or
-  token-balanced DP+TP/SP stages.
+- Native DBO requires eager Attention, two ubatches, and no speculative
+  decoding. FFN keeps its independent connector-driven execution.
+- Attention DP1 reuses native DBO through scoped Ascend compatibility adapters;
+  the legacy request/token split selector no longer controls boundaries.
 - ModelRunnerV2 rejects PP, PCP, and DCP; V1 PCP and async MoE context
   parallelism remain unsupported.
 - Routed experts should divide evenly across FFN ranks.

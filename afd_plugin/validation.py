@@ -178,13 +178,13 @@ def validate_npu_model_runner_v2_config(
     ):
         raise RuntimeError("AFD ModelRunnerV2 requires static expert parallelism")
     if parallel.enable_dbo or parallel.use_ubatching:
-        if afd_config.connector == AFD_ASYNC_CONNECTOR:
-            raise RuntimeError(
-                "AFD NPU ModelRunnerV2 Async CAM does not support DBO or ubatching"
-            )
         if not vllm_config.model_config.enforce_eager:
             raise RuntimeError("AFD NPU ModelRunnerV2 DBO requires eager execution")
-        if expected_role == "attention" and parallel.data_parallel_size <= 1:
+        if (
+            expected_role == "attention"
+            and parallel.data_parallel_size <= 1
+            and afd_config.connector != AFD_ASYNC_CONNECTOR
+        ):
             raise RuntimeError("AFD NPU ModelRunnerV2 DBO requires Attention DP > 1")
         if parallel.num_ubatches != 2:
             raise RuntimeError(

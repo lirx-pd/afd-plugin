@@ -8,12 +8,13 @@ implementation plugin-owned.
 
 import threading
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TypeAlias, cast
 
 import torch
 import torch_npu  # noqa: F401
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import (
     get_pp_group,
 )
@@ -23,6 +24,8 @@ from vllm.forward_context import (
     override_forward_context,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.v1.worker import ubatching as native_ubatching
+from vllm.v1.worker.dp_utils import skip_dp_coordination
 from vllm.v1.worker.gpu_ubatch_wrapper import UbatchMetadata, UBatchWrapper
 from vllm_ascend.compilation.acl_graph import (
     ACLGraphWrapper,
@@ -30,7 +33,12 @@ from vllm_ascend.compilation.acl_graph import (
     get_graph_params,
 )
 
-from afd_plugin.compat.npu.runtime_config import npu_model_uses_sharded_pp_tensors
+from afd_plugin.compat.npu.runtime_config import (
+    npu_model_uses_sharded_pp_tensors,
+    uses_async_cam_dbo,
+)
+from afd_plugin.compat.patches.npu.mrv2_ubatching import use_npu_ubatch_contexts
+from afd_plugin.config import parse_afd_config
 from afd_plugin.v1.worker.npu.forward_context import (
     create_ascend_forward_context,
 )
@@ -87,7 +95,7 @@ def _cat_ubatch_outputs(
 
 @dataclass
 class AscendUbatchMetadata(UbatchMetadata):
-    context: AscendUBatchContext
+    context: AscendUBatchContext | native_ubatching.UBatchContext
     input_ids: torch.Tensor | None
 
 
@@ -133,6 +141,11 @@ class AscendUBatchWrapper(UBatchWrapper):
         self.compilation_config = vllm_config.compilation_config
         self.comm_stream = torch.npu.Stream(device=device)
         self.ready_barrier = threading.Barrier(_READY_BARRIER_PARTIES)
+        if uses_async_cam_dbo(vllm_config):
+            self.ready_barrier = threading.Barrier(
+                _READY_BARRIER_PARTIES,
+                timeout=parse_afd_config(vllm_config).afd_process_group_timeout_s,
+            )
         self.cudagraphs: dict[AscendNPUGraphKey, AscendNPUGraphMetaData] = {}
         self.cudagraph_wrapper = None
         if runtime_mode is not CUDAGraphMode.NONE:
@@ -222,7 +235,7 @@ class AscendUBatchWrapper(UBatchWrapper):
         )
         if ubatch_dp_metadata is None:
             dp_size = self.vllm_config.parallel_config.data_parallel_size
-            if dp_size > 1:
+            if dp_size > 1 and not uses_async_cam_dbo(self.vllm_config):
                 raise RuntimeError(
                     "Ascend DP ubatches require synchronized stage token counts"
                 )
@@ -389,12 +402,22 @@ class AscendUBatchWrapper(UBatchWrapper):
                 )
             )
 
-        ubatch_ctxs = make_ubatch_contexts(
-            num_micro_batches=len(ubatch_slices),
-            compute_stream=compute_stream,
-            forward_contexts=forward_contexts,
-            ready_barrier=self.ready_barrier,
-        )
+        if uses_async_cam_dbo(self.vllm_config):
+            with use_npu_ubatch_contexts():
+                ubatch_ctxs = native_ubatching.make_ubatch_contexts(
+                    num_micro_batches=len(ubatch_slices),
+                    compute_stream=compute_stream,
+                    comm_stream=self.comm_stream,
+                    forward_contexts=forward_contexts,
+                    ready_barrier=self.ready_barrier,
+                )
+        else:
+            ubatch_ctxs = make_ubatch_contexts(
+                num_micro_batches=len(ubatch_slices),
+                compute_stream=compute_stream,
+                forward_contexts=forward_contexts,
+                ready_barrier=self.ready_barrier,
+            )
 
         metadata_list: list[AscendUbatchMetadata] = []
         for i, ubatch_slice in enumerate(ubatch_slices):
@@ -489,7 +512,13 @@ class AscendUBatchWrapper(UBatchWrapper):
 
     @torch.inference_mode()
     def _run_ubatch_thread(self, results, model, ubatch_metadata):
-        with ubatch_metadata.context:
+        with (
+            ubatch_metadata.context,
+            set_current_vllm_config(self.vllm_config),
+            skip_dp_coordination()
+            if uses_async_cam_dbo(self.vllm_config)
+            else nullcontext(),
+        ):
             model_output = model(
                 input_ids=ubatch_metadata.input_ids,
                 positions=ubatch_metadata.positions,
@@ -504,19 +533,39 @@ class AscendUBatchWrapper(UBatchWrapper):
         model,
     ) -> AscendModelOutput:
         results: list[tuple[int, AscendModelOutput]] = []
-        with override_forward_context(None):
+        errors: list[BaseException] = []
+
+        def run(metadata):
+            try:
+                self._run_ubatch_thread(results, model, metadata)
+            except BaseException as exc:
+                errors.append(exc)
+
+        with (
+            override_forward_context(None),
+            use_npu_ubatch_contexts()
+            if uses_async_cam_dbo(self.vllm_config)
+            else nullcontext(),
+        ):
             ubatch_threads = []
             for metadata in ubatch_metadata:
                 thread = threading.Thread(
-                    target=self._run_ubatch_thread,
-                    args=(results, model, metadata),
+                    target=run,
+                    args=(metadata,),
                 )
                 ubatch_threads.append(thread)
                 thread.start()
-            self.ready_barrier.wait()
-            ubatch_metadata[0].context.cpu_wait_event.set()
-            for thread in ubatch_threads:
-                thread.join()
+            try:
+                self.ready_barrier.wait()
+                ubatch_metadata[0].context.cpu_wait_event.set()
+            finally:
+                for thread in ubatch_threads:
+                    thread.join()
+
+        if errors:
+            raise RuntimeError(
+                "Ascend DBO microbatch failed; restart the A/F worker group"
+            ) from errors[0]
 
         sorted_results = [value for _, value in sorted(results)]
         get_forward_context().dbo_enabled = True

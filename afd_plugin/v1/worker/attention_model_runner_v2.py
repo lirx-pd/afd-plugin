@@ -143,7 +143,8 @@ def _use_afd_ubatch_preparation(
         runner.install_mrv2_ubatch_metadata(
             prepared.slices, prepared.forward_contexts, input_batch.num_tokens
         )
-        runner.send_dp_metadata(None, prepared.slices)
+        if runner.connector.control_plane is not None:
+            runner.send_dp_metadata(None, prepared.slices)
         return prepared
         # ### PATCH END: bind AFD to native stage state outside graph execution.
 

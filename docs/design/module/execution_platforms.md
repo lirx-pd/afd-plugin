@@ -253,10 +253,17 @@ wrapper. The current path:
   path requires it.
 
 `v1/worker/dbo.py` registers the model-side yield operation and dispatches to
-the platform DBO implementation. The optional CAM async MoE pipeline is not
-this native DBO path: it is an eager, two-stage pipeline owned by the
-model/connector flow. It supports request-boundary and token-balanced stages,
-with real-token metadata kept separate from physical TP/SP padding. FlashComm1
+the platform DBO implementation. Eager Async Attention uses native DBO at every
+DP size, including DP1:
+MRV2 reuses `NPUUBatchRunner` child preparation and output merge; MRV1 reuses
+`AscendUBatchWrapper` with native NPU contexts and receive hooks. Async children
+are created with `dp_metadata=None` and establish local DP coordination scopes in their
+threads. Before the next dispatch, a peer raw receive reclaims CAM's single
+physical window; layout restoration, collectives and shared output stay with
+the owner. DP1 has scoped factory/threshold adapters for upstream's DP1 early
+returns. Native slicing owns request/token boundaries and distinguishes real
+tokens from padding; the Async planner, sidecar metadata and model-local stage
+loops are removed. The legacy split selector is accepted but ignored. FlashComm1
 is Attention-local; without it, the CAM boundary shards replicated Attention
 tokens and restores the FFN result with TP all-gather.
 
@@ -285,8 +292,9 @@ With synchronous CAMP2P, the NPU V2 runner supports eager, `FULL`, and
 it publishes descriptor-matched warmup/capture control outside formal graph
 capture and installs an instance-scoped pre-replay hook because native full
 replay creates no `ForwardContext`. V2 does not use `AscendUBatchWrapper` and
-rejects native DBO/ubatching. Async CAM may use its model-local two-stage MoE
-pipeline instead.
+uses native `NPUUBatchRunner` preparation, execution and merge for eager DBO.
+Async CAM additionally enables the native path at DP1; it has no separate MoE
+stage pipeline. DBO graphs remain unsupported in V2.
 
 The FFN runner owns a separate ACL graph cache keyed by stage token counts and
 A/F topology. Warmup runs the eager FFN path. Formal capture updates connector
@@ -344,8 +352,8 @@ an expansion of the supported runtime contract.
 | CUDA V1 + `P2pNcclAFDConnector` | Eager or `FULL_DECODE_ONLY` CUDA Graph | Native DBO, exactly two ubatches | Registered CUDA model boundaries; Attention-side or FFN-side gate where the model supports it | DeepSeek-V2-Lite eager/graph/DBO accuracy E2E; model, graph, connector, and profiler unit tests |
 | CUDA V2 + `P2pNcclAFDConnector` | Eager or `FULL_DECODE_ONLY` native V2 CUDA Graph | Exactly two native microbatches; Attention DP > 1 | `compute_gate_on_attention=false`; PP/CP, elastic EP, EPLB, SP MoE, and compile SP rejected; role ranks equal DP x TP | DeepSeek-V2-Lite eager/graph DP2 and TP2 E2E; H20 live two-stage execution and representative 300-question comparisons; numerical equivalence is not established |
 | Ascend V1 + `CAMP2pAFDConnector` | Eager or current ACL Graph path | Native DBO, exactly two ubatches | Common and connector-local `compute_gate_on_attention=false`; `connector_extra_config.quant_mode=0`; plugin CANN ops required | V2-Lite 2A2F graph 300-question comparison, 2A1F/2A2F functional checks, and Legacy DBO regressions; runtime, graph, ops, connector, and profiler unit tests |
-| Ascend V2 + `CAMP2pAFDConnector` | Eager, `FULL`, or `FULL_DECODE_ONLY` native V2 ACL Graph | DBO and ubatching rejected | `compute_gate_on_attention=false`; PP/CP, elastic EP, EPLB, SP MoE, and compile SP rejected; role ranks equal DP x TP | V2-Lite 2A2F FULL 300-question comparison and 2A1F eager/FULL_DECODE_ONLY/FULL functional checks; focused runner, context, validation, and device-contract unit tests |
-| Ascend + `CAMAsyncAFDConnector` | Eager only | Native DBO rejected; optional AFD-managed MoE ubatching uses exactly two request or token-balanced stages | Experimental async path; `async=true`; documented path uses common `compute_gate_on_attention=true`; token mode requires Attention TP > 1; model runner v1 PCP is unsupported; prefill and decode context parallelism are unsupported; `connector_extra_config.dynamicQuant` is 0 or 1; plugin-owned async CAM ops required | V2-Lite ordinary Async and DSV4 Flash W4A8 layered off/on 300-question comparisons, MoE ubatching functional checks, real operator traces, and focused unit coverage; V3.2 v0.26 results remain historical |
+| Ascend V2 + `CAMP2pAFDConnector` | Eager, `FULL`, or `FULL_DECODE_ONLY` native V2 ACL Graph | Eager native DBO with two ubatches and Attention DP > 1; graphs remain single-batch | `compute_gate_on_attention=false`; PP/CP, elastic EP, EPLB, SP MoE, and compile SP rejected; role ranks equal DP x TP | V2-Lite 2A2F FULL 300-question comparison and 2A1F eager/FULL_DECODE_ONLY/FULL functional checks; focused runner, context, validation, and device-contract unit tests |
+| Ascend + `CAMAsyncAFDConnector` | Eager only | Two native DBO microbatches on Attention, including DP1; legacy split selector is ignored | Experimental async path; `async=true`; documented path uses common `compute_gate_on_attention=true`; model runner v1 PCP is unsupported; prefill and decode context parallelism are unsupported; `connector_extra_config.dynamicQuant` is 0 or 1; plugin-owned async CAM ops required | Earlier V2-Lite and DSV4 layered comparisons retain their original scope; native-only migration has local checks and awaits NPU/accuracy validation; V3.2 v0.26 results remain historical |
 
 The Async CAM row also supports an MRV2 Attention runner for DeepSeek-V2/V3
 MLA and DeepSeek-V4, with static EP, PP=PCP=DCP=1, and Attention-local SP.

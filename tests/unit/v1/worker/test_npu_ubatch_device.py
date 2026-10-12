@@ -12,6 +12,8 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("torch_npu")
 pytest.importorskip("vllm")
 
+from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices  # noqa: E402
+
 ubatching = importlib.import_module("afd_plugin.v1.worker.npu.ubatching")
 ubatch_utils = importlib.import_module("afd_plugin.v1.worker.npu.ubatch_utils")
 
@@ -59,7 +61,9 @@ def test_split_partial_request_preserves_seq_len_bounds(monkeypatch):
         logits_indices_padded=None,
         num_logits_indices=0,
     )
-    slices = ubatch_utils.create_ubatch_slices(np.array([3, 5], dtype=np.int32), [5])
+    slices, _ = maybe_create_ubatch_slices(
+        True, np.array([3, 5], dtype=np.int32), 8, 2, 2, split_point=5
+    )
 
     first, second = ubatch_utils.split_attn_metadata(slices, metadata)
 

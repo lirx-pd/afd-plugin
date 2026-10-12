@@ -15,16 +15,15 @@ from vllm.v1.worker.ubatch_utils import (
     UBatchSlice,
     UBatchSlices,
     check_ubatch_thresholds,
+    is_last_ubatch_empty,
+)
+from vllm.v1.worker.ubatch_utils import (
+    _pad_out_ubatch_slices as pad_out_ubatch_slices,
+)
+from vllm.v1.worker.ubatch_utils import (
+    maybe_create_ubatch_slices as native_maybe_create_ubatch_slices,
 )
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
-
-
-def is_last_ubatch_empty(
-    orig_num_tokens: int,
-    padded_num_tokens: int,
-    num_ubatches: int,
-) -> bool:
-    return (padded_num_tokens // num_ubatches) * (num_ubatches - 1) >= orig_num_tokens
 
 
 def _cp_enabled(vllm_config: VllmConfig) -> bool:
@@ -68,37 +67,6 @@ def check_enable_ubatch(
     )
 
 
-def pad_out_ubatch_slices(
-    ubatch_slices: UBatchSlices,
-    num_total_tokens: int,
-    num_reqs_padded: int,
-) -> UBatchSlices:
-    last_slice = ubatch_slices[-1]
-    padded_last_request_slice = slice(last_slice.request_slice.start, num_reqs_padded)
-    padded_last_token_slice = slice(last_slice.token_slice.start, num_total_tokens)
-    return ubatch_slices[:-1] + [
-        UBatchSlice(padded_last_request_slice, padded_last_token_slice)
-    ]
-
-
-def create_ubatch_slices(
-    num_scheduled_tokens: np.ndarray,
-    token_split_points: list[int],
-) -> UBatchSlices:
-    cu_num_tokens = np.zeros(len(num_scheduled_tokens) + 1, dtype=np.int32)
-    np.cumsum(num_scheduled_tokens, dtype=np.int32, out=cu_num_tokens[1:])
-
-    ubatch_slices: UBatchSlices = []
-    start_token = 0
-    for end_token in token_split_points + [int(cu_num_tokens[-1])]:
-        token_slice = slice(start_token, end_token)
-        req_start = int(np.searchsorted(cu_num_tokens, start_token, side="right") - 1)
-        req_stop = int(np.searchsorted(cu_num_tokens, end_token, side="left"))
-        ubatch_slices.append(UBatchSlice(slice(req_start, req_stop), token_slice))
-        start_token = end_token
-    return ubatch_slices
-
-
 def create_request_boundary_ubatch_slices(
     num_scheduled_tokens: np.ndarray,
     *,
@@ -106,14 +74,12 @@ def create_request_boundary_ubatch_slices(
 ) -> UBatchSlices | None:
     """Split scheduled tokens on request boundaries.
 
-    Async MoE ubatching keeps dense layers on the full batch and only slices
-    connector payloads.  Splitting on request boundaries avoids partial request
-    metadata and keeps each stage's common attention metadata rebuildable by
-    the existing Ascend builder stack.  Among those boundaries, pick the split
-    whose two stages have the closest token counts.
+    Synchronous MRV1 eager DBO uses this compatibility policy to avoid
+    partial-request metadata. Async CAM preserves native DBO boundaries.
+    Pick the request boundary whose two microbatches have closest token counts.
     """
 
-    assert num_ubatches == 2, "Async MoE ubatching currently supports 2 stages."
+    assert num_ubatches == 2, "Ascend ubatching currently supports 2 microbatches."
     num_reqs = len(num_scheduled_tokens)
     if num_reqs < num_ubatches:
         return None
@@ -148,27 +114,14 @@ def maybe_create_ubatch_slices(
     num_reqs_padded: int,
     vllm_config: VllmConfig,
 ) -> tuple[UBatchSlices | None, UBatchSlices | None]:
-    if not should_ubatch:
-        return None, None
-
-    num_ubatches = vllm_config.parallel_config.num_ubatches
-    assert num_ubatches == 2, "Ascend ubatching currently supports exactly 2 ubatches."
-
-    split_point = int(num_tokens_padded) // num_ubatches
-    token_split_points = [split_point * i for i in range(1, num_ubatches)]
-    ubatch_slices = create_ubatch_slices(
+    """Adapt the legacy NPU config argument to native DBO slicing."""
+    return native_maybe_create_ubatch_slices(
+        should_ubatch,
         num_scheduled_tokens_per_request,
-        token_split_points,
-    )
-    ubatch_slices_padded = pad_out_ubatch_slices(
-        ubatch_slices,
         num_tokens_padded,
         num_reqs_padded,
+        vllm_config.parallel_config.num_ubatches,
     )
-    assert sum(ubatch_slice.num_tokens for ubatch_slice in ubatch_slices_padded) == (
-        num_tokens_padded
-    )
-    return ubatch_slices, ubatch_slices_padded
 
 
 def slice_query_start_locs(
@@ -390,7 +343,6 @@ __all__ = [
     "UBatchSlices",
     "check_enable_ubatch",
     "create_request_boundary_ubatch_slices",
-    "create_ubatch_slices",
     "is_last_ubatch_empty",
     "maybe_create_ubatch_slices",
     "pad_out_ubatch_slices",

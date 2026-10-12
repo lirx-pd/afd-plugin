@@ -193,9 +193,29 @@ def _fail_if_unsupported_npu_afd_async_features(
             "CAMAsyncAFDConnector supports only eager Attention/FFN execution",
         )
     if bool(parallel_config.enable_dbo) or bool(parallel_config.use_ubatching):
-        raise RuntimeError(
-            "CAMAsyncAFDConnector does not support vLLM native ubatching/DBO",
-        )
+        if not afd_config.is_attention_server:
+            raise RuntimeError("Async CAM DBO/ubatching requires the Attention role")
+        if parallel_config.num_ubatches != 2:
+            raise RuntimeError("Async CAM DBO requires exactly two ubatches")
+        if not afd_config.compute_gate_on_attention:
+            raise RuntimeError("Async CAM DBO requires compute_gate_on_attention=true")
+        if (
+            parallel_config.pipeline_parallel_size != 1
+            or parallel_config.prefill_context_parallel_size != 1
+            or parallel_config.decode_context_parallel_size != 1
+            or vllm_config.speculative_config is not None
+        ):
+            raise RuntimeError(
+                "Async CAM DBO does not support PP, CP or speculative decoding"
+            )
+        if not _is_dsv4_target(vllm_config) and (
+            vllm_config.model_config.hf_text_config.model_type
+            not in {"deepseek_v2", "deepseek_v3"}
+            or not vllm_config.model_config.use_mla
+        ):
+            raise RuntimeError(
+                "Async CAM DBO requires DeepSeek-V2/V3 MLA or DeepSeek-V4"
+            )
     speculative_config = vllm_config.speculative_config
     # Native draft MoE still uses Attention-side cross-DP collectives.
     if (
@@ -258,7 +278,7 @@ def _fail_if_unsupported_npu_afd_async_features(
                 "AFD NPU ModelRunnerV2 Async CAM does not support finegrained TP "
                 "or shared-expert DP",
             )
-    if extra_info.async_moe_ubatching:
+    if extra_info.async_moe_ubatching or parallel_config.use_ubatching:
         _fail_if_unsupported_npu_async_moe_ubatching_features(
             vllm_config,
             afd_config,
@@ -335,7 +355,7 @@ def _fail_if_unsupported_npu_async_moe_ubatching_features(
             "async_moe_split must be 'request' or 'token'; "
             f"got async_moe_split={split!r}",
         )
-    # Attention owns stage planning and SP layout conversion. FFN workers
+    # Attention owns native DBO execution and SP layout conversion. FFN workers
     # consume CAM work items and may use an independent TP/EP topology.
     if afd_config.is_ffn_server:
         return
@@ -350,14 +370,6 @@ def _fail_if_unsupported_npu_async_moe_ubatching_features(
         raise RuntimeError(
             "async_moe_ubatching requires Attention attn_ranks_per_dp to "
             "equal tensor_parallel_size",
-        )
-    if (
-        split == ASYNC_MOE_TOKEN_SPLIT
-        and int(parallel_config.tensor_parallel_size) <= 1
-    ):
-        raise RuntimeError(
-            "async_moe_split='token' requires Attention DP+TP/SP with "
-            "tensor_parallel_size > 1",
         )
 
 

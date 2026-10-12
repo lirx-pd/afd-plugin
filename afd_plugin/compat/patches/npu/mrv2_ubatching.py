@@ -3,28 +3,39 @@
 """Scoped Ascend seams for vLLM ced6857a's native eager UBatchRunner.
 
 Ascend baseline: 8d4409d6256d8a6729140ddcc0d1889e3f96cdd6.
-Enabled only by the AFD NPU MRV2 runner; all bindings are restored on exit.
+MRV2 uses native preparation; MRV1 Async shares the native NPU contexts.
+All bindings are scoped to AFD runners and restored on exit.
 Remove when upstream supports Ascend child inputs, streams and cancellation.
 """
 
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
-from vllm.config import VllmConfig
+from vllm.config import ParallelConfig, VllmConfig
 from vllm.utils import torch_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker import ubatching
 from vllm.v1.worker.gpu import model_runner, ubatch_utils
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    BatchExecutionDescriptor,
+    CudaGraphManager,
+)
+from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_states.interface import ModelState
-from vllm.v1.worker.ubatch_utils import UBatchSlice
+from vllm.v1.worker.ubatch_utils import (
+    UBatchSlice,
+    check_ubatch_thresholds,
+    get_num_ubatches,
+)
 from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 
-from afd_plugin.config import parse_afd_config
+from afd_plugin.config import is_afd_async_dp, parse_afd_config
 
 if TYPE_CHECKING:
     from afd_plugin.v1.worker.npu.attention_model_runner_v2 import (
@@ -101,7 +112,7 @@ def use_npu_ubatch_factory(runner: "AFDNPUAttentionModelRunnerV2") -> Iterator[N
     original_sm_control = ubatch_utils.create_sm_control_context
 
     # This scope runs only during AFD NPU KV initialization. Keep the native
-    # eligibility check; change only constructor dispatch for that worker.
+    # eligibility check, except Async CAM needs no DP handshake at DP=1.
     # Signature matches maybe_build_ubatch_runner at ced6857a.
     def maybe_build_ubatch_runner(
         vllm_config: VllmConfig,
@@ -115,7 +126,9 @@ def use_npu_ubatch_factory(runner: "AFDNPUAttentionModelRunnerV2") -> Iterator[N
         from afd_plugin.v1.worker.npu.ubatch_runner import NPUUBatchRunner
 
         parallel = vllm_config.parallel_config
-        if not parallel.use_ubatching or parallel.data_parallel_size <= 1:
+        if not parallel.use_ubatching or (
+            parallel.data_parallel_size <= 1 and not is_afd_async_dp(vllm_config)
+        ):
             return None
         return NPUUBatchRunner(
             vllm_config,
@@ -136,6 +149,95 @@ def use_npu_ubatch_factory(runner: "AFDNPUAttentionModelRunnerV2") -> Iterator[N
     finally:
         model_runner.maybe_build_ubatch_runner = original_factory
         ubatch_utils.create_sm_control_context = original_sm_control
+
+
+@contextmanager
+def use_async_cam_dbo_dispatch() -> Iterator[None]:
+    """Extend native threshold selection to Async CAM Attention DP=1."""
+    original_dispatch = model_runner.dispatch_cg_and_sync_dp
+
+    # Patch reason: native dispatch returns early at DP=1 before DBO selection.
+    # Patch functionality: apply native eligibility and thresholds at DP=1;
+    # native dispatch continues to own every DP>1 descriptor.
+    # Signature matches dispatch_cg_and_sync_dp at ced6857a.
+    # Delegation exception: native descriptor/threshold selection stays upstream.
+    # Removal plan: remove when native dispatch supports local DP=1 DBO.
+    def dispatch_cg_and_sync_dp(
+        cudagraph_manager: CudaGraphManager | None,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        dp_size: int,
+        dp_rank: int,
+        max_query_len: int | None = None,
+        need_eager: bool = False,
+        num_active_loras: int = 0,
+        parallel_config: ParallelConfig | None = None,
+        allow_ubatching: bool = False,
+        uniform_decode: bool = False,
+        dp_sync: DPSyncState | None = None,
+    ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
+        desc, sync = original_dispatch(
+            cudagraph_manager,
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            dp_size,
+            dp_rank,
+            max_query_len=max_query_len,
+            need_eager=need_eager,
+            num_active_loras=num_active_loras,
+            parallel_config=parallel_config,
+            allow_ubatching=allow_ubatching,
+            uniform_decode=uniform_decode,
+            dp_sync=dp_sync,
+        )
+        # ### PATCH START: native DBO eligibility without a DP handshake.
+        if (
+            dp_size == 1
+            and allow_ubatching
+            and parallel_config is not None
+            and check_ubatch_thresholds(parallel_config, num_tokens, uniform_decode)
+            and num_tokens >= get_num_ubatches(parallel_config)
+        ):
+            desc = replace(desc, num_ubatches=get_num_ubatches(parallel_config))
+        # ### PATCH END: native DBO eligibility without a DP handshake.
+        return desc, sync
+
+    model_runner.dispatch_cg_and_sync_dp = dispatch_cg_and_sync_dp
+    try:
+        yield
+    finally:
+        model_runner.dispatch_cg_and_sync_dp = original_dispatch
+
+
+@contextmanager
+def use_async_cam_child_dp_metadata() -> Iterator[None]:
+    """Build native Async contexts without FFN expert DP coordination metadata."""
+    original_metadata = ubatch_utils.DPMetadata
+
+    class AsyncCamDPMetadata:
+        # Native ced6857a UBatchRunner calls DPMetadata.make unconditionally.
+        # Async FFN owns its own DP layout; DP1 without SP also fails that factory.
+        # This factory alias is scoped to native child context construction;
+        # the real forward_context.DPMetadata class remains untouched.
+        # Signature matches DPMetadata.make except its intentional None result.
+        # Remove when native UBatchRunner supports optional child DP metadata.
+        @staticmethod
+        def make(
+            parallel_config: ParallelConfig,
+            num_tokens: int,
+            num_tokens_across_dp_cpu: torch.Tensor,
+        ) -> None:
+            # ### PATCH START: Async children do not coordinate FFN DP.
+            return None
+            # ### PATCH END: Async children do not coordinate FFN DP.
+
+    ubatch_utils.DPMetadata = AsyncCamDPMetadata
+    try:
+        yield
+    finally:
+        ubatch_utils.DPMetadata = original_metadata
 
 
 @contextmanager

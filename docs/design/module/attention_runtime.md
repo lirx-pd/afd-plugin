@@ -244,14 +244,16 @@ sidecar to the context created by the upstream runner. The shared metadata
 mixin supplies the ordinary single-stage and graph-control behavior. V1
 native ubatching still gives each child context stage-local metadata.
 
-Ascend V2 Async CAM uses `async_cam_metadata_v2.py` to build stage-local
-attention metadata with native builders and vLLM slicing, then reuses the
-model's existing two-stage CAM pipeline. Each stage context carries its real
-token count separately from TP/SP padding. This does not enable native DBO.
+Ascend V2 Async CAM uses `NPUUBatchRunner` to adapt native DBO child inputs to
+Ascend attention builders. Native slicing, execution threads and output merge
+are reused at DP1 and DP > 1. Each child context carries its real token count
+separately from TP/SP padding and starts with `dp_metadata=None`. The old Async
+stage metadata sidecar and model-local two-stage pipeline are removed.
 
 When vLLM does not produce `DPMetadata` for DP size 1, the shared provider
 creates `AFDDPMetadata` from the pending stage token count. DP greater than 1
-requires native DP metadata on the ordinary request path.
+requires native DP metadata for synchronous control-plane connectors. Async
+CAM children skip model-side DP coordination; FFN consumes connector work items.
 
 The previous NPU design described a separate forward-context metadata mirror.
 That is no longer the contract: current CUDA and Ascend model paths read the
@@ -295,28 +297,29 @@ without loading FFN expert/MLP components on this role.
 The documented `CAMAsyncAFDConnector` configuration uses
 `compute_gate_on_attention=true`. Attention computes MoE routing data and sends
 hidden states together with `topk_weights`, `topk_ids`, and optional
-`router_logits`. FFN receive is delayed until the next layer when possible,
-which permits CAM dispatch/combine overlap. Dense layers remain local to the
+`router_logits`. Native DBO receive hooks reclaim CAM's single window before a
+peer dispatch and let the resumed owner consume its result. Dense layers remain local to the
 Attention model path.
 
-The optional `async_moe_ubatching` mode is distinct from vLLM native DBO. It:
+The legacy `async_moe_ubatching` option is an alias for vLLM native DBO. It:
 
 - requires `compute_gate_on_attention=true`;
-- uses exactly two request-boundary or token-balanced stages;
-- keeps real token ranges separate from stage-local TP/SP padding;
-- runs the dense prefix before the split;
-- pipelines stage Attention send and FFN receive through the MoE layers;
-- rejoins stage outputs after the pipeline;
+- uses exactly two native microbatches, including Attention DP1;
+- keeps real token ranges separate from child-local TP/SP padding;
+- runs ordinary model forwards, including dense layers, on native children;
+- coordinates CAM send/receive through native peer receive hooks;
+- merges child outputs through the existing DBO runner;
 - does not synchronize stage eligibility across asynchronous DP replicas;
 - does not support prefill or decode context parallel metadata.
 
-The Attention runner calls the device-independent planner in
-`model_executor/npu/async_cam_ubatching.py`; the NPU model path applies the plan
-through `models/npu/async_cam_layout.py`. FlashComm1/SP is Attention-local and
+Native DBO owns request/token boundaries; `async_moe_split` is deprecated and
+ignored. `models/npu/async_cam_layout.py` retains only communication layout
+conversion, and `models/npu/async_cam_dbo.py` supplies the single-window receive
+hook. FlashComm1/SP is Attention-local and
 FFN topology validation is independent. See the CAM async user guide for the
 supported topology and environment matrix.
 
-CAM async requires eager execution and rejects vLLM native ubatching. Its
+CAM async requires eager execution. Its
 feature limits are recorded in the
 [platform matrix](execution_platforms.md#tested-runtime-matrix).
 

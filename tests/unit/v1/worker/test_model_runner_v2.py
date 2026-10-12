@@ -614,7 +614,7 @@ def test_npu_v2_dbo_is_sync_eager_dp2_only(invalid):
         ("parallel", "prefill_context_parallel_size", 2, "PP or CP"),
         ("parallel", "decode_context_parallel_size", 2, "PP or CP"),
         ("parallel", "enable_dbo", True, "DBO"),
-        ("parallel", "use_ubatching", True, "ubatching"),
+        ("parallel", "use_ubatching", True, "DBO"),
         ("parallel", "enable_elastic_ep", True, "static expert"),
         ("parallel", "enable_eplb", True, "static expert"),
     ],

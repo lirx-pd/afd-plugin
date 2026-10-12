@@ -11,7 +11,7 @@ constructs the native MoE module and exposes it through the runner-facing
 ``compute_ffn_output`` hook.
 """
 
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Iterable, Iterator
 from copy import copy
 from typing import TYPE_CHECKING, Any
 
@@ -28,16 +28,22 @@ from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import (
     AFDExpertRoutingSpec,
     AFDF2ATransferPayload,
+    AFDTransferContext,
+    AFDTransferMetadata,
 )
+from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
 from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
+from afd_plugin.model_executor.models.npu.async_cam_dbo import (
+    send_async_cam_remote_call,
+)
 from afd_plugin.model_executor.models.npu.async_cam_layout import (
-    get_async_moe_ubatch_metadata_from_forward_context,
     prepare_cam_dispatch_payload,
     restore_cam_dispatch_output,
 )
 from afd_plugin.model_executor.models.npu.deepseek_v4_shared_experts import (
     AFDDeepseekV4SharedExperts,
 )
+from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 try:
     from vllm_ascend.models.deepseek_v4 import model as native
@@ -266,14 +272,33 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
             None,
             use_sequence_parallel=self.use_sequence_parallel_moe,
         )
-        output = self._send_and_receive(
+        afd_metadata = get_afd_metadata_from_forward_context()
+        if afd_metadata is None:
+            raise RuntimeError("Async CAM requires AFD forward metadata")
+        context = AFDTransferContext(
+            metadata=AFDTransferMetadata.create_attention_metadata(
+                layer_idx=self.layer_idx,
+                stage_idx=afd_metadata.stage_idx,
+                seq_len=int(dispatch_payload.hidden_states.shape[0]),
+            )
+        )
+        receive = send_async_cam_remote_call(
+            afd_metadata.connector,
             dispatch_payload.hidden_states,
+            context,
             topk_weights=dispatch_payload.topk_weights,
             topk_ids=dispatch_payload.topk_ids,
         )
+        shared_output = (
+            self.shared_experts(hidden_states)
+            if self.shared_experts is not None
+            else None
+        )
+        maybe_apply_dbo_yield(hidden_states, role="attention")
+        output = receive()
         output = restore_cam_dispatch_output(output, dispatch_payload.layout)
-        if self.shared_experts is not None:
-            output = output + self.shared_experts(hidden_states)
+        if shared_output is not None:
+            output = output + shared_output
         return output
 
 
@@ -589,50 +614,6 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
     ) -> torch.Tensor:
         return self.layers[layer_idx].compute_ffn_output(hidden_states, **kwargs)
 
-    # Upstream source: vllm-ascend commit 8d4409d,
-    # DeepseekV4Model.forward.
-    # Patch reason: native DSV4 serializes Attention and FFN within each layer,
-    # while Async CAM needs a model-owned two-stage schedule at the FFN boundary.
-    # Patch functionality: delegate planned Async CAM execution to the isolated
-    # DSV4 pipeline while preserving native forward for unsplit requests.
-    # The native forward is large, so the non-AFD path stays exact through
-    # inheritance rather than copying that implementation into this adapter.
-    # Signature: matches upstream; no added parameters.
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
-        # ### PATCH START: DSV4 model-owned Async CAM pipeline
-        async_moe_metadata = get_async_moe_ubatch_metadata_from_forward_context()
-        if async_moe_metadata is not None:
-            if input_ids is None or inputs_embeds is not None:
-                raise NotImplementedError(
-                    "DSV4 AFD async MoE ubatching requires token input_ids for "
-                    "hash routing and does not support inputs_embeds"
-                )
-            from afd_plugin.model_executor.models.npu import (
-                deepseek_v4_async_cam_forward,
-            )
-
-            return deepseek_v4_async_cam_forward.run_async_moe_ubatch_forward(
-                self,
-                input_ids,
-                positions,
-                intermediate_tensors,
-                async_moe_metadata,
-                inputs_embeds,
-            )
-        # ### PATCH END: DSV4 model-owned Async CAM pipeline
-        return super().forward(
-            input_ids,
-            positions,
-            intermediate_tensors,
-            inputs_embeds,
-        )
-
     def get_experts_layer_indices(self) -> tuple[int, ...]:
         return tuple(
             layer.layer_idx
@@ -663,40 +644,6 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         raise NotImplementedError(
             "DSV4 AFD does not support compute_gate_on_attention yet"
         )
-
-
-def _run_two_stage_async_moe_schedule(
-    layers: list[AFDDeepseekV4DecoderLayer],
-    compute_stage_attention: Callable[[AFDDeepseekV4DecoderLayer, int], None],
-    send_stage_attention: Callable[[AFDDeepseekV4DecoderLayer, int], None],
-    receive_and_complete: Callable[[AFDDeepseekV4DecoderLayer, int], None],
-) -> None:
-    """Pipeline two AFD-owned stages through Attention and remote FFN.
-
-    Once a send succeeds, any later exception is intentionally fatal: the
-    EngineCore propagates model-forward failures and terminates the worker.
-    Blindly draining CAM here would be unsafe because the remote receive point
-    is unknown after an asynchronous operator failure.
-    """
-
-    if not layers:
-        return
-    compute_stage_attention(layers[0], 0)
-    send_stage_attention(layers[0], 0)
-    for layer_idx in range(len(layers) - 1):
-        current_layer = layers[layer_idx]
-        next_layer = layers[layer_idx + 1]
-        compute_stage_attention(current_layer, 1)
-        receive_and_complete(current_layer, 0)
-        send_stage_attention(current_layer, 1)
-        compute_stage_attention(next_layer, 0)
-        receive_and_complete(current_layer, 1)
-        send_stage_attention(next_layer, 0)
-    last_layer = layers[-1]
-    compute_stage_attention(last_layer, 1)
-    receive_and_complete(last_layer, 0)
-    send_stage_attention(last_layer, 1)
-    receive_and_complete(last_layer, 1)
 
 
 class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):

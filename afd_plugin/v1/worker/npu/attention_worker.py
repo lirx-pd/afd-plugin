@@ -15,6 +15,7 @@ from afd_plugin.compat.npu import (
     fix_all2all_backend_for_afd,
     npu_afd_num_ubatches,
 )
+from afd_plugin.compat.npu.runtime_config import configure_async_cam_dbo
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.npu.attention_model_runner import (
     AFDNPUAttentionModelRunner,
@@ -45,6 +46,8 @@ class AFDNPUAttentionWorker(NPUWorker):
             expected_role="attention",
             expected_worker_qualname_override=NPU_ATTENTION_WORKER_FQCN,
         )
+        fail_if_unsupported_npu_afd_features(self.vllm_config)
+        configure_async_cam_dbo(self.vllm_config)
         fail_if_unsupported_npu_afd_features(self.vllm_config)
         fix_all2all_backend_for_afd(self.vllm_config)
         if self.use_v2_model_runner:

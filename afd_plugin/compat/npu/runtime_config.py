@@ -6,6 +6,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from afd_plugin.config import (
+    AFD_ASYNC_CONNECTOR,
+    connector_extra_config_from_source,
+    is_afd_async_dp,
+    parse_afd_config,
+)
+from afd_plugin.config_utils import coerce_extra_bool
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
@@ -13,6 +21,49 @@ FLASHINFER_ALL2ALLV_BACKEND = "flashinfer_all2allv"
 DEEPSEEK_V2_MODEL_TYPES = frozenset(
     ("deepseek", "deepseek_v2", "deepseek_v3", "deepseek_v32", "glm_moe_dsa")
 )
+
+
+def configure_async_cam_dbo(vllm_config: VllmConfig) -> None:
+    """Treat the legacy Async flag as native DBO on every Attention DP size."""
+    afd_config = parse_afd_config(vllm_config)
+    parallel = vllm_config.parallel_config
+    if (
+        afd_config.connector != AFD_ASYNC_CONNECTOR
+        or not afd_config.is_attention_server
+    ):
+        return
+    if not (
+        parallel.use_ubatching
+        or coerce_extra_bool(
+            connector_extra_config_from_source(vllm_config).get(
+                "async_moe_ubatching", False
+            ),
+            field_name="async_moe_ubatching",
+        )
+    ):
+        return
+
+    parallel.enable_dbo = True
+    # Enabling the legacy alias happens after ParallelConfig validation.
+    # Repeat its native threshold guard so no empty child can be selected.
+    if (
+        min(
+            parallel.dbo_decode_token_threshold,
+            parallel.dbo_prefill_token_threshold,
+        )
+        < parallel.num_ubatches
+    ):
+        raise ValueError(
+            "dbo_decode_token_threshold and dbo_prefill_token_threshold must "
+            f"be at least the number of microbatches ({parallel.num_ubatches})."
+        )
+
+
+def uses_async_cam_dbo(vllm_config: VllmConfig) -> bool:
+    return is_afd_async_dp(vllm_config) and (
+        vllm_config.parallel_config.enable_dbo
+        or vllm_config.parallel_config.use_ubatching
+    )
 
 
 def npu_afd_num_ubatches(vllm_config: VllmConfig) -> int:
@@ -63,8 +114,10 @@ def fix_all2all_backend_for_afd(vllm_config: VllmConfig) -> None:
 
 
 __all__ = [
+    "configure_async_cam_dbo",
     "fix_all2all_backend_for_afd",
     "npu_afd_num_ubatches",
     "npu_model_uses_sequence_parallel_moe",
     "npu_model_uses_sharded_pp_tensors",
+    "uses_async_cam_dbo",
 ]

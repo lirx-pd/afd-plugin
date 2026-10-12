@@ -17,10 +17,10 @@ control plane.
 
 The supported deployment requires ``async=true``, eager execution, Ascend CAM
 operator packages, and matching topology/configuration on every rank. Regular
-prefill and autoregressive decode steps use the same connector; vLLM native DBO
-and ACL graph execution are not supported.
-Optional AFD-managed MoE ubatching is a separate two-stage pipeline using
-request boundaries or token-balanced stages for DP+TP/SP. See
+prefill and autoregressive decode steps use the same connector. Attention
+microbatching uses the native DBO runtime with Ascend adaptations; ACL graph
+execution is not supported. Legacy Async microbatching flags are configuration
+aliases, and no independent Async split or model schedule is maintained. See
 ``docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md`` for configuration, rank
 derivation, launch guidance, and the full limitations.
 """
@@ -144,10 +144,9 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
     Attributes:
         dynamic_quant: Dynamic quantization mode accepted by CAM operators.
         attn_ranks_per_dp: Number of Attention ranks in each data-parallel group.
-        async_moe_ubatching: Whether two-stage async MoE ubatching is used.
-        async_moe_num_ubatches: Number of stages used by async MoE ubatching.
-        async_moe_split: ``"request"`` for request boundaries or ``"token"``
-            for token-balanced DP+TP/SP stages.
+        async_moe_ubatching: Legacy alias for Attention native DBO.
+        async_moe_num_ubatches: Legacy count validation; only two is supported.
+        async_moe_split: Deprecated parsing compatibility; native DBO owns slices.
         hccl_buffer_size: Optional buffer size in MB for the CAM HCCL domain.
     """
 
@@ -174,6 +173,12 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
             raise ValueError(
                 "unknown AFD async connector_extra_config field(s): "
                 + ", ".join(unknown),
+            )
+
+        if "async_moe_split" in raw:
+            logger.warning_once(
+                "async_moe_split is deprecated and has no effect; "
+                "Async CAM uses the native DBO split policy"
             )
 
         return cls(

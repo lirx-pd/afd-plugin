@@ -4,6 +4,7 @@
 
 import threading
 from collections.abc import Callable
+from contextlib import nullcontext
 from copy import copy
 from typing import Any
 
@@ -13,6 +14,7 @@ from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker import ubatching
+from vllm.v1.worker.dp_utils import skip_dp_coordination
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.ubatch_utils import UBatchRunner, UBatchState
@@ -26,7 +28,9 @@ from vllm_ascend.ascend_forward_context import (
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata, build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 
+from afd_plugin.compat.npu.runtime_config import uses_async_cam_dbo
 from afd_plugin.compat.patches.npu.mrv2_ubatching import (
+    use_async_cam_child_dp_metadata,
     use_npu_input_batch_slicing,
     use_npu_ubatch_contexts,
 )
@@ -153,9 +157,14 @@ class NPUUBatchRunner(UBatchRunner):
         slot_mappings_by_layer: list[dict[str, torch.Tensor]],
         is_padding: list[torch.Tensor | None],
     ) -> list[ForwardContext]:
-        contexts = super()._make_forward_contexts(
-            ubatch_slices, attn_metadata, slot_mappings_by_layer, is_padding
-        )
+        with (
+            use_async_cam_child_dp_metadata()
+            if uses_async_cam_dbo(self.vllm_config)
+            else nullcontext()
+        ):
+            contexts = super()._make_forward_contexts(
+                ubatch_slices, attn_metadata, slot_mappings_by_layer, is_padding
+            )
         for stage_idx, (context, stage) in enumerate(
             zip(contexts, ubatch_slices, strict=True)
         ):
@@ -184,6 +193,9 @@ class NPUUBatchRunner(UBatchRunner):
             with (
                 set_current_vllm_config(self.vllm_config),
                 override_mrv2_in_profile_run(is_profile),
+                skip_dp_coordination()
+                if uses_async_cam_dbo(self.vllm_config)
+                else nullcontext(),
                 use_workspace_lane(0),
             ):
                 return model(**inputs)

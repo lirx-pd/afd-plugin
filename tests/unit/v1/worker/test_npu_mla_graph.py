@@ -8,7 +8,7 @@ from __future__ import annotations
 # mypy: disable-error-code="attr-defined"
 import importlib
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from importlib.util import find_spec
 from types import ModuleType, SimpleNamespace
 
@@ -120,6 +120,7 @@ def _load_forward_context_module(monkeypatch):
 
     fake_config.CUDAGraphMode = CUDAGraphMode
     fake_config.VllmConfig = object
+    fake_config.set_current_vllm_config = lambda *a, **k: nullcontext()
     fake_distributed = ModuleType("vllm.distributed")
     fake_distributed.get_dp_group = lambda: SimpleNamespace(world_size=1)
     fake_distributed.get_tensor_model_parallel_world_size = lambda: 1
@@ -213,6 +214,7 @@ def _load_ubatch_wrapper_module(monkeypatch):
 
     fake_config.CUDAGraphMode = CUDAGraphMode
     fake_config.VllmConfig = object
+    fake_config.set_current_vllm_config = lambda *a, **k: nullcontext()
     fake_distributed = ModuleType("vllm.distributed")
     fake_distributed.get_pp_group = lambda: SimpleNamespace(is_last_rank=True)
     fake_distributed.get_tensor_model_parallel_world_size = lambda: 1
@@ -238,6 +240,12 @@ def _load_ubatch_wrapper_module(monkeypatch):
     fake_vllm_v1.__path__ = []
     fake_vllm_worker = ModuleType("vllm.v1.worker")
     fake_vllm_worker.__path__ = []
+    fake_native_ubatching = ModuleType("vllm.v1.worker.ubatching")
+    fake_native_ubatching.UBatchContext = object
+    fake_dp_utils = ModuleType("vllm.v1.worker.dp_utils")
+    fake_dp_utils.skip_dp_coordination = lambda: nullcontext()
+    fake_patches = ModuleType("afd_plugin.compat.patches.npu.mrv2_ubatching")
+    fake_patches.use_npu_ubatch_contexts = lambda: nullcontext()
     fake_gpu_wrapper = ModuleType("vllm.v1.worker.gpu_ubatch_wrapper")
     fake_gpu_wrapper.UbatchMetadata = object
     fake_gpu_wrapper.UBatchWrapper = object
@@ -281,6 +289,9 @@ def _load_ubatch_wrapper_module(monkeypatch):
         "vllm.sequence": fake_sequence,
         "vllm.v1": fake_vllm_v1,
         "vllm.v1.worker": fake_vllm_worker,
+        "vllm.v1.worker.ubatching": fake_native_ubatching,
+        "vllm.v1.worker.dp_utils": fake_dp_utils,
+        "afd_plugin.compat.patches.npu.mrv2_ubatching": fake_patches,
         "vllm.v1.worker.gpu_ubatch_wrapper": fake_gpu_wrapper,
         "vllm_ascend": fake_ascend,
         "vllm_ascend.compilation": fake_compilation,
@@ -361,6 +372,7 @@ def _new_wrapper_for_unit_test(wrapper_module, *, mla_full_graph_enabled):
     wrapper.cudagraph_wrapper = None
     wrapper.runnable = lambda **_kwargs: "eager"
     wrapper.vllm_config = SimpleNamespace(
+        additional_config={},
         parallel_config=SimpleNamespace(data_parallel_size=1),
     )
     return wrapper

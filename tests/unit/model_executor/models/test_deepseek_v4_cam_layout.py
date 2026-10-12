@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,6 +23,14 @@ def _make_proxy(monkeypatch, *, use_sequence_parallel: bool, in_profile_run: boo
     torch.nn.Module.__init__(proxy)
     proxy.use_sequence_parallel_moe = use_sequence_parallel
     proxy.shared_experts = None
+    proxy.layer_idx = 3
+    connector = SimpleNamespace()
+    monkeypatch.setattr(
+        adapter,
+        "get_afd_metadata_from_forward_context",
+        lambda: SimpleNamespace(connector=connector, stage_idx=0),
+    )
+    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", lambda states, **kw: states)
     topk_weights = torch.arange(32, dtype=torch.float32).reshape(16, 2)
     topk_ids = torch.arange(32, dtype=torch.int32).reshape(16, 2)
     monkeypatch.setattr(
@@ -57,11 +65,13 @@ def test_dsv4_profile_gate_shards_plain_tp8_and_restores(monkeypatch):
     )
     sends = []
 
-    def send_and_receive(_self, local_hidden_states, **kwargs):
+    def send(_connector, local_hidden_states, context, **kwargs):
+        assert context.metadata.layer_idx == proxy.layer_idx
+        assert context.metadata.stage_idx == 0
         sends.append((local_hidden_states, kwargs))
-        return local_hidden_states + 100
+        return lambda: local_hidden_states + 100
 
-    proxy._send_and_receive = MethodType(send_and_receive, proxy)
+    monkeypatch.setattr(adapter, "send_async_cam_remote_call", send)
 
     output = proxy(hidden_states)
 
@@ -86,11 +96,11 @@ def test_dsv4_gate_keeps_sequence_parallel_tokens_rank_local(monkeypatch):
     hidden_states = torch.arange(64, dtype=torch.float32).reshape(16, 4)
     sends = []
 
-    def send_and_receive(_self, local_hidden_states, **kwargs):
+    def send(_connector, local_hidden_states, context, **kwargs):
         sends.append((local_hidden_states, kwargs))
-        return local_hidden_states + 1
+        return lambda: local_hidden_states + 1
 
-    proxy._send_and_receive = MethodType(send_and_receive, proxy)
+    monkeypatch.setattr(adapter, "send_async_cam_remote_call", send)
 
     output = proxy(hidden_states)
 

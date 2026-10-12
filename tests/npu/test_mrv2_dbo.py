@@ -26,6 +26,7 @@ from vllm.config import VllmConfig  # noqa: E402
 from vllm.forward_context import get_forward_context  # noqa: E402
 from vllm.utils.torch_utils import current_stream  # noqa: E402
 from vllm.v1.worker import ubatching  # noqa: E402
+from vllm.v1.worker.dp_utils import should_skip_dp_coordination  # noqa: E402
 from vllm.v1.worker.gpu import model_runner  # noqa: E402, F401
 from vllm.v1.worker.gpu.ubatch_utils import UBatchState  # noqa: E402
 from vllm.v1.worker.ubatch_utils import UBatchSlice  # noqa: E402
@@ -40,16 +41,29 @@ from vllm_ascend.ascend_forward_context import (  # noqa: E402
 from vllm_ascend.utils import adapt_patch  # noqa: E402
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper  # noqa: E402
 
+from afd_plugin.connectors import AFDTransferContext, AFDTransferMetadata  # noqa: E402
+from afd_plugin.model_executor.models.npu.async_cam_dbo import (  # noqa: E402
+    send_async_cam_remote_call,
+)
 from afd_plugin.v1.worker.npu.ubatch_runner import NPUUBatchRunner  # noqa: E402
 
 
-def _exercise(fault):
+def _exercise(fault, cam_layers=0):
     # Construct only the native execution state; full initialization/metadata
     # and distributed communication are covered by the checkpoint run.
     adapt_patch(is_global_patch=True)
     torch.npu.set_device(0)
     runner = object.__new__(NPUUBatchRunner)
     runner.vllm_config = VllmConfig()
+    if cam_layers:
+        runner.vllm_config.additional_config = {
+            "afd": {
+                "role": "attention",
+                "async": True,
+                "connector": "CAMAsyncAFDConnector",
+            }
+        }
+        runner.vllm_config.parallel_config.enable_dbo = True
     runner.device = torch.device("npu:0")
     runner.num_ubatches = 2
     runner.comm_stream = torch.npu.Stream(device=runner.device)
@@ -65,7 +79,7 @@ def _exercise(fault):
     )
     parent = ubatching.forward_context._forward_context
     inputs = torch.arange(8, dtype=torch.float32, device=runner.device)
-    trace = []
+    trace: list[tuple[int | str | None, ...]] = []
     injected: list[str] = []
     if fault == "device_init":
         # Native threads initialize before entering UBatchContext/barrier.
@@ -111,6 +125,56 @@ def _exercise(fault):
             ubatching._CURRENT_CONTEXTS[stage].recv_hook = fail
         return value
 
+    outstanding: list[AFDTransferContext] = []
+    if cam_layers:
+
+        def send(value, transfer, **kwargs):
+            assert not outstanding, "CAM physical window was overwritten"
+            outstanding.append(transfer)
+            trace.append(
+                (ubatching.dbo_current_ubatch_id(), "send", transfer.metadata.layer_idx)
+            )
+            if transfer.metadata.stage_idx == 0 and fault == "after_send":
+                fail()
+
+        def receive(*, ref_tensor, ubatch_idx, context):
+            assert outstanding.pop() is context
+            assert ubatch_idx == context.metadata.stage_idx
+            # Native exit can drain the final slot after removing its identity.
+            actor = ubatching._THREAD_ID_TO_CONTEXT.get(threading.get_ident())
+            trace.append((actor, "raw_receive", context.metadata.layer_idx, ubatch_idx))
+            assert actor != ubatch_idx
+            if ubatch_idx == 0 and fault == "recv_hook":
+                fail()
+            return ref_tensor * 3
+
+        connector = SimpleNamespace(send_attn_output=send, recv_ffn_output=receive)
+
+        def model(input_ids, positions):
+            stage = ubatching.dbo_current_ubatch_id()
+            owner = get_forward_context()
+            assert owner is contexts[stage]
+            assert should_skip_dp_coordination()
+            assert current_stream() == torch.npu.current_stream()
+            states = input_ids
+            for layer in range(cam_layers):
+                transfer = AFDTransferContext(
+                    metadata=AFDTransferMetadata.create_attention_metadata(
+                        layer_idx=layer, stage_idx=stage, seq_len=len(states)
+                    )
+                )
+                recv = send_async_cam_remote_call(connector, states, transfer)
+                shared = torch.ones_like(states)
+                ubatching.dbo_yield()
+                assert get_forward_context() is owner
+                states = recv() + shared
+                trace.append((stage, "consume", layer))
+                if stage == 0 and fault == "owner_consume":
+                    fail()
+            if stage == 0 and fault == "final_exit":
+                ubatching._CURRENT_CONTEXTS[stage].recv_hook = fail
+            return states
+
     before = set(threading.enumerate())
     try:
         with override_mrv2_in_profile_run(True), torch_cuda_wrapper():
@@ -118,8 +182,21 @@ def _exercise(fault):
                 model, {"input_ids": inputs, "positions": inputs}, state
             )
         assert fault == "none", "injected failure was lost"
-        torch.testing.assert_close(result.cpu(), torch.arange(8) * 4, check_dtype=False)
-        assert trace == [(0, "send"), (1, "send"), (0, "consume"), (1, "consume")]
+        if cam_layers:
+            expected = torch.arange(8, dtype=torch.float32)
+            for _ in range(cam_layers):
+                expected = expected * 3 + 1
+            torch.testing.assert_close(result.cpu(), expected)
+            assert not outstanding
+            assert (
+                len([event for event in trace if event[1] == "raw_receive"])
+                == cam_layers * 2
+            )
+        else:
+            torch.testing.assert_close(
+                result.cpu(), torch.arange(8) * 4, check_dtype=False
+            )
+            assert trace == [(0, "send"), (1, "send"), (0, "consume"), (1, "consume")]
     except (RuntimeError, threading.BrokenBarrierError):
         if fault == "none":
             raise
@@ -135,6 +212,8 @@ def _exercise(fault):
     assert ubatching.forward_context._forward_context is parent
     torch.npu.synchronize()
     print("NPU_DBO_PASS " + fault, flush=True)
+    if cam_layers:
+        print("CAM_TRACE " + repr(trace), flush=True)
 
 
 @pytest.mark.parametrize(
@@ -154,5 +233,32 @@ def test_native_npu_threads_and_bounded_failure(fault):
     assert "NPU_DBO_PASS " + fault in result.stdout
 
 
+@pytest.mark.parametrize(
+    "fault,layers",
+    [("none", 1), ("none", 3)]
+    + [
+        (fault, 2)
+        for fault in (
+            "device_init",
+            "after_send",
+            "recv_hook",
+            "owner_consume",
+            "final_exit",
+        )
+    ],
+)
+def test_native_async_cam_window_and_owner_on_npu(fault, layers):
+    if not torch.npu.is_available():
+        pytest.skip("requires an allocated NPU")
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), fault, str(layers)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "NPU_DBO_PASS " + fault in result.stdout
+
+
 if __name__ == "__main__":
-    _exercise(sys.argv[1])
+    _exercise(sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 0)

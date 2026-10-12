@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import inspect
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
@@ -41,7 +41,17 @@ Runner = npu_v2.AFDNPUAttentionModelRunnerV2
 def _runner(*, async_dp=False):
     runner = object.__new__(Runner)
     runner.vllm_config = SimpleNamespace(
-        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE)
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
+        additional_config={
+            "afd": {
+                "role": "attention",
+                "async": async_dp,
+                "connector": "CAMAsyncAFDConnector"
+                if async_dp
+                else "CAMP2pAFDConnector",
+            }
+        },
+        parallel_config=SimpleNamespace(enable_dbo=False, use_ubatching=False),
     )
     runner.afd_config = SimpleNamespace(
         async_dp=async_dp, num_attention_ranks=2, num_ffn_ranks=2
@@ -53,7 +63,6 @@ def _runner(*, async_dp=False):
     runner.ubatch_runner = None
     runner.prof = object()
     runner._afd_pending_metadata = object()
-    runner._afd_async_moe_ubatch_metadata = None
     runner._afd_suppress_metadata_send = True
     runner._is_warmup = True
     runner._afd_is_graph_capturing = True
@@ -65,7 +74,6 @@ def _runner(*, async_dp=False):
 def _state(runner):
     return (
         runner._afd_pending_metadata,
-        runner._afd_async_moe_ubatch_metadata,
         runner._afd_suppress_metadata_send,
         runner._is_warmup,
         runner._afd_is_graph_capturing,
@@ -151,55 +159,6 @@ def test_execute_forwards_dummy_profile_and_context_then_restores(
     assert step_calls == [runner.prof]
     assert _state(runner) == original_state
     assert forward_module.create_forward_context is original_factory
-
-
-@pytest.mark.parametrize("async_dp", [False, True])
-@pytest.mark.parametrize("stages_enabled", [False, True])
-@pytest.mark.parametrize("raise_in_native", [False, True])
-def test_execute_installs_local_stages_without_control_and_restores(
-    monkeypatch, async_dp, stages_enabled, raise_in_native
-):
-    runner = _runner(async_dp=async_dp)
-    runner.connector.control_plane = None
-    runner.connector.extra_info.async_moe_ubatching = stages_enabled
-    previous = object()
-    current = object()
-    runner._afd_async_moe_ubatch_metadata = previous
-    context = SimpleNamespace(additional_kwargs={}, ubatch_slices=None)
-    events = []
-
-    @contextmanager
-    def stage_scope(self):
-        events.append("enter")
-        self._afd_async_moe_ubatch_metadata = current
-        try:
-            yield
-        finally:
-            events.append("exit")
-
-    monkeypatch.setattr(npu_v2, "use_async_cam_stage_metadata", stage_scope)
-    monkeypatch.setattr(npu_v2, "step_afd_npu_profiler", lambda _: None)
-    monkeypatch.setattr(
-        afd_context.forward_context_module, "create_forward_context", lambda: context
-    )
-
-    def native_execute(self, *args, **kwargs):
-        ctx = afd_context.forward_context_module.create_forward_context()
-        assert ctx.additional_kwargs["afd_metadata"] is self._afd_pending_metadata
-        stage_plan = ctx.additional_kwargs.get(npu_v2.ASYNC_MOE_UBATCH_METADATA_KEY)
-        assert stage_plan is (current if async_dp and stages_enabled else None)
-        if raise_in_native:
-            raise RuntimeError("native failed")
-        return "result"
-
-    monkeypatch.setattr(NPUModelRunner, "execute_model", native_execute)
-    if raise_in_native:
-        with pytest.raises(RuntimeError, match="native failed"):
-            runner.execute_model(None)
-    else:
-        assert runner.execute_model(None) == "result"
-    assert events == (["enter", "exit"] if async_dp and stages_enabled else [])
-    assert runner._afd_async_moe_ubatch_metadata is previous
 
 
 @pytest.mark.parametrize("profile_only", [False, True])
@@ -598,7 +557,7 @@ def test_stage_prepare_uses_independent_builders_and_detaches_cache(monkeypatch)
     runner.stage_attn_groups = [object(), object()]
     runner.model_state = SimpleNamespace(max_model_len=128)
     runner.parallel_config = object()
-    runner.vllm_config = object()
+    runner.vllm_config = SimpleNamespace(additional_config={})
     calls = []
     reusable = torch.empty(5)
 
@@ -652,7 +611,7 @@ def test_stage_prepare_uses_independent_builders_and_detaches_cache(monkeypatch)
 
 def test_native_child_contexts_preserve_dp_and_own_ascend_kwargs(monkeypatch):
     runner = object.__new__(npu_ubatch.NPUUBatchRunner)
-    runner.vllm_config = object()
+    runner.vllm_config = SimpleNamespace(additional_config={})
     slices = [SimpleNamespace(num_tokens=4), SimpleNamespace(num_tokens=4)]
     dp = [object(), object()]
     contexts = [
@@ -698,3 +657,182 @@ def test_scope_restores_native_bindings_after_failure():
     assert patches.ubatch_utils.current_stream is runner_stream
     assert patches.model_runner.maybe_build_ubatch_runner is factory
     assert patches.ubatch_utils.create_sm_control_context is sm_control
+
+
+@pytest.mark.parametrize("dp_size", [1, 2])
+@pytest.mark.parametrize("tokens,threshold,expected", [(1, 2, 1), (7, 2, 2), (7, 8, 1)])
+def test_async_dbo_dispatch_preserves_thresholds_and_falls_back_locally(
+    monkeypatch, dp_size, tokens, threshold, expected
+):
+    from vllm.v1.worker.dp_utils import skip_dp_coordination
+
+    parallel = SimpleNamespace(
+        use_ubatching=True,
+        enable_dbo=True,
+        num_ubatches=2,
+        dbo_decode_token_threshold=threshold,
+        dbo_prefill_token_threshold=threshold,
+    )
+    monkeypatch.setattr(
+        dp_utils, "get_dp_group", lambda: SimpleNamespace(cpu_group=None)
+    )
+    monkeypatch.setattr(
+        dp_utils.dist, "all_reduce", lambda *a, **k: pytest.fail("Async DP collective")
+    )
+    native = native_v2.dispatch_cg_and_sync_dp
+    with (
+        skip_dp_coordination(),
+        patches.use_async_cam_dbo_dispatch(),
+    ):
+        desc, sync = native_v2.dispatch_cg_and_sync_dp(
+            None,
+            tokens,
+            tokens,
+            1,
+            dp_size,
+            dp_size - 1,
+            need_eager=True,
+            parallel_config=parallel,
+            allow_ubatching=True,
+            uniform_decode=True,
+        )
+        assert desc.num_ubatches == expected
+        if dp_size == 1:
+            assert sync is None
+        else:
+            assert sync.num_tokens_across_dp.tolist() == [tokens, tokens]
+        # Native slicing also supports one request straddling both microbatches.
+        desc, _ = native_v2.dispatch_cg_and_sync_dp(
+            None,
+            1,
+            7,
+            None,
+            dp_size,
+            0,
+            need_eager=True,
+            parallel_config=parallel,
+            allow_ubatching=True,
+        )
+        assert desc.num_ubatches == (2 if threshold <= 7 else 1)
+    assert native_v2.dispatch_cg_and_sync_dp is native
+
+
+def test_async_native_children_keep_request_prefix_and_parent_padding(monkeypatch):
+
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.input_batch.update_cos_sin", lambda _: None
+    )
+    buffers = AscendInputBuffers(2, 8, torch.device("cpu"))
+    batch = AscendInputBatch.make_dummy(2, 7, buffers)
+    batch.num_tokens_after_padding = 8
+    batch.input_ids = torch.arange(8)
+    batch.positions = torch.arange(8)
+    batch.num_scheduled_tokens = np.array([3, 4], dtype=np.int32)
+    batch.query_start_loc_np = np.array([0, 3, 7], dtype=np.int32)
+    batch.query_start_loc.copy_(torch.from_numpy(batch.query_start_loc_np))
+    batch.seq_lens.copy_(torch.tensor([15, 24]))
+    batch.seq_lens_cpu_upper_bound.copy_(torch.tensor([15, 24]))
+    batch.seq_lens_np = np.array([15, 24], dtype=np.int32)
+    boundary = 4
+    native_plan = ubatch_utils.create_ubatch_slices
+    with patches.use_npu_input_batch_slicing():
+        slices = ubatch_utils.create_ubatch_slices(batch, 2)
+        children = [
+            ubatch_utils._slice_input_batch(
+                batch,
+                stage,
+                torch.zeros(3, dtype=torch.int32),
+                torch.zeros(2, dtype=torch.int32),
+            )
+            for stage in slices
+        ]
+    assert ubatch_utils.create_ubatch_slices is native_plan
+    assert [stage.token_slice for stage in slices] == [
+        slice(0, boundary),
+        slice(boundary, 8),
+    ]
+    assert [child.num_tokens for child in children] == [boundary, 7 - boundary]
+    assert [child.positions.tolist() for child in children] == [
+        list(range(boundary)),
+        list(range(boundary, 8)),
+    ]
+    assert children[0].seq_lens_np.tolist() == [15, 21]
+    assert children[1].seq_lens_np.tolist() == [24]
+    assert children[1].query_start_loc_np.tolist() == [0, 7 - boundary]
+    assert batch.seq_lens_np.tolist() == [15, 24]
+
+
+@pytest.mark.parametrize("dp_size", [1, 2])
+@pytest.mark.parametrize("async_dp", [False, True])
+def test_native_factory_allows_local_async_dbo_only(monkeypatch, dp_size, async_dp):
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(use_ubatching=True, data_parallel_size=dp_size),
+        additional_config={
+            "afd": {
+                "connector": "CAMAsyncAFDConnector"
+                if async_dp
+                else "CAMP2pAFDConnector",
+                "role": "attention",
+                "async_dp": async_dp,
+            }
+        },
+    )
+    created = []
+    instance = object()
+
+    def build(*args, **kwargs):
+        created.append((args, kwargs))
+        return instance
+
+    monkeypatch.setattr(npu_ubatch, "NPUUBatchRunner", build)
+    with patches.use_npu_ubatch_factory(SimpleNamespace(kernel_block_sizes=[128])):
+        result = native_v2.maybe_build_ubatch_runner(config, None, None, [], None, 2)
+    assert (result is instance) is (async_dp or dp_size > 1)
+    assert len(created) == int(async_dp or dp_size > 1)
+
+
+@pytest.mark.parametrize("dp_size", [1, 2])
+def test_async_native_context_creation_without_sp(monkeypatch, dp_size):
+    runner = object.__new__(npu_ubatch.NPUUBatchRunner)
+    runner.parallel_config = SimpleNamespace(
+        data_parallel_size=dp_size,
+        data_parallel_rank=0,
+        use_sequence_parallel_moe=False,
+        is_moe_model=True,
+        enable_dbo=True,
+    )
+    runner.vllm_config = SimpleNamespace(
+        additional_config={
+            "afd": {
+                "role": "attention",
+                "async": True,
+                "connector": "CAMAsyncAFDConnector",
+            }
+        },
+        parallel_config=runner.parallel_config,
+        compilation_config=SimpleNamespace(
+            fast_moe_cold_start=False, static_forward_context={}
+        ),
+    )
+    monkeypatch.setattr(
+        npu_ubatch.current_platform,
+        "set_additional_forward_context",
+        lambda *a, **k: {},
+    )
+    native_metadata = ubatch_utils.DPMetadata
+    contexts = runner._make_forward_contexts(
+        [SimpleNamespace(num_tokens=3)] * 2, [None, None], [{}, {}], [None, None]
+    )
+    assert all(ctx.dp_metadata is None for ctx in contexts)
+    assert [ctx.additional_kwargs["ubatch_idx"] for ctx in contexts] == [0, 1]
+    assert ubatch_utils.DPMetadata is native_metadata
+
+
+def test_async_child_metadata_factory_restores_after_failure():
+    native_metadata = ubatch_utils.DPMetadata
+    with (
+        pytest.raises(RuntimeError, match="injected"),
+        patches.use_async_cam_child_dp_metadata(),
+    ):
+        raise RuntimeError("injected")
+    assert ubatch_utils.DPMetadata is native_metadata

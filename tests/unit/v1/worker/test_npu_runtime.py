@@ -2949,17 +2949,14 @@ def test_npu_async_feature_validation_requires_async_config_and_eager():
 
 
 @pytest.mark.parametrize(
-    ("parallel_override", "error"),
+    "parallel_override",
     [
-        ({"use_ubatching": True}, "ubatching"),
-        ({"enable_dbo": True}, "DBO"),
+        {"use_ubatching": True},
+        {"enable_dbo": True},
     ],
 )
-def test_npu_async_feature_validation_rejects_native_ubatching(
-    parallel_override,
-    error,
-):
-    with pytest.raises(RuntimeError, match=error):
+def test_npu_async_feature_validation_requires_two_native_ubatches(parallel_override):
+    with pytest.raises(RuntimeError, match="DBO requires exactly two ubatches"):
         fail_if_unsupported_npu_afd_features(
             _vllm_config(
                 connector="CAMAsyncAFDConnector",
@@ -3133,7 +3130,8 @@ def test_npu_async_moe_ubatching_validation_rejects_unsupported_shape(
         fail_if_unsupported_npu_afd_features(config)
 
 
-def test_npu_ubatch_enabled_when_thresholds_are_met(monkeypatch):
+@pytest.fixture
+def npu_ubatch_utils(monkeypatch):
     fake_numpy = ModuleType("numpy")
     fake_numpy.ndarray = object  # type: ignore[attr-defined]
     fake_torch = ModuleType("torch")
@@ -3157,6 +3155,15 @@ def test_npu_ubatch_enabled_when_thresholds_are_met(monkeypatch):
     fake_vllm_ubatch_utils.check_ubatch_thresholds = (  # type: ignore[attr-defined]
         check_ubatch_thresholds
     )
+    fake_vllm_ubatch_utils.is_last_ubatch_empty = (  # type: ignore[attr-defined]
+        lambda *_args: False
+    )
+    for name in ("_pad_out_ubatch_slices", "maybe_create_ubatch_slices"):
+        setattr(
+            fake_vllm_ubatch_utils,
+            name,
+            lambda *_args: pytest.fail("unused native helper"),
+        )
 
     fake_vllm_ascend = ModuleType("vllm_ascend")
     fake_forward_context = ModuleType("vllm_ascend.ascend_forward_context")
@@ -3194,27 +3201,31 @@ def test_npu_ubatch_enabled_when_thresholds_are_met(monkeypatch):
     with _temporarily_reimport_module(
         "afd_plugin.v1.worker.npu.ubatch_utils",
     ) as ubatch_utils:
-        config = _vllm_config(
-            enable_dbo=True,
-            use_ubatching=True,
-            num_ubatches=2,
-            ubatch_size=4,
-            dbo_decode_token_threshold=2,
-            dbo_prefill_token_threshold=12,
-        )
+        yield ubatch_utils
 
-        assert ubatch_utils.check_enable_ubatch(
-            num_tokens_unpadded=12,
-            num_tokens_padded=12,
-            uniform_decode=True,
-            vllm_config=config,
-        )
-        assert ubatch_utils.check_enable_ubatch(
-            num_tokens_unpadded=12,
-            num_tokens_padded=12,
-            uniform_decode=True,
-            vllm_config=config,
-        )
+
+def test_npu_ubatch_enabled_when_thresholds_are_met(npu_ubatch_utils):
+    config = _vllm_config(
+        enable_dbo=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        ubatch_size=4,
+        dbo_decode_token_threshold=2,
+        dbo_prefill_token_threshold=12,
+    )
+
+    assert npu_ubatch_utils.check_enable_ubatch(
+        num_tokens_unpadded=12,
+        num_tokens_padded=12,
+        uniform_decode=True,
+        vllm_config=config,
+    )
+    assert npu_ubatch_utils.check_enable_ubatch(
+        num_tokens_unpadded=12,
+        num_tokens_padded=12,
+        uniform_decode=False,
+        vllm_config=config,
+    )
 
 
 def _tokens(dp_metadata):
@@ -3535,10 +3546,9 @@ def test_npu_async_mrv2_rejects_fractional_tp_capacity():
     ],
 )
 def test_async_cam_dbo_configuration_reuses_mrv1_thresholds(
-    native_flag, local_flag, dp_size, expected
+    npu_ubatch_utils, native_flag, local_flag, dp_size, expected
 ):
     from afd_plugin.compat.npu.runtime_config import configure_async_cam_dbo
-    from afd_plugin.v1.worker.npu.ubatch_utils import check_enable_ubatch
 
     config = _vllm_config(
         connector="CAMAsyncAFDConnector",
@@ -3553,9 +3563,9 @@ def test_async_cam_dbo_configuration_reuses_mrv1_thresholds(
     configure_async_cam_dbo(config)
     assert config.parallel_config.enable_dbo is expected
     config.parallel_config.use_ubatching = expected
-    assert check_enable_ubatch(8, 8, True, config) is expected
+    assert npu_ubatch_utils.check_enable_ubatch(8, 8, True, config) is expected
     config.parallel_config.dbo_decode_token_threshold = 9
-    assert not check_enable_ubatch(8, 8, True, config)
+    assert not npu_ubatch_utils.check_enable_ubatch(8, 8, True, config)
 
 
 @pytest.mark.parametrize("use_mrv2", [False, True])
@@ -3563,6 +3573,7 @@ def test_async_cam_dbo_configuration_reuses_mrv1_thresholds(
 def test_async_moe_flag_initializes_two_workspace_lanes_before_runner(
     monkeypatch, use_mrv2, dp_size
 ):
+    _require_npu_runtime()
     from vllm.config import ParallelConfig
 
     from afd_plugin.v1.worker.npu import attention_worker

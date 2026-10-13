@@ -3580,11 +3580,14 @@ def test_async_moe_flag_initializes_two_workspace_lanes_before_runner(
     worker = SimpleNamespace(
         vllm_config=config, use_v2_model_runner=use_mrv2, _init_device=lambda: "device"
     )
+    events = []
     monkeypatch.setattr(
         attention_worker, "assert_compatible_afd_stack", lambda *a, **k: None
     )
     monkeypatch.setattr(
-        attention_worker, "fail_if_unsupported_npu_afd_features", lambda *a, **k: None
+        attention_worker,
+        "fail_if_unsupported_npu_afd_features",
+        lambda cfg: events.append(("validate", cfg.parallel_config.enable_dbo)),
     )
     monkeypatch.setattr(
         attention_worker, "fix_all2all_backend_for_afd", lambda *a: None
@@ -3593,7 +3596,6 @@ def test_async_moe_flag_initializes_two_workspace_lanes_before_runner(
         attention_worker, "validate_npu_model_runner_v2_config", lambda *a, **k: None
     )
     monkeypatch.setattr(attention_worker, "get_afd_model_config", lambda cfg, **kw: cfg)
-    events = []
     monkeypatch.setattr(
         attention_worker,
         "init_workspace_manager",
@@ -3608,4 +3610,4 @@ def test_async_moe_flag_initializes_two_workspace_lanes_before_runner(
     monkeypatch.setattr(attention_worker, "AFDNPUAttentionModelRunner", runner)
     monkeypatch.setattr(attention_worker, "AFDNPUAttentionModelRunnerV2", runner)
     attention_worker.AFDNPUAttentionWorker.init_device(worker)
-    assert events == [("workspace", 2), ("runner", 2)]
+    assert events == [("validate", True), ("workspace", 2), ("runner", 2)]

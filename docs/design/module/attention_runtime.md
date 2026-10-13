@@ -153,11 +153,11 @@ The supported V2 deployment is deliberately narrower than V1:
 | Connector | Synchronous `P2pNcclAFDConnector` | Synchronous `CAMP2pAFDConnector` | `CAMAsyncAFDConnector`; `async=true` |
 | Gate placement | `compute_gate_on_attention=false` | `compute_gate_on_attention=false` | `compute_gate_on_attention=true` |
 | Parallelism | PP=PCP=DCP=1; configured role ranks equal DP x TP; static EP enabled | Same | Same; `attn_ranks_per_dp` equals Attention TP |
-| Excluded features | Elastic EP, EPLB, sequence-parallel MoE, and compile SP | Same, plus native DBO and ubatching | Elastic EP, EPLB, native DBO/ubatching, native draft models/MTP, finegrained TP, and shared-expert DP |
+| Excluded features | Elastic EP, EPLB, sequence-parallel MoE, and compile SP | Same | Elastic EP, EPLB, native draft models/MTP, finegrained TP, and shared-expert DP |
 | Sequence parallelism | Unsupported | Unsupported | Attention-local FlashComm1/SP supported; disabled on FFN; no PCP/DCP |
-| Native DBO | Exactly two microbatches, Attention DP > 1 | Unsupported | Unsupported |
-| AFD async MoE ubatching | Not applicable | Not applicable | Optional; exactly two request or token stages; token mode requires Attention TP > 1 |
-| Graph execution | Eager or `FULL_DECODE_ONLY` | Eager, `FULL`, or `FULL_DECODE_ONLY` | Eager only on both roles |
+| Native DBO | Exactly two microbatches, Attention DP > 1 | Eager only; exactly two microbatches, Attention DP > 1 | Eager only; exactly two microbatches at Attention DP1 or DP > 1 |
+| AFD async MoE ubatching | Not applicable | Not applicable | Legacy alias for native DBO; split selector is ignored |
+| Graph execution | Eager or `FULL_DECODE_ONLY` | Eager, `FULL`, or `FULL_DECODE_ONLY`; graphs require a single batch | Eager only on both roles |
 | Model | Must resolve to a registered AFD architecture | Same | Registered DeepSeek-V2/V3 MLA or DeepSeek-V4; V4 requires `dynamicQuant=1` |
 
 Both roles validate the paired V2 topology, but only Attention uses the native
@@ -338,9 +338,12 @@ the platform wrapper send the exact per-stage shape. CUDA Graph, ACL Graph,
 stream, and wrapper implementation details are owned by
 [execution platforms](execution_platforms.md).
 
-CUDA V2 supports exactly two native microbatches with Attention DP > 1;
-Ascend V2 rejects native DBO and ubatching but allows model-local async MoE
-ubatching with Async CAM. For full-graph capture, the V2 runner
+CUDA V2 supports exactly two native microbatches with Attention DP > 1.
+Ascend V2 supports exactly two native microbatches in eager execution:
+synchronous CAMP2P requires Attention DP > 1, while Async CAM also supports
+Attention DP1. Ascend V2 DBO graph capture and replay remain unsupported.
+
+For full-graph capture, the V2 runner
 wraps native input preparation and publishes one warmup and one capture
 payload per descriptor. CUDA two-stage preparation installs separate AFD
 metadata on both native stage contexts and sends their complete layout before
@@ -389,9 +392,10 @@ the matching platform and connector tests as well.
 Current shared limits are the supported vLLM release and registered role-aware
 model integrations. V1 native ubatching accepts exactly two ubatches. V2
 requires static EP and no PP/CP. CUDA V2 requires a synchronous control-plane
-connector and supports the two-microbatch path above. Ascend V2 also supports
-eager Async CAM with optional model-local MoE stages; native DBO/ubatching
-remains excluded. Hardware evidence remains limited to the recorded model and
+connector and supports the two-microbatch path above. Ascend V2 supports eager
+native DBO with exactly two microbatches: synchronous CAMP2P requires Attention
+DP > 1, while Async CAM supports Attention DP1 or DP > 1. Ascend V2 DBO graphs
+remain unsupported. Hardware evidence remains limited to the recorded model and
 configuration cells.
 Platform/connector limits are intentionally centralized in
 [execution platforms](execution_platforms.md#tested-runtime-matrix).

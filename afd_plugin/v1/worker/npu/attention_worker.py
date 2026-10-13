@@ -46,7 +46,6 @@ class AFDNPUAttentionWorker(NPUWorker):
             expected_role="attention",
             expected_worker_qualname_override=NPU_ATTENTION_WORKER_FQCN,
         )
-        fail_if_unsupported_npu_afd_features(self.vllm_config)
         configure_async_cam_dbo(self.vllm_config)
         fail_if_unsupported_npu_afd_features(self.vllm_config)
         fix_all2all_backend_for_afd(self.vllm_config)

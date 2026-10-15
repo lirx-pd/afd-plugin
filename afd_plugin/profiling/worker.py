@@ -17,7 +17,9 @@ if TYPE_CHECKING:
     import torch
     from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 
+    from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
     from afd_plugin.profiling.session import WorkerSession
+    from afd_plugin.profiling.tracing import DeviceTracer
     from afd_plugin.v1.worker.npu.attention_model_runner import (
         AFDNPUAttentionModelRunner,
     )
@@ -41,24 +43,17 @@ class CAMProfileWorkerMixin:
             return
         # Keep TorchNPU and the event pool out of workers with profiling disabled.
         from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+        from afd_plugin.profiling.full import FFNDeviceWaiter
         from afd_plugin.profiling.session import WorkerSession
-        from afd_plugin.profiling.tracing import DeviceTracer
 
         connector = self.model_runner.connector
         if not isinstance(connector, CAMAsyncAFDConnector):
             raise ValueError("runtime CAM profiling requires the async CAM connector")
-        tracer = DeviceTracer(
-            self.device,
-            connector.profile_worker_id,
-            connector.profile_peers,
-            connector.tp_size,
-            connector.expert_per_rank,
-        )
         self.cam_profile_session = WorkerSession(
             connector.profile_worker_id,
             connector.topology.role,
             Path(os.environ.get("AFD_CAM_PROFILE_DIR", "cam-profiles")),
-            tracer,
+            None,
             {
                 "host": socket.gethostname(),
                 "pid": os.getpid(),
@@ -69,13 +64,29 @@ class CAMProfileWorkerMixin:
                 "tp_size": connector.tp_size,
                 "protocol_version": 1,
             },
+            tracer_factory=partial(self._create_cam_tracer, connector),
             full_factory=partial(
                 self._create_cam_full_profiler,
                 "attention" if connector.topology.role == "attention" else "ffn",
             ),
         )
+        if connector.topology.role == "ffn":
+            self.cam_profile_session.device_waiter = FFNDeviceWaiter(
+                self.device, self.cam_profile_session
+            )
         connector.profile_session = self.cam_profile_session
-        tracer.start(self.cam_profile_session)
+        self.cam_profile_session.start(self.device)
+
+    def _create_cam_tracer(self, connector: CAMAsyncAFDConnector) -> DeviceTracer:
+        from afd_plugin.profiling.tracing import DeviceTracer
+
+        return DeviceTracer(
+            self.device,
+            connector.profile_worker_id,
+            connector.profile_peers,
+            connector.tp_size,
+            connector.expert_per_rank,
+        )
 
     def _create_cam_full_profiler(
         self, role: Literal["attention", "ffn"], trace_dir: Path

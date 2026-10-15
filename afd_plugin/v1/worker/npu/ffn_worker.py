@@ -202,7 +202,8 @@ class AFDNPUFFNWorker(CAMProfileWorkerMixin, NPUWorker):
                 if not self.model_runner.execute_connector_driven_step():
                     return
                 if self.cam_profile_session is not None:
-                    self.cam_profile_session.tracer.wait_for_stream()
+                    assert self.cam_profile_session.device_waiter is not None
+                    self.cam_profile_session.device_waiter.wait_for_stream()
                 if self.model_runner.effective_mode == "eager":
                     torch.npu.synchronize()
                 continue

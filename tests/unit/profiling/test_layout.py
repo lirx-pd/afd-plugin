@@ -45,7 +45,8 @@ def test_layout_import_needs_no_device_runtime():
     assert result.returncode == 0, result.stderr
 
 
-def test_tracer_host_slots_match_prefix_and_tail(monkeypatch):
+@pytest.mark.parametrize("ready", [True, False])
+def test_tracer_host_slots_match_prefix_and_tail(monkeypatch, ready):
     torch = pytest.importorskip("torch")
     torch_npu = pytest.importorskip("torch_npu")
     from afd_plugin.profiling import tracing
@@ -58,10 +59,22 @@ def test_tracer_host_slots_match_prefix_and_tail(monkeypatch):
     monkeypatch.setattr(
         torch_npu.npu,
         "Event",
-        lambda **kwargs: SimpleNamespace(record=lambda *args: None),
+        lambda **kwargs: SimpleNamespace(
+            record=lambda *args: None, query=lambda: ready
+        ),
     )
     monkeypatch.setattr(torch_npu.npu, "Stream", lambda **kwargs: object())
-    monkeypatch.setattr(torch_npu.npu, "synchronize", lambda *args: None)
+
+    def unexpected_sync(*args):
+        pytest.fail("lazy PREPARE must not synchronize the whole device")
+
+    monkeypatch.setattr(torch_npu.npu, "synchronize", unexpected_sync)
+    monkeypatch.setattr(tracing, "RESOURCE_INIT_TIMEOUT_S", 0)
+
+    if not ready:
+        with pytest.raises(TimeoutError, match="event initialization deadline"):
+            tracing.DeviceTracer(torch.device("cpu"), "ffn", ["a0", "a1"], 2, 3)
+        return
 
     tracer = tracing.DeviceTracer(torch.device("cpu"), "ffn", ["a0", "a1"], 2, 3)
 

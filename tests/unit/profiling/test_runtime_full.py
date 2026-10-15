@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -84,7 +85,6 @@ def full_session(tmp_path, monkeypatch):
     clock = FakeClock()
     monkeypatch.setattr(session_module, "time", clock)
     monkeypatch.setattr(session_module, "FULL_OPERATION_TIMEOUT_S", 0.05)
-    tracer = FakeTracer()
     owners = []
 
     def factory(path):
@@ -93,7 +93,13 @@ def full_session(tmp_path, monkeypatch):
         return owner
 
     session = WorkerSession(
-        "attention-dp0", "attention", tmp_path, tracer, {"pid": 7}, full_factory=factory
+        "attention-dp0",
+        "attention",
+        tmp_path,
+        None,
+        {"pid": 7},
+        tracer_factory=FakeTracer,
+        full_factory=factory,
     )
     yield session, clock, owners
     if session.capture is not None:
@@ -128,6 +134,76 @@ def make_worker(session):
     worker.profiler = None
     worker.model_runner = SimpleNamespace(prof=None)
     return worker
+
+
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+def test_enabled_worker_creates_tracer_only_for_lightweight(
+    tmp_path, monkeypatch, role
+):
+    class Connector(SimpleNamespace):
+        pass
+
+    connector = Connector(
+        profile_worker_id=f"{role}-dp0",
+        topology=SimpleNamespace(role=role),
+        world_rank=0,
+        attn_size=1,
+        ffn_size=1,
+        tp_size=1,
+    )
+    module = ModuleType("afd_plugin.connectors.npu.async_cam")
+    monkeypatch.setattr(module, "CAMAsyncAFDConnector", Connector, raising=False)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setenv("AFD_CAM_PROFILE_ENABLE", "1")
+    monkeypatch.setenv("AFD_CAM_PROFILE_DIR", str(tmp_path))
+    starts = []
+    waiters = []
+    tracer_calls = []
+    waiter = SimpleNamespace()
+    tracer = FakeTracer()
+    monkeypatch.setattr(
+        WorkerSession, "start", lambda session, device: starts.append((session, device))
+    )
+
+    def create_waiter(device, session):
+        waiters.append((device, session))
+        return waiter
+
+    monkeypatch.setattr(full_module, "FFNDeviceWaiter", create_waiter)
+    worker = CAMProfileWorkerMixin()
+    worker.device = "npu:0"
+    worker.model_runner = SimpleNamespace(connector=connector, prof=None)
+
+    def create_tracer(received_connector):
+        tracer_calls.append(received_connector)
+        return tracer
+
+    monkeypatch.setattr(worker, "_create_cam_tracer", create_tracer)
+    worker.initialize_cam_profiling()
+    session = worker.cam_profile_session
+    assert connector.profile_session is session
+    assert starts == [(session, worker.device)]
+    assert waiters == ([(worker.device, session)] if role == "ffn" else [])
+    assert session.device_waiter is (waiter if role == "ffn" else None)
+    assert session.tracer is None
+    assert not tracer_calls
+
+    try:
+        assert worker.cam_profile_prepare(prepare_command(mode="FULL"))["error"] is None
+        assert session.tracer is None
+        assert not tracer_calls
+        worker.cam_profile_stop(stop_command(session))
+        finish_writer(session)
+        command = prepare_command()
+        assert worker.cam_profile_prepare(command)["error"] is None
+        assert worker.cam_profile_prepare(dict(command))["error"] is None
+        assert tracer_calls == [connector]
+        assert session.tracer is tracer
+        assert tracer.session is session
+        assert tracer.beginnings == 1
+    finally:
+        if session.capture is not None:
+            assert session.capture.writer.close(1.0)
 
 
 def test_worker_reuses_existing_runner_profiler_step_and_allows_mode_switches(
@@ -327,7 +403,7 @@ def test_full_waits_for_start_time_and_backend_activation(full_session):
     owner.activate(clock.time_ns())
     session.tick()
     assert session.state == "RUNNING"
-    assert session.capture.admits()
+    assert not session.capture.admits()
     assert session.status()["details"]["started_at_ns"] == owner.started_at_ns
     session.stop(stop_command(session))
     assert not session.capture.admits()
@@ -390,12 +466,115 @@ def test_full_sessions_have_independent_owners_and_outputs(full_session):
         assert session.profiler_reusable
         output = session.output_dir / capture.session_id / f"{session.worker_id}.jsonl"
         records = [json.loads(line) for line in output.read_text().splitlines()]
+        assert [record["record_type"] for record in records] == ["SESSION", "SUMMARY"]
         assert records[0]["record_type"] == "SESSION"
         assert records[0]["mode"] == "FULL"
         assert records[0]["full_trace_dir"] == str(expected)
         paths.append(expected)
     assert owners[0] is not owners[1]
     assert paths[0] != paths[1]
+
+
+def test_full_never_allocates_or_admits_lightweight_tracing(full_session):
+    session, clock, _ = full_session
+
+    def unexpected_tracer():
+        pytest.fail("FULL must not construct the lightweight tracer")
+
+    session._tracer_factory = unexpected_tracer
+    activate_full(session, clock)
+    capture = session.capture
+    assert session.tracer is None
+    assert not capture.accepting
+    assert not capture.admits()
+    capture.accepting = True
+    assert not capture.admits()
+    capture.accepting = False
+    session.stop(stop_command(session))
+    finish_writer(session)
+    assert session.state == "COMPLETED"
+    assert session.tracer is None
+
+
+def test_lightweight_never_constructs_full_backend(full_session):
+    session, clock, owners = full_session
+
+    def unexpected_full(path):
+        pytest.fail("LIGHTWEIGHT must not construct the FULL backend")
+
+    session._full_factory = unexpected_full
+    session.prepare(prepare_command(), backend_busy=False)
+    tracer = session.tracer
+    assert isinstance(tracer, FakeTracer)
+    assert tracer.beginnings == 1
+    assert session.capture.full is None
+    assert not owners
+    session.commit(commit_command(session, clock))
+    clock.advance(0.1)
+    session.tick()
+    assert session.capture.admits()
+    session.stop(stop_command(session))
+    finish_writer(session)
+    assert session.state == "COMPLETED"
+    assert tracer.collections > 0
+    assert tracer.finalized_generations == {session.capture.generation}
+
+
+def test_mode_switches_do_not_reuse_lightweight_collection_or_counts(
+    full_session, monkeypatch
+):
+    session, clock, owners = full_session
+    activate_full(session, clock)
+    session.stop(stop_command(session))
+    finish_writer(session)
+    assert session.tracer is None
+
+    session.prepare(prepare_command(), backend_busy=False)
+    tracer = session.tracer
+    assert isinstance(tracer, FakeTracer)
+    monkeypatch.setattr(
+        tracer,
+        "snapshot",
+        lambda: {"pending_spans": 0, "dropped_spans": 9, "unresolved_spans": 3},
+    )
+    session.commit(commit_command(session, clock))
+    clock.advance(0.1)
+    session.tick()
+    assert session.capture.admits()
+    assert session.status()["details"]["dropped_spans"] == 9
+    session.stop(stop_command(session))
+    finish_writer(session)
+    assert session.state == "COMPLETED"
+
+    def unexpected_lightweight(*args):
+        pytest.fail("FULL must not use the previous lightweight capture")
+
+    for method in (
+        "begin_capture",
+        "close_admission",
+        "collect",
+        "finalized",
+        "finish_capture",
+        "snapshot",
+    ):
+        monkeypatch.setattr(tracer, method, unexpected_lightweight)
+    activate_full(session, clock)
+    assert len(owners) == 2
+    assert not session.capture.admits()
+    session.stop(stop_command(session))
+    finish_writer(session)
+    status = session.status()
+    assert status["state"] == "COMPLETED"
+    for counter in ("pending_spans", "dropped_spans", "unresolved_spans"):
+        assert status["details"].get(counter, 0) == 0
+    output = (
+        session.output_dir / session.capture.session_id / f"{session.worker_id}.jsonl"
+    )
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [record["record_type"] for record in records] == ["SESSION", "SUMMARY"]
+    assert records[-1]["error"] is None
+    for counter in ("dropped_spans", "dropped_metadata", "unresolved_spans"):
+        assert records[-1].get(counter, 0) == 0
 
 
 @pytest.mark.parametrize("phase", ["start", "stop"])

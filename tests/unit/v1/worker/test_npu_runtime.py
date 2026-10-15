@@ -1276,7 +1276,7 @@ def test_npu_ffn_worker_uses_connector_driven_loop_for_async_connector(
     worker.model_runner.execute_connector_driven_step = execute_connector_driven_step
     worker.cam_profile_session = (
         SimpleNamespace(
-            tracer=SimpleNamespace(wait_for_stream=lambda: calls.append("wait"))
+            device_waiter=SimpleNamespace(wait_for_stream=lambda: calls.append("wait"))
         )
         if profiling
         else None

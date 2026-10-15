@@ -28,7 +28,9 @@ def _make_proxy(monkeypatch, *, use_sequence_parallel: bool, in_profile_run: boo
     monkeypatch.setattr(
         adapter,
         "get_afd_metadata_from_forward_context",
-        lambda: SimpleNamespace(connector=connector, stage_idx=0),
+        lambda: SimpleNamespace(
+            connector=connector, stage_idx=0, profile_attention=None
+        ),
     )
     monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", lambda states, **kw: states)
     topk_weights = torch.arange(32, dtype=torch.float32).reshape(16, 2)

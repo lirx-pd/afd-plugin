@@ -21,6 +21,8 @@ namespace MoeDistributeDispatchImpl {
 constexpr uint64_t CAM_MAX_RANK_SIZE = 384;  // max NPUs supported by the Cam comm library
 constexpr uint32_t UB_ALIGN = 32;            // UB aligned to 32 bytes
 constexpr uint32_t BATCH_INFO_VAL_NUM = 5;   // number of batch-related info fields
+constexpr uint32_t WIRE_HEADER_FIELDS = 8;
+constexpr int64_t WIRE_PROTOCOL_VERSION = 1;
 constexpr uint32_t IDS_PAGE_SIZE = 1024 * 64;  // routing table cache page size
 constexpr uint32_t IDS_PAGE_ELEMENT_NUM = IDS_PAGE_SIZE / sizeof(int32_t); // elements per cache page
 
@@ -106,6 +108,7 @@ private:
     uint64_t totalWorkspaceSize_{0};
     uint64_t workspaceSizePerAttn_{0};
     uint32_t layerIndex_{0};
+    int64_t dispatchSeq_{0};
     int32_t idsPageIndex_{0};
 
     GlobalTensor<XType> xGMTensor_;
@@ -210,6 +213,7 @@ __aicore__ inline void AfdAsyncDispatchSend<TemplateMC2TypeFunc>::Init(
     totalUbSize_ = tilingData->moeDistributeDispatchInfo.totalUbSize;
     totalWorkspaceSize_ = tilingData->moeDistributeDispatchInfo.totalWorkspaceSize;
     layerIndex_ = tilingData->moeDistributeDispatchInfo.layerIndex;
+    dispatchSeq_ = tilingData->moeDistributeDispatchInfo.magic;
 
     uint64_t batchInfoWorkspaceSize = MathCeil(sizeof(int64_t) * BATCH_INFO_VAL_NUM, UB_ALIGN);
     uint64_t expertRecvTokenNumWorkspaceSize = MathCeil(sizeof(int32_t) * expertNumPerMoe_, UB_ALIGN);
@@ -656,9 +660,13 @@ __aicore__ inline void AfdAsyncDispatchSend<TemplateMC2TypeFunc>::SetFlags()
             // tokens this attn sent to prior moes
             batchInfoTensor_(3) = moePrefixTokenNum;
             batchInfoTensor_(BATCH_INFO_VAL_NUM - 1) = 0;  // reserved for Moe
+            // The five legacy fields already occupy an aligned 64-byte slot.
+            batchInfoTensor_(BATCH_INFO_VAL_NUM) = dispatchSeq_;
+            batchInfoTensor_(BATCH_INFO_VAL_NUM + 1) = WIRE_PROTOCOL_VERSION;
+            batchInfoTensor_(WIRE_HEADER_FIELDS - 1) = 0;
             SyncFunc<HardEvent::S_MTE3>();
             DataCopyPad(dstMoeTokenNumGMTensor, batchInfoTensor_,
-                {1U, sizeof(int64_t) * BATCH_INFO_VAL_NUM, 0U, 0U, 0U});
+                {1U, sizeof(int64_t) * WIRE_HEADER_FIELDS, 0U, 0U, 0U});
             SyncFunc<HardEvent::MTE3_S>();
 
             for (uint32_t i = 0; i < expertNumPerMoe_; ++i) {

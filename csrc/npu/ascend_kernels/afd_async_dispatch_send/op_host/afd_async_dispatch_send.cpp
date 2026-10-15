@@ -58,7 +58,7 @@ constexpr static int MAX_AIV_NUM = 48;
 
 constexpr static uint32_t OP_TYPE_ALL_TO_ALL = 8U;
 
-static uint32_t MathCeil(uint32_t n, uint32_t align)
+static uint64_t MathCeil(uint64_t n, uint64_t align)
 {
     return (n + align - 1) / align * align;
 }
@@ -174,6 +174,18 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 
     OPS_ERR_IF(sharedMemSize < sharedMemAttnNeedSize,
         OPS_LOG_E(nodeName, "sharedMemSize is %lu but need %lu.", sharedMemSize, sharedMemAttnNeedSize),
+        return ge::GRAPH_FAILED);
+
+    // The last FFN window block holds the receive cursor, not dispatch payload.
+    uint64_t headerSize = MathCeil(sizeof(int64_t) * BATCH_INFO_VAL_NUM, UB_ALIGN);
+    uint64_t expertCountSize = MathCeil(sizeof(int32_t) * routeExpertNumPerMoe, UB_ALIGN);
+    uint64_t tokenSize = MathCeil(
+        (dynamicQuant == 1 ? hiddenSize + UB_ALIGN : sizeof(int16_t) * hiddenSize)
+        * limitMaxSeqLenPerRank, UB_ALIGN);
+    uint64_t tokenOffsetSize = MathCeil(sizeof(uint16_t) * limitMaxSeqLenPerRank * topk, UB_ALIGN);
+    uint64_t moeNeedSize = (headerSize + 2 * expertCountSize + tokenSize + tokenOffsetSize) * attnRankNum;
+    OPS_ERR_IF(sharedMemSize < UB_ALIGN || moeNeedSize > sharedMemSize - UB_ALIGN,
+        OPS_LOG_E(nodeName, "FFN window requires %lu bytes plus its 32-byte receive cursor.", moeNeedSize),
         return ge::GRAPH_FAILED);
 
     std::string groupName(groupNamePtr);

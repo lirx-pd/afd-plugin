@@ -29,6 +29,7 @@ from afd_plugin.connectors import (
     AFDTransferMetadata,
 )
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
+from afd_plugin.profiling import runtime_profiling_enabled
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 logger = init_logger(__name__)
@@ -380,6 +381,8 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
     # Signature: matches upstream; no added parameters.
     # Upstream: vLLM v0.30.0, vllm/model_executor/models/deepseek_v2.py
     # Commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    cam_profile_enabled = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -436,6 +439,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         # ### PATCH START: construct only the stage owned by this AFD role.
         self.vllm_config = vllm_config
         self.config = config
+        self.cam_profile_enabled = runtime_profiling_enabled()
         self.is_moe_layer = is_moe_layer
         self.compute_gate_on_attention = bool(
             afd_config.compute_gate_on_attention,
@@ -624,6 +628,12 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
             )
             if not already_sequence_parallel:
                 residual = native.sequence_parallel_chunk(residual)
+            if self.cam_profile_enabled:
+                afd_metadata = get_afd_metadata_from_forward_context()
+                if afd_metadata is not None:
+                    afd_metadata.profile_sp_origin = (
+                        native.get_tensor_model_parallel_rank() * hidden_states.shape[0]
+                    )
 
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states,

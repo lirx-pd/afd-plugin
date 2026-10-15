@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 from transformers import DeepseekV2Config
 from vllm.config import VllmConfig
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -42,6 +43,14 @@ from afd_plugin.model_executor.models.npu.async_cam_layout import (
 )
 from afd_plugin.model_executor.models.npu.deepseek_v4_shared_experts import (
     AFDDeepseekV4SharedExperts,
+)
+from afd_plugin.profiling import runtime_profiling_enabled
+from afd_plugin.profiling.model import (
+    begin_profile_call,
+    host_span,
+    install_attention_hooks,
+    record_source_call,
+    span,
 )
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
@@ -259,12 +268,24 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         """Select DSV4 experts on Attention and exchange routed work via CAM."""
         from afd_plugin.model_executor.models.npu import deepseek_v4_attention_gate
 
-        topk_weights, topk_ids = deepseek_v4_attention_gate.compute_attention_gate_topk(
-            self,
-            hidden_states,
-            input_ids=input_ids,
-            hidden_states_fp32=hidden_states_fp32,
-        )
+        afd_metadata = get_afd_metadata_from_forward_context()
+        if afd_metadata is None:
+            raise RuntimeError("Async CAM requires AFD forward metadata")
+        sequence, execution = begin_profile_call(afd_metadata)
+        if execution is not None and self.use_sequence_parallel_moe:
+            # Ascend 8d4409d6 sp_shard/sp_reduce_scatter produce equal TP row shards.
+            afd_metadata.profile_sp_origin = (
+                get_tensor_model_parallel_rank() * hidden_states.shape[0]
+            )
+        with span(execution, "GATE"):
+            topk_weights, topk_ids = (
+                deepseek_v4_attention_gate.compute_attention_gate_topk(
+                    self,
+                    hidden_states,
+                    input_ids=input_ids,
+                    hidden_states_fp32=hidden_states_fp32,
+                )
+            )
         dispatch_payload = prepare_cam_dispatch_payload(
             hidden_states,
             topk_weights,
@@ -272,15 +293,17 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
             None,
             use_sequence_parallel=self.use_sequence_parallel_moe,
         )
-        afd_metadata = get_afd_metadata_from_forward_context()
-        if afd_metadata is None:
-            raise RuntimeError("Async CAM requires AFD forward metadata")
         context = AFDTransferContext(
             metadata=AFDTransferMetadata.create_attention_metadata(
                 layer_idx=self.layer_idx,
                 stage_idx=afd_metadata.stage_idx,
                 seq_len=int(dispatch_payload.hidden_states.shape[0]),
-            )
+            ),
+            dispatch_seq=sequence,
+            profile=execution,
+        )
+        record_source_call(
+            execution, afd_metadata, self.layer_idx, dispatch_payload.layout
         )
         receive = send_async_cam_remote_call(
             afd_metadata.connector,
@@ -289,16 +312,21 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
             topk_weights=dispatch_payload.topk_weights,
             topk_ids=dispatch_payload.topk_ids,
         )
-        shared_output = (
-            self.shared_experts(hidden_states)
-            if self.shared_experts is not None
-            else None
-        )
-        maybe_apply_dbo_yield(hidden_states, role="attention")
+        with span(execution, "SHARED_EXPERT"):
+            shared_output = (
+                self.shared_experts(hidden_states)
+                if self.shared_experts is not None
+                else None
+            )
+        with host_span(execution, "DBO_HOST_WAIT"):
+            maybe_apply_dbo_yield(hidden_states, role="attention")
         output = receive()
-        output = restore_cam_dispatch_output(output, dispatch_payload.layout)
-        if shared_output is not None:
-            output = output + shared_output
+        with span(execution, "RESTORE_MERGE"):
+            output = restore_cam_dispatch_output(output, dispatch_payload.layout)
+            if shared_output is not None:
+                output = output + shared_output
+        if execution is not None:
+            execution.tracer.release_execution(execution)
         return output
 
 
@@ -402,6 +430,10 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV4DecoderLayer):
             raise ValueError(f"Unsupported AFD role: {afd_config.role!r}")
 
         # ### PATCH END: role-local Attention and remote experts
+        if runtime_profiling_enabled() and afd_config.role == _ATTENTION_ROLE:
+            install_attention_hooks(
+                self.self_attn, get_afd_metadata_from_forward_context
+            )
 
         self.input_layernorm = native.RMSNorm(config.hidden_size, eps=self.norm_eps)
         self.post_attention_layernorm = native.RMSNorm(

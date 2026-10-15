@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
 from types import MethodType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
@@ -25,6 +25,7 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
 
 from afd_plugin.compat.npu import fail_if_unsupported_npu_afd_features
@@ -47,6 +48,8 @@ from afd_plugin.connectors import (
     AFDForwardContextMetadata,
 )
 from afd_plugin.model_executor.models.forward_context import use_afd_metadata_provider
+from afd_plugin.profiling import runtime_profiling_enabled
+from afd_plugin.profiling.fragments import InputSnapshot
 from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
     _resolve_world_ranks,
@@ -56,6 +59,8 @@ from afd_plugin.validation import validate_npu_model_runner_v2_config
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.pcp_manager import PCPManager
+
+    from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
 
 _AFD_FULLGRAPH_HOOK_MARKER = "_afd_fullgraph_replay_hook_active"
 
@@ -274,6 +279,35 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                 "AFD ModelRunnerV2 requires a native eager BatchDescriptor",
             )
         return int(batch_descriptor.num_tokens)
+
+    # Signature matches Ascend 8d4409d6 NPUModelRunner.prepare_inputs.
+    # Delegation exception: native input preparation remains in super(); this
+    # wrapper only snapshots its completed CPU identity before buffers advance.
+    # Remove when upstream exposes an inputs-ready observer.
+    def prepare_inputs(
+        self,
+        scheduler_output: SchedulerOutput,
+        batch_req_state: v2_model_runner.BatchReqState,
+        batch_desc: v2_cudagraph_utils.BatchExecutionDescriptor,
+    ) -> AscendInputBatch:
+        self._profile_snapshot = None
+        batch = super().prepare_inputs(scheduler_output, batch_req_state, batch_desc)
+        if not runtime_profiling_enabled():
+            return batch
+        session = cast("CAMAsyncAFDConnector", self.connector).profile_session
+        capture = session.capture if session is not None else None
+        if capture is None or not capture.admits():
+            return batch
+        num_reqs = batch.num_reqs
+        self._profile_snapshot = InputSnapshot.from_cpu(
+            batch.req_ids[:num_reqs],
+            batch.query_start_loc_np[: num_reqs + 1],
+            batch.num_computed_tokens_np[:num_reqs],
+            self.req_states.prompt_len.np[batch.idx_mapping_np[:num_reqs]],
+            batch.is_prefilling_np[:num_reqs],
+            batch.num_tokens,
+        )
+        return batch
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:

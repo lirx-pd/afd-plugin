@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from itertools import islice
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from vllm.distributed import (
@@ -32,13 +32,21 @@ from afd_plugin.model_executor.models.npu.async_cam_layout import (
     prepare_cam_dispatch_payload,
     restore_cam_dispatch_output,
 )
+from afd_plugin.profiling.model import (
+    begin_profile_call,
+    host_span,
+    record_source_call,
+    span,
+)
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 if TYPE_CHECKING:
+    from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
     from afd_plugin.model_executor.models.deepseek_v2 import (
         AFDDeepseekV2DecoderLayer,
         AFDDeepseekV2Model,
     )
+    from afd_plugin.profiling.tracing import Execution
 
 
 def run_model_forward(
@@ -102,20 +110,25 @@ def run_attention_gate_afd_forward(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the Attention-side gate AFD path used by async CAM."""
 
-    afd_connector = afd_metadata.connector
+    afd_connector = cast("CAMAsyncAFDConnector", afd_metadata.connector)
     stage_idx = afd_metadata.stage_idx
     pending_shared_output: torch.Tensor | None = None
     pending_ffn_recv = False
     pending_dispatch_layout: CAMDispatchLayout | None = None
     pending_receive: Callable[[], torch.Tensor] | None = None
+    pending_profile: Execution | None = None
     input_is_sequence_parallel = False
 
     def receive_pending_ffn() -> torch.Tensor:
         if pending_dispatch_layout is None or pending_receive is None:
             raise RuntimeError("Async CAM receive is missing its dispatch layout")
-        output = restore_cam_dispatch_output(pending_receive(), pending_dispatch_layout)
-        if pending_shared_output is not None:
-            output = output + pending_shared_output
+        routed = pending_receive()
+        with span(pending_profile, "RESTORE_MERGE"):
+            output = restore_cam_dispatch_output(routed, pending_dispatch_layout)
+            if pending_shared_output is not None:
+                output = output + pending_shared_output
+        if pending_profile is not None:
+            pending_profile.tracer.release_execution(pending_profile)
         return output
 
     # Async CAM profile forwards are a distributed startup contract: every
@@ -146,19 +159,21 @@ def run_attention_gate_afd_forward(
             )
             continue
 
-        (
-            hidden_states,
-            residual,
-            topk_weights,
-            topk_ids,
-            router_logits,
-        ) = layer.compute_attn_output(
-            positions,
-            hidden_states,
-            residual,
-            llama_4_scaling,
-            already_sequence_parallel=input_is_sequence_parallel,
-        )
+        sequence, execution = begin_profile_call(afd_metadata)
+        with span(execution, "ATTENTION_GATE"):
+            (
+                hidden_states,
+                residual,
+                topk_weights,
+                topk_ids,
+                router_logits,
+            ) = layer.compute_attn_output(
+                positions,
+                hidden_states,
+                residual,
+                llama_4_scaling,
+                already_sequence_parallel=input_is_sequence_parallel,
+            )
         input_is_sequence_parallel = layer.use_sequence_parallel_moe
 
         dispatch_payload = prepare_cam_dispatch_payload(
@@ -173,7 +188,13 @@ def run_attention_gate_afd_forward(
             stage_idx=stage_idx,
             seq_len=int(dispatch_payload.hidden_states.shape[0]),
         )
-        context = AFDTransferContext(metadata=metadata)
+        context = AFDTransferContext(
+            metadata=metadata, dispatch_seq=sequence, profile=execution
+        )
+        record_source_call(
+            execution, afd_metadata, layer.layer_idx, dispatch_payload.layout
+        )
+        pending_profile = execution
         pending_receive = send_async_cam_remote_call(
             afd_connector,
             dispatch_payload.hidden_states,
@@ -182,13 +203,15 @@ def run_attention_gate_afd_forward(
             topk_ids=dispatch_payload.topk_ids,
             router_logits=dispatch_payload.router_logits,
         )
-        pending_shared_output = compute_shared_output(layer, hidden_states)
+        with span(execution, "SHARED_EXPERT"):
+            pending_shared_output = compute_shared_output(layer, hidden_states)
         pending_ffn_recv = True
         pending_dispatch_layout = dispatch_payload.layout
-        hidden_states = maybe_apply_dbo_yield(
-            hidden_states,
-            role="attention",
-        )
+        with host_span(execution, "DBO_HOST_WAIT"):
+            hidden_states = maybe_apply_dbo_yield(
+                hidden_states,
+                role="attention",
+            )
 
     if pending_ffn_recv:
         hidden_states = receive_pending_ffn()

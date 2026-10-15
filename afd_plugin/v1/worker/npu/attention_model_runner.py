@@ -7,7 +7,7 @@ from __future__ import annotations
 import copy
 from contextlib import AbstractContextManager, nullcontext
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -97,6 +97,8 @@ from afd_plugin.model_executor.models.npu.deepseek_attention_metadata import (
     isolate_deepseek_attention_builder_inputs,
     materialize_deepseek_attention_metadata,
 )
+from afd_plugin.profiling import runtime_profiling_enabled
+from afd_plugin.profiling.fragments import InputSnapshot
 from afd_plugin.v1.worker.attention_metadata import (
     _forward_context_num_tokens,
     _full_cudagraph_padded_tokens,
@@ -115,6 +117,9 @@ from afd_plugin.v1.worker.npu.ubatch_utils import (
     split_attn_metadata,
 )
 
+if TYPE_CHECKING:
+    from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+
 logger = init_logger(__name__)
 
 
@@ -124,6 +129,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
     afd_expected_role = "attention"
     model: nn.Module
     intermediate_tensors: IntermediateTensors | None
+    _profile_snapshot: InputSnapshot | None = None
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         afd_config = self.parse_config(vllm_config)
@@ -312,6 +318,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         offload_dummy: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         # ### PATCH START: AFD NPU ubatch metadata routing
+        self._profile_snapshot = None
         # Ascend MLA FULL graphs capture equal-sized stages. Eager DBO can
         # avoid partial-request metadata by splitting on request boundaries.
         if (
@@ -359,6 +366,8 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 batch_descriptor=batch_descriptor,
                 offload_dummy=offload_dummy,
             )
+        if ubatch_slices is None and not for_cudagraph_capture:
+            self._capture_profile_snapshot(num_reqs, num_tokens)
         self._afd_pending_metadata = self._build_afd_metadata(
             ubatch_slices,
             num_tokens,
@@ -440,6 +449,14 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         reusable backend output buffers before the next stage is built.
         """
 
+        self._profile_snapshot = None
+        if not for_cudagraph_capture:
+            self._capture_profile_snapshot(num_reqs, num_tokens)
+        if (
+            self._profile_snapshot is not None
+            and self._afd_pending_metadata is not None
+        ):
+            self._afd_pending_metadata.profile_snapshot = self._profile_snapshot
         if len(self.kv_cache_config.kv_cache_groups) == 0:
             return {}, None
         # ### PATCH START: AFD per-ubatch metadata containers
@@ -1357,6 +1374,24 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
                 self._dsa_positions_cpu_buf.fill_(0)
             return hidden_states, hidden_states
 
+    def _capture_profile_snapshot(self, num_reqs: int, num_tokens: int) -> None:
+        if not runtime_profiling_enabled():
+            return
+        session = cast("CAMAsyncAFDConnector", self.connector).profile_session
+        capture = session.capture if session is not None else None
+        if capture is None or not capture.admits():
+            return
+        computed = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
+        prompts = self.input_batch.num_prompt_tokens_cpu_tensor[:num_reqs]
+        self._profile_snapshot = InputSnapshot.from_cpu(
+            self.input_batch.req_ids[:num_reqs],
+            self.query_start_loc.cpu[: num_reqs + 1],
+            computed,
+            prompts,
+            computed < prompts,
+            num_tokens,
+        )
+
     def _build_afd_metadata(
         self,
         ubatch_slices: UBatchSlices | None,
@@ -1384,6 +1419,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             num_stages=num_stages,
             transaction_id=self._next_afd_transaction_id(),
             tokens_unpadded_lens=tokens_unpadded_lens,
+            profile_snapshot=self._profile_snapshot,
         )
 
     def _install_afd_metadata_on_forward_context(

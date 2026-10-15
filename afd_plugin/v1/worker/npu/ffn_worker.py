@@ -23,6 +23,8 @@ from afd_plugin.compat.npu import (
     npu_afd_num_ubatches,
 )
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
+from afd_plugin.profiling import runtime_profiling_enabled
+from afd_plugin.profiling.worker import CAMProfileWorkerMixin
 from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
 from afd_plugin.validation import (
     NPU_FFN_WORKER_FQCN,
@@ -40,7 +42,7 @@ logger = logging.getLogger(__name__)
 FFN_SHUTDOWN_TIMEOUT_SECONDS = 5
 
 
-class AFDNPUFFNWorker(NPUWorker):
+class AFDNPUFFNWorker(CAMProfileWorkerMixin, NPUWorker):
     """FFN worker that owns a connector-driven NPU daemon loop."""
 
     afd_expected_role = "ffn"
@@ -79,6 +81,8 @@ class AFDNPUFFNWorker(NPUWorker):
             device_type="npu",
         )
         self.model_runner = AFDNPUFFNModelRunner(self.vllm_config, self.device)
+        if runtime_profiling_enabled():
+            self.initialize_cam_profiling()
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {}

@@ -83,7 +83,7 @@ class _FakeCamOps:
         return (
             _FakeTensor((batch_size, hidden_size)),
             _FakeTensor((batch_size,), dtype="fp32"),
-            _FakeTensor((5 + tp_size * (1 + expert_per_rank),), dtype="int64"),
+            _FakeTensor((5 + tp_size * (3 + expert_per_rank),), dtype="int64"),
             _FakeTensor((expert_per_rank,), dtype="int64"),
         )
 
@@ -308,6 +308,9 @@ def test_async_connector_init_creates_attention_first_hccl_group(monkeypatch):
     fake_torch = _FakeTorch()
     monkeypatch.setattr(async_cam_module, "torch", fake_torch)
     monkeypatch.setattr(
+        CAMAsyncAFDConnector, "_validate_profile_protocol", lambda self: None
+    )
+    monkeypatch.setattr(
         async_cam_module,
         "ensure_cam_async_ops_available",
         lambda: None,
@@ -365,6 +368,9 @@ def test_async_connector_init_uses_one_hccl_group_for_all_dp(monkeypatch):
     calls = []
     fake_torch = _FakeTorch()
     monkeypatch.setattr(async_cam_module, "torch", fake_torch)
+    monkeypatch.setattr(
+        CAMAsyncAFDConnector, "_validate_profile_protocol", lambda self: None
+    )
     monkeypatch.setattr(
         async_cam_module,
         "ensure_cam_async_ops_available",
@@ -996,6 +1002,9 @@ def test_async_receive_anchor_uses_model_dtype(monkeypatch, dtype):
     fake_torch = _FakeTorch()
     monkeypatch.setattr(async_cam_module, "torch", fake_torch)
     monkeypatch.setattr(
+        CAMAsyncAFDConnector, "_validate_profile_protocol", lambda self: None
+    )
+    monkeypatch.setattr(
         async_cam_module, "ensure_cam_async_ops_available", lambda: None
     )
     backend = SimpleNamespace(get_hccl_comm_name=lambda rank: "source-test")
@@ -1012,6 +1021,101 @@ def test_async_receive_anchor_uses_model_dtype(monkeypatch, dtype):
     connector = CAMAsyncAFDConnector(0, 0, config, _afd_config(role="ffn"), 0)
     connector.init_afd_connector()
     assert connector._placeholder.dtype == dtype
+
+
+def _mock_profile_protocol(
+    monkeypatch, enabled, *, peer_protocol=None, capability_error=False
+):
+    connector = CAMAsyncAFDConnector(
+        0, 0, _vllm_config(), _afd_config(role="attention"), 0
+    )
+    connector.profile_enabled = enabled
+    connector.comm_args = torch.empty(1, device="cpu")
+    connector.cam_pg = object()
+    peers = [f"{rank + 1:032x}" for rank in range(connector.topology.world_size)]
+    peers[connector.world_rank] = connector.profile_worker_id
+    capability_calls = []
+
+    def all_gather(outputs, local, *, group):
+        assert group is connector.cam_pg
+        assert local.device.type == "cpu"
+        assert local.dtype == torch.int64
+        assert local.tolist() == [
+            -1 if capability_error else int(enabled),
+            *connector.profile_worker_id.encode("ascii"),
+        ]
+        assert len(outputs) == connector.topology.world_size
+        for rank, (output, worker_id) in enumerate(zip(outputs, peers, strict=True)):
+            flag = int(enabled)
+            if rank == connector.world_rank:
+                flag = int(local[0])
+            elif rank == len(peers) - 1 and peer_protocol is not None:
+                flag = peer_protocol
+            output.copy_(torch.tensor([int(flag), *worker_id.encode("ascii")]))
+
+    def check_capability():
+        capability_calls.append(True)
+        if capability_error:
+            raise RuntimeError("profile-v1 operators are unavailable")
+
+    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
+    monkeypatch.setattr(
+        async_cam_module,
+        "ensure_cam_async_profile_ops_available",
+        check_capability,
+    )
+    return connector, peers, capability_calls
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_profile_protocol_accepts_uniform_flags_and_maps_rank_uids(
+    monkeypatch, enabled
+):
+    connector, peers, capability_calls = _mock_profile_protocol(monkeypatch, enabled)
+    shared_peers = connector.profile_peers
+
+    connector._validate_profile_protocol()
+
+    assert connector.profile_peers is shared_peers
+    assert shared_peers == peers
+    assert capability_calls == ([True] if enabled else [])
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_profile_protocol_rejects_mixed_deployments(monkeypatch, enabled):
+    connector, _, capability_calls = _mock_profile_protocol(
+        monkeypatch, enabled, peer_protocol=int(not enabled)
+    )
+
+    with pytest.raises(
+        ValueError, match="all CAM ranks must support the same profiling protocol"
+    ):
+        connector._validate_profile_protocol()
+
+    assert connector.profile_peers == []
+    assert capability_calls == ([True] if enabled else [])
+
+
+def test_profile_protocol_rejects_missing_profile_operator_package(monkeypatch):
+    connector, _, capability_calls = _mock_profile_protocol(
+        monkeypatch, True, capability_error=True
+    )
+    with pytest.raises(ValueError, match="profile-v1 operators are unavailable"):
+        connector._validate_profile_protocol()
+    assert connector.profile_peers == []
+    assert capability_calls == [True]
+
+
+def test_profile_protocol_rejects_peer_without_profile_operator_package(monkeypatch):
+    connector, _, capability_calls = _mock_profile_protocol(
+        monkeypatch, True, peer_protocol=-1
+    )
+    with pytest.raises(
+        ValueError, match="all CAM ranks must support the same profiling protocol"
+    ):
+        connector._validate_profile_protocol()
+    assert connector.profile_peers == []
+    assert capability_calls == [True]
 
 
 def test_async_rejects_nondivisible_expert_placement():

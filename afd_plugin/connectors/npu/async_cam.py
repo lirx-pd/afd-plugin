@@ -28,6 +28,8 @@ derivation, launch guidance, and the full limitations.
 from __future__ import annotations
 
 import os
+import threading
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
@@ -37,7 +39,10 @@ import torch
 from torch import Tensor
 from vllm.logger import init_logger
 
-from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
+from afd_plugin.compat.npu.ops import (
+    ensure_cam_async_ops_available,
+    ensure_cam_async_profile_ops_available,
+)
 from afd_plugin.config import AFDConfig
 from afd_plugin.config_utils import (
     coerce_extra_bool,
@@ -61,11 +66,20 @@ from afd_plugin.distributed import (
     create_hccl_process_group_options,
     init_afd_process_group,
 )
+from afd_plugin.profiling import (
+    SOURCE_TRACE_FIELDS,
+    batch_info_prefix_size,
+    runtime_profiling_enabled,
+)
+from afd_plugin.profiling.model import span
 
 if TYPE_CHECKING:
     from torch.distributed.distributed_c10d import ProcessGroup
     from vllm.config import VllmConfig
     from vllm.model_executor.layers.fused_moe import FusedMoERouter
+
+    from afd_plugin.profiling.session import WorkerSession
+    from afd_plugin.profiling.tracing import Execution
 
 AFD_ASYNC_CAM_GROUP_NAME = "afd_async_cam"
 CAM_COMM_ID = 0
@@ -232,6 +246,7 @@ class AFDAsyncTransferState(AFDTransferState):
     token_nums_rankid_layeridx: Tensor | None = None
     group_list: Tensor | None = None
     dynamic_scales: Tensor | None = None
+    source_trace: Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -284,6 +299,8 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         return AFDAsyncExtraInfo.from_mapping(raw)
 
     layered_gmm_enabled: bool = False
+    profile_enabled: bool = False
+    profile_session: WorkerSession | None = None
 
     def __init__(
         self,
@@ -302,6 +319,11 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         """
         super().__init__(rank, local_rank, vllm_config, afd_config, role_rank)
         self._initialized = False
+        self.profile_enabled = runtime_profiling_enabled()
+        self.profile_worker_id = uuid.uuid4().hex
+        self.profile_peers: list[str] = []
+        self._profile_sequence = 0
+        self._profile_lock = threading.Lock()
         hf_config = vllm_config.model_config.hf_config
         self.hidden_size = hf_config.hidden_size
         self.activation_dtype = vllm_config.model_config.dtype
@@ -369,7 +391,55 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             dtype=self.activation_dtype,
             device=device,
         )
+        self._validate_profile_protocol()
         self._initialized = True
+
+    def _validate_profile_protocol(self) -> None:
+        import torch.distributed as dist
+
+        assert self.comm_args is not None
+        capability_error = None
+        protocol = int(self.profile_enabled)
+        if self.profile_enabled:
+            try:
+                ensure_cam_async_profile_ops_available()
+            except RuntimeError as exc:
+                capability_error = str(exc)
+                protocol = -1
+        # This startup collective rejects mixed A/F wire versions before CAM IO.
+        local = torch.tensor(
+            [protocol, *self.profile_worker_id.encode("ascii")],
+            dtype=torch.int64,
+            device=self.comm_args.device,
+        )
+        gathered = [torch.empty_like(local) for _ in range(self.topology.world_size)]
+        dist.all_gather(gathered, local, group=self.cam_pg)
+        values = torch.stack(gathered).cpu().tolist()
+        if any(row[0] != int(self.profile_enabled) for row in values):
+            raise ValueError(
+                capability_error
+                or "all CAM ranks must support the same profiling protocol"
+            )
+        self.profile_peers[:] = [bytes(row[1:]).decode("ascii") for row in values]
+
+    def begin_profile_call(self) -> tuple[int, Execution | None]:
+        if not self.profile_enabled:
+            return 0, None
+        with self._profile_lock:
+            self._profile_sequence += 1
+            sequence = self._profile_sequence
+        if sequence >= 1 << 63:
+            raise RuntimeError("CAM profiling sequence exhausted; restart workers")
+        execution = None
+        if self.profile_session is not None:
+            execution = self.profile_session.tracer.execution(
+                f"{self.profile_worker_id}:call:{sequence}"
+            )
+            if execution is not None and not execution.tracer.retain_execution(
+                execution
+            ):
+                execution = None
+        return sequence, execution
 
     def close(self) -> None:
         """Destroy the HCCL process group and clear pending transfer states."""
@@ -529,6 +599,8 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
                 f"hidden_states shape {hidden_states.shape!r} does not match "
                 f"AFD async metadata token count {metadata.total_tokens}",
             )
+        if self.profile_enabled and context.dispatch_seq == 0:
+            context.dispatch_seq, context.profile = self.begin_profile_call()
         states = AFDAsyncTransferState(
             batch_size=metadata.total_tokens,
             hidden_size=self.hidden_size,
@@ -577,25 +649,26 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             dynamic_quant=self.dynamic_quant,
             group_name=self.group_name,
         )
-        torch.ops.afd_ascend.afd_async_dispatch_send(
-            hidden_states,
-            topk_ids,
-            self.comm_args,
-            self.comm_id,
-            self.max_num_batched_tokens,
-            states.batch_size,
-            states.hidden_size,
-            states.topk,
-            self.ffn_size,
-            self.attn_size,
-            self.expert_per_rank,
-            self.world_rank,
-            self.topology.world_size,
-            states.layer_idx,
-            self.tp_size,
-            self.dynamic_quant,
-            self.group_name,
-        )
+        with span(context.profile, "DISPATCH_SEND"):
+            torch.ops.afd_ascend.afd_async_dispatch_send(
+                hidden_states,
+                topk_ids,
+                self.comm_args,
+                context.dispatch_seq if self.profile_enabled else self.comm_id,
+                self.max_num_batched_tokens,
+                states.batch_size,
+                states.hidden_size,
+                states.topk,
+                self.ffn_size,
+                self.attn_size,
+                self.expert_per_rank,
+                self.world_rank,
+                self.topology.world_size,
+                states.layer_idx,
+                self.tp_size,
+                self.dynamic_quant,
+                self.group_name,
+            )
         self._pending_attention_payloads.setdefault(
             context.metadata.stage_idx, []
         ).append(
@@ -667,22 +740,23 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             world_size=self.topology.world_size,
             group_name=self.group_name,
         )
-        output = torch.ops.afd_ascend.afd_async_combine_recv(
-            placeholder,
-            topk_ids,
-            topk_weights,
-            self.comm_args,
-            self.comm_id,
-            states.batch_size,
-            states.hidden_size,
-            states.topk,
-            self.ffn_size,
-            self.attn_size,
-            self.expert_per_rank,
-            self.world_rank,
-            self.topology.world_size,
-            self.group_name,
-        )
+        with span(context.profile, "COMBINE_RECV"):
+            output = torch.ops.afd_ascend.afd_async_combine_recv(
+                placeholder,
+                topk_ids,
+                topk_weights,
+                self.comm_args,
+                self.comm_id,
+                states.batch_size,
+                states.hidden_size,
+                states.topk,
+                self.ffn_size,
+                self.attn_size,
+                self.expert_per_rank,
+                self.world_rank,
+                self.topology.world_size,
+                self.group_name,
+            )
         _log_cam_op_values("async_combine_recv", "outputs", output=output)
         return output
 
@@ -710,6 +784,8 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             metadata=metadata,
             states=states,
         )
+        if self.profile_session is not None:
+            context.profile = self.profile_session.tracer.new_work()
         placeholder = kwargs.get("placeholder", self._placeholder)
         _log_cam_op_values(
             "async_dispatch_recv",
@@ -730,23 +806,32 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             dynamic_quant=self.dynamic_quant,
             group_name=self.group_name,
         )
-        outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(
-            placeholder,
-            self.comm_args,
-            self.comm_id,
-            self.max_num_batched_tokens,
-            states.hidden_size,
-            states.topk,
-            self.ffn_size,
-            self.attn_size,
-            self.expert_per_rank,
-            self.world_rank,
-            self.topology.world_size,
-            self.tp_size,
-            self.dynamic_quant,
-            self.group_name,
-        )
+        with span(context.profile, "DISPATCH_RECV"):
+            outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(
+                placeholder,
+                self.comm_args,
+                self.comm_id,
+                self.max_num_batched_tokens,
+                states.hidden_size,
+                states.topk,
+                self.ffn_size,
+                self.attn_size,
+                self.expert_per_rank,
+                self.world_rank,
+                self.topology.world_size,
+                self.tp_size,
+                self.dynamic_quant,
+                self.group_name,
+            )
         hidden_states, dynamic_scales, batch_info, expert_token_nums = outputs
+        if context.profile is not None:
+            prefix_size = batch_info_prefix_size(self.tp_size, self.expert_per_rank)
+            states.source_trace = batch_info[prefix_size:].view(
+                self.tp_size, SOURCE_TRACE_FIELDS
+            )
+            context.profile.tracer.defer_metadata(
+                context.profile, states.source_trace, batch_info[:prefix_size]
+            )
         _log_cam_op_values(
             "async_dispatch_recv",
             "outputs",
@@ -804,22 +889,25 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             tp_size=self.tp_size,
             group_name=self.group_name,
         )
-        torch.ops.afd_ascend.afd_async_combine_send(
-            ffn_output,
-            self.comm_args,
-            token_nums_rankid_layeridx,
-            self.comm_id,
-            self.max_num_batched_tokens,
-            states.hidden_size,
-            states.topk,
-            self.ffn_size,
-            self.attn_size,
-            self.expert_per_rank,
-            self.world_rank,
-            self.topology.world_size,
-            self.tp_size,
-            self.group_name,
-        )
+        with span(context.profile, "COMBINE_SEND"):
+            torch.ops.afd_ascend.afd_async_combine_send(
+                ffn_output,
+                self.comm_args,
+                token_nums_rankid_layeridx,
+                self.comm_id,
+                self.max_num_batched_tokens,
+                states.hidden_size,
+                states.topk,
+                self.ffn_size,
+                self.attn_size,
+                self.expert_per_rank,
+                self.world_rank,
+                self.topology.world_size,
+                self.tp_size,
+                self.group_name,
+            )
+        if context.profile is not None:
+            context.profile.tracer.release_execution(context.profile)
 
     def _require_initialized(self) -> None:
         if not self._initialized:

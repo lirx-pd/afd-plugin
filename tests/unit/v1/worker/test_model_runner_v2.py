@@ -154,6 +154,8 @@ def _v2_config(
         enable_dbo=False,
         use_ubatching=False,
         num_ubatches=1,
+        dbo_decode_token_threshold=32,
+        dbo_prefill_token_threshold=512,
     )
     compilation_config = SimpleNamespace(
         mode=None,
@@ -510,6 +512,7 @@ def test_npu_async_v2_constructor_validates_before_native_and_connector_init(
     from afd_plugin.v1.worker.npu import attention_model_runner_v2 as module
 
     config = _v2_config()
+    config.parallel_config.num_ubatches = 2 if local_ubatching else 1
     config.model_config.hf_text_config = config.model_config.hf_config
     config.model_config.use_mla = True
     config.additional_config["afd"].update(

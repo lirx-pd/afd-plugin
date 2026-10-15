@@ -5,8 +5,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
+
+from afd_plugin.profiling.model import span
+
+if TYPE_CHECKING:
+    from afd_plugin.profiling.tracing import Execution
 
 INT4_PER_INT32 = 8
 CAM_LAYER_INDEX = 2
@@ -145,6 +151,8 @@ class AsyncCAMW4A8Executor:
         dynamic_scales: torch.Tensor,
         group_list: torch.Tensor,
         batch_info: torch.Tensor,
+        *,
+        profile: Execution | None = None,
     ) -> torch.Tensor:
         layer_index = batch_info[CAM_LAYER_INDEX : CAM_LAYER_INDEX + 1]
         if self.layer_id_to_slot is not None:
@@ -153,30 +161,32 @@ class AsyncCAMW4A8Executor:
             # The CANN tiling path checks the storage shape. A slice still
             # carries batch_info's larger storage, so materialize one element.
             layer_index = layer_index.clone()
-        activation, scale = self.w13_op(
-            hidden_states,
-            self.w13,
-            self.w13_scale,
-            self.w13_bias,
-            dynamic_scales,
-            group_list,
-            layer_index,
-            dequant_mode=0 if self.per_channel else 1,
-            quant_mode=0,
-            group_list_type=1,
-        )
-        output = self.w2_op(
-            [activation],
-            self.w2,
-            self.w2_bias,
-            self.w2_scale,
-            layer_index,
-            group_list,
-            per_token_scale=scale,
-            group_list_type=1,
-            split_item=3,
-            output_dtype=self.output_dtype,
-        )[0]
+        with span(profile, "GMM_W13"):
+            activation, scale = self.w13_op(
+                hidden_states,
+                self.w13,
+                self.w13_scale,
+                self.w13_bias,
+                dynamic_scales,
+                group_list,
+                layer_index,
+                dequant_mode=0 if self.per_channel else 1,
+                quant_mode=0,
+                group_list_type=1,
+            )
+        with span(profile, "GMM_W2"):
+            output = self.w2_op(
+                [activation],
+                self.w2,
+                self.w2_bias,
+                self.w2_scale,
+                layer_index,
+                group_list,
+                per_token_scale=scale,
+                group_list_type=1,
+                split_item=3,
+                output_dtype=self.output_dtype,
+            )[0]
         if self.routed_scaling_factor != 1.0:
             output.mul_(self.routed_scaling_factor)
         return output

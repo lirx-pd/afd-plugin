@@ -18,6 +18,11 @@ from types import ModuleType
 import pytest
 
 from afd_plugin.compat.npu.ops import ensure_afd_ascend_ops_loaded
+from afd_plugin.profiling import (
+    SOURCE_TRACE_FIELDS,
+    WIRE_PROTOCOL_VERSION,
+    batch_info_prefix_size,
+)
 
 pytestmark = pytest.mark.npu
 
@@ -130,8 +135,8 @@ def test_cam_four_phase_meta_contracts(
     assert expanded.dtype == (torch.int8 if dynamic_quant else dtype)
     assert tuple(scales.shape) == ((262144,) if dynamic_quant else (1,))
     assert scales.dtype == torch.float32
-    # compact_v2: [5 header fields][2 TP totals][3 x 2 expert/TP counts].
-    assert tuple(batch_info.shape) == (13,)
+    # Legacy compact prefix followed by [version, sequence] for each TP source.
+    assert tuple(batch_info.shape) == (17,)
     assert batch_info.dtype == torch.int64
     assert tuple(counts.shape) == (3,)
     assert counts.dtype == torch.int64
@@ -204,13 +209,14 @@ def test_cam_receive_rejects_local_moe_rank_id(cam_runtime):
         _dispatch_recv(cam_runtime, moe_rank_id=0)
 
 
-def test_cam_combine_rejects_noncompact_batch_info_shape(cam_runtime):
+@pytest.mark.parametrize("batch_info_size", [7, 13, 18])
+def test_cam_combine_rejects_noncompact_batch_info_shape(cam_runtime, batch_info_size):
     torch = cam_runtime
     with pytest.raises(RuntimeError, match="batch_info must be int64"):
         torch.ops.afd_ascend.afd_async_combine_send(
             torch.empty((8, 64), device="meta", dtype=torch.bfloat16),
             torch.empty(1, device="meta", dtype=torch.float16),
-            torch.empty(7, device="meta", dtype=torch.int64),
+            torch.empty(batch_info_size, device="meta", dtype=torch.int64),
             0,
             64,
             64,
@@ -249,3 +255,138 @@ def test_cam_send_rejects_autograd_inputs(cam_runtime):
             0,
             "meta_only",
         )
+
+
+def _send_sequence(torch, dispatch_seq):
+    return torch.ops.afd_ascend.afd_async_dispatch_send(
+        torch.empty((4, 64), device="meta", dtype=torch.bfloat16),
+        torch.empty((4, 2), device="meta", dtype=torch.int32),
+        torch.empty(1, device="meta", dtype=torch.float16),
+        dispatch_seq,
+        64,
+        4,
+        64,
+        2,
+        2,
+        2,
+        3,
+        0,
+        4,
+        0,
+        2,
+        0,
+        "meta_only",
+    )
+
+
+@pytest.mark.parametrize("dispatch_seq", [0, 1, 2**32 + 7, 2**63 - 1])
+def test_send_accepts_nonnegative_int64_sequence_in_comm_id(cam_runtime, dispatch_seq):
+    output = _send_sequence(cam_runtime, dispatch_seq)
+    assert output.shape == (1,)
+    assert output.dtype == cam_runtime.int8
+    assert output.device.type == "meta"
+
+
+@pytest.mark.parametrize("dispatch_seq", [-1, -(2**63)])
+def test_send_rejects_negative_sequence(cam_runtime, dispatch_seq):
+    with pytest.raises(RuntimeError, match="comm_id.*profiling sequence"):
+        _send_sequence(cam_runtime, dispatch_seq)
+
+
+def test_send_rejects_int64_overflow(cam_runtime):
+    with pytest.raises((RuntimeError, OverflowError)):
+        _send_sequence(cam_runtime, 2**63)
+
+
+@pytest.mark.parametrize("dynamic_quant", [0, 1])
+def test_receive_retains_four_outputs_and_owns_extended_metadata(
+    cam_runtime, monkeypatch, dynamic_quant
+):
+    torch = cam_runtime
+    monkeypatch.delenv("BATCH_SIZE_FACTOR", raising=False)
+    outputs = _dispatch_recv(torch, dynamic_quant=dynamic_quant)
+    next_outputs = _dispatch_recv(torch, dynamic_quant=dynamic_quant)
+    assert len(outputs) == len(next_outputs) == 4
+    batch_info = outputs[2]
+    assert batch_info.shape == (17,)
+    source_trace = batch_info[-4:].view(2, 2)
+    assert source_trace.dtype == torch.int64
+    assert source_trace.device.type == "meta"
+    assert source_trace.is_contiguous()
+    assert torch._C._is_alias_of(source_trace, batch_info)
+    assert not torch._C._is_alias_of(batch_info, next_outputs[2])
+
+
+@pytest.mark.parametrize(
+    "tp_size,experts,prefix,total",
+    [(1, 1, 7, 9), (2, 3, 13, 17), (4, 16, 73, 81), (8, 8, 77, 93)],
+)
+def test_python_layout_matches_compiled_meta(
+    cam_runtime, tp_size, experts, prefix, total
+):
+    torch = cam_runtime
+    outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(
+        torch.empty(1, device="meta", dtype=torch.float16),
+        torch.empty(1, device="meta", dtype=torch.float16),
+        0,
+        64,
+        64,
+        1,
+        1,
+        tp_size,
+        experts,
+        tp_size,
+        tp_size + 1,
+        tp_size,
+        0,
+        "meta_only",
+    )
+    assert batch_info_prefix_size(tp_size, experts) == prefix
+    assert outputs[2].shape == (total,)
+    assert outputs[2][prefix:].view(tp_size, SOURCE_TRACE_FIELDS).shape == (tp_size, 2)
+    assert (
+        torch.ops.afd_ascend.afd_async_profile_protocol_version()
+        == WIRE_PROTOCOL_VERSION
+        == 1
+    )
+
+
+def test_protocol_extension_preserves_dispatch_schemas(cam_runtime):
+    namespace = cam_runtime.ops.afd_ascend
+    send = namespace.afd_async_dispatch_send.default._schema
+    recv = namespace.afd_async_dispatch_recv.default._schema
+    assert [arg.name for arg in send.arguments] == [
+        "x",
+        "expert_ids",
+        "comm_args",
+        "comm_id",
+        "max_seq_len",
+        "batch_size",
+        "hidden_size",
+        "top_k",
+        "moe_rank_num",
+        "attn_rank_num",
+        "route_expert_num_per_moe",
+        "attn_rank_id",
+        "world_size",
+        "layer_index",
+        "tp_size",
+        "dynamic_quant",
+        "group_name",
+    ]
+    assert [arg.name for arg in recv.arguments] == [
+        "x",
+        "comm_args",
+        "comm_id",
+        "max_seq_len",
+        "hidden_size",
+        "top_k",
+        "moe_rank_num",
+        "attn_rank_num",
+        "route_expert_num_per_moe",
+        "moe_rank_id",
+        "world_size",
+        "tp_size",
+        "dynamic_quant",
+        "group_name",
+    ]

@@ -21,6 +21,7 @@ from afd_plugin.model_executor.npu.async_cam_w4a8 import (  # noqa: E402
     AsyncCAMW4A8Executor,
     W4A8LayerWeights,
 )
+from afd_plugin.profiling.model import span  # noqa: E402
 
 
 def weights(layer_idx=0, per_channel=True):
@@ -181,11 +182,12 @@ def test_runner_preserves_raw_context_and_chunk_capacity():
         SimpleNamespace(
             hidden_states=torch.empty(8, 32),
             context=SimpleNamespace(
+                profile=None,
                 states=SimpleNamespace(
                     dynamic_scales=torch.ones(8),
                     group_list=torch.tensor([0, 0]),
                     token_nums_rankid_layeridx=torch.tensor([99, 1, 5, 0]),
-                )
+                ),
             ),
         )
         for _ in range(2)
@@ -198,7 +200,8 @@ def test_runner_preserves_raw_context_and_chunk_capacity():
         send_ffn_output=lambda result, ctx: sent.append((result, ctx)),
     )
 
-    def compute(*args):
+    def compute(*args, profile=None):
+        assert profile is None
         computed.append(args)
         return torch.empty(8, 32, dtype=torch.bfloat16)
 
@@ -210,6 +213,7 @@ def test_runner_preserves_raw_context_and_chunk_capacity():
             "CAMAsyncAFDConnector": SimpleNamespace,
             "AFDAsyncTransferState": SimpleNamespace,
             "_ffn_layer_indices": lambda self: [2, 5],
+            "span": span,
         },
     )
     method(runner)

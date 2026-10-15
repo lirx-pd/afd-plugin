@@ -78,6 +78,7 @@ def test_decoder_first_and_later_moe_own_collectives(monkeypatch, num_tokens, tp
     )
     monkeypatch.setattr(adapter.native, "sequence_parallel_chunk", chunk)
     layer = SimpleNamespace(
+        cam_profile_enabled=False,
         use_sequence_parallel_moe=True,
         input_layernorm=norm,
         post_attention_layernorm=norm,

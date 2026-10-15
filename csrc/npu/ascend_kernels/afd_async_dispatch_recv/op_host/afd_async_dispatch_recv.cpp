@@ -44,6 +44,7 @@ constexpr static int TILING_KEY_BF16 = 100;
 constexpr static int TILING_KEY_FP16 = 101;
 
 constexpr static int INFO_NUM = 5; // number of valid batch-info fields; also start/end expert per chunk
+constexpr static int SOURCE_TRACE_FIELDS = 2;
 
 // maxSeqLen [1, 8192]
 constexpr static int LIMIT_MAX_SEQ_LEN_MIN = 1;
@@ -62,7 +63,7 @@ constexpr static float EP_BALANCE_FACTOR = 1.2;
 
 constexpr static uint32_t OP_TYPE_ALL_TO_ALL = 8U;
 
-static uint32_t MathCeil(uint32_t n, uint32_t align)
+static uint64_t MathCeil(uint64_t n, uint64_t align)
 {
     return (n + align - 1) / align * align;
 }
@@ -163,8 +164,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     uint64_t sharedMemMoeNeedSize =
         (dispatchInfoSize + expertTokenCntSize * 2 + dispatchTokenSize + tokenAddrSize) * attnRankNum;
 
-    OPS_ERR_IF(sharedMemSize < sharedMemMoeNeedSize,
-        OPS_LOG_E(nodeName, "sharedMemSize is %lu but need %lu.", sharedMemSize, sharedMemMoeNeedSize),
+    OPS_ERR_IF(sharedMemSize < UB_ALIGN || sharedMemMoeNeedSize > sharedMemSize - UB_ALIGN,
+        OPS_LOG_E(nodeName, "sharedMemSize is %lu but need %lu plus the 32-byte receive cursor.", sharedMemSize, sharedMemMoeNeedSize),
         return ge::GRAPH_FAILED);
 
     float maxSeqLenFactor = GetBatchSizeFactor();
@@ -245,7 +246,7 @@ static ge::graphStatus InferShape(gert::InferShapeContext* context)
         dynamicScalesOutShape->SetDim(0, 1);
     }
 
-    int64_t batchInfoNum = INFO_NUM + tpSize + routeExpertNumPerMoe * tpSize;
+    int64_t batchInfoNum = INFO_NUM + tpSize + routeExpertNumPerMoe * tpSize + SOURCE_TRACE_FIELDS * tpSize;
     gert::Shape *batchInfoOutShape = context->GetOutputShape(OUTPUT_BATCH_INFO);
     batchInfoOutShape->SetDimNum(1);
     batchInfoOutShape->SetDim(0, batchInfoNum);

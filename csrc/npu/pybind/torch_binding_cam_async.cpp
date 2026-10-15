@@ -26,6 +26,8 @@ namespace {
 
 constexpr int64_t MAX_SEQUENCE_LENGTH = 1024 * 256;
 constexpr int64_t BATCH_INFO_FIELDS = 5;
+constexpr int64_t SOURCE_TRACE_FIELDS = 2;
+constexpr int64_t WIRE_PROTOCOL_VERSION = 1;
 constexpr int64_t RESERVED_MAGIC = 0;
 constexpr float DEFAULT_BATCH_SIZE_FACTOR = 1.0f;
 
@@ -101,8 +103,8 @@ at::Tensor dispatch_send(
     const int64_t world_size, const int64_t layer_index,
     const int64_t tp_size, const int64_t dynamic_quant,
     c10::string_view group_name) {
-  // Reserved by the source API: HCCL group_name selects communication resources.
-  (void)comm_id;
+  // HCCL group_name selects resources; comm_id carries the profiling sequence.
+  TORCH_CHECK(comm_id >= 0, "comm_id must be a nonnegative profiling sequence");
   check_float_input(x);
   check_tensor(expert_ids, x, "expert_ids");
   check_tensor(comm_args, x, "comm_args");
@@ -128,7 +130,7 @@ at::Tensor dispatch_send(
     std::string group(group_name.data(), group_name.size());
     char *group_ptr = group.data();
     EXEC_NPU_CMD(aclnnAfdAsyncDispatchSend, x, expert_ids, comm_args,
-                 RESERVED_MAGIC, max_seq_len, batch_size, hidden_size, top_k,
+                 comm_id, max_seq_len, batch_size, hidden_size, top_k,
                  moe_rank_num, attn_rank_num, route_expert_num_per_moe,
                  attn_rank_id, world_size, layer_index, tp_size, dynamic_quant,
                  group_ptr, output);
@@ -162,7 +164,7 @@ std::vector<at::Tensor> dispatch_recv(
               "dynamic_quant must be 0 or 1");
   const int64_t capacity = dispatch_recv_capacity();
   const int64_t batch_info_size =
-      BATCH_INFO_FIELDS + tp_size + route_expert_num_per_moe * tp_size;
+      BATCH_INFO_FIELDS + tp_size + route_expert_num_per_moe * tp_size + SOURCE_TRACE_FIELDS * tp_size;
   at::Tensor expanded = at::empty(
       {capacity, hidden_size}, dynamic_quant == 1 ? x.options().dtype(at::kChar)
                                                   : x.options());
@@ -181,6 +183,20 @@ std::vector<at::Tensor> dispatch_recv(
                  expanded, scales, batch_info, counts);
   }
   return {expanded, scales, batch_info, counts};
+}
+
+int64_t profile_protocol_version() {
+  // This reports the binding layout. Same-name ACLNN symbols cannot identify an
+  // old CANN layout: deploy the binding and operator package from the same build.
+  for (const char *symbol : {
+           "aclnnAfdAsyncDispatchSendGetWorkspaceSize", "aclnnAfdAsyncDispatchSend",
+           "aclnnAfdAsyncDispatchRecvGetWorkspaceSize", "aclnnAfdAsyncDispatchRecv",
+           "aclnnAfdAsyncCombineSendGetWorkspaceSize", "aclnnAfdAsyncCombineSend",
+           "aclnnAfdAsyncCombineRecvGetWorkspaceSize", "aclnnAfdAsyncCombineRecv"}) {
+    TORCH_CHECK(GetOpApiFuncAddr(symbol) != nullptr,
+                "Async CAM custom-op package is missing ", symbol);
+  }
+  return WIRE_PROTOCOL_VERSION;
 }
 
 // Source: moe_combine_send_async.cpp::cam_combine_send_async_impl_npu/meta.
@@ -209,10 +225,10 @@ at::Tensor combine_send(
   TORCH_CHECK(comm_args.scalar_type() == at::kHalf,
               "comm_args must have dtype float16");
   const int64_t batch_info_size =
-      BATCH_INFO_FIELDS + tp_size + route_expert_num_per_moe * tp_size;
+      BATCH_INFO_FIELDS + tp_size + route_expert_num_per_moe * tp_size + SOURCE_TRACE_FIELDS * tp_size;
   TORCH_CHECK(batch_info.scalar_type() == at::kLong && batch_info.dim() == 1 &&
                   batch_info.size(0) == batch_info_size,
-              "batch_info must be int64[5 + tp_size + route_expert_num_per_moe * tp_size]");
+              "batch_info must be int64[5 + tp_size + route_expert_num_per_moe * tp_size + 2 * tp_size]");
   at::Tensor output = at::empty({1}, expand_x.options().dtype(at::kChar));
   if constexpr (EXECUTE_NPU) {
     std::string group(group_name.data(), group_name.size());
@@ -275,6 +291,8 @@ at::Tensor combine_recv(
 }  // namespace afd_plugin::cam_async
 
 TORCH_LIBRARY_FRAGMENT(afd_ascend, ops) {
+  ops.def("afd_async_profile_protocol_version() -> int",
+          &afd_plugin::cam_async::profile_protocol_version);
   ops.def("afd_async_dispatch_send(Tensor x, Tensor expert_ids, Tensor comm_args, "
           "int comm_id, int max_seq_len, int batch_size, int hidden_size, int top_k, "
           "int moe_rank_num, int attn_rank_num, int route_expert_num_per_moe, "

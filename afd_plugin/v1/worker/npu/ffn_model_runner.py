@@ -41,6 +41,7 @@ from afd_plugin.connectors.npu.async_cam import (
 )
 from afd_plugin.envs import async_cam_layered_gmm_enabled
 from afd_plugin.model_executor.npu.async_cam_w4a8 import AsyncCAMW4A8Executor
+from afd_plugin.profiling.model import span
 from afd_plugin.v1.worker.attention_metadata import (
     _resolve_world_ranks,
 )
@@ -374,12 +375,14 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             for _ in _ffn_layer_indices(self):
                 payload = connector.recv_attn_output()
                 states = cast(AFDAsyncTransferState, payload.context.states)
-                rank_ffn_output = self._layered_executor(
-                    payload.hidden_states,
-                    states.dynamic_scales,
-                    states.group_list,
-                    states.token_nums_rankid_layeridx,
-                )
+                with span(payload.context.profile, "FFN_COMPUTE"):
+                    rank_ffn_output = self._layered_executor(
+                        payload.hidden_states,
+                        states.dynamic_scales,
+                        states.group_list,
+                        states.token_nums_rankid_layeridx,
+                        profile=payload.context.profile,
+                    )
                 connector.send_ffn_output(rank_ffn_output, payload.context)
             return rank_ffn_output
 
@@ -418,12 +421,13 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 forward_context.additional_kwargs["afd_metadata"] = metadata
                 _set_moe_layer_index(forward_context, layer_idx)
 
-                rank_ffn_output = self.model.compute_ffn_output(
-                    hidden_states=hidden_states,
-                    layer_idx=layer_idx,
-                    group_list=legacy_states.group_list,
-                    dynamic_scales=legacy_states.dynamic_scales,
-                )
+                with span(work_item.context.profile, "FFN_COMPUTE"):
+                    rank_ffn_output = self.model.compute_ffn_output(
+                        hidden_states=hidden_states,
+                        layer_idx=layer_idx,
+                        group_list=legacy_states.group_list,
+                        dynamic_scales=legacy_states.dynamic_scales,
+                    )
                 rank_ffn_output = connector.send_ffn_work_item_output(
                     work_item,
                     rank_ffn_output,

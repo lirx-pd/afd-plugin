@@ -12,6 +12,7 @@ from afd_plugin.compat.npu import ops
 from afd_plugin.compat.npu.ops import (
     ensure_afd_ascend_ops_loaded,
     ensure_cam_async_ops_available,
+    ensure_cam_async_profile_ops_available,
     ensure_cam_p2p_ops_available,
     get_afd_cann_vendor_path,
     get_afd_cust_opapi_path,
@@ -127,3 +128,71 @@ def test_async_loader_requires_all_source_ops(monkeypatch, missing):
         assert loaded == [True]
     finally:
         ensure_cam_async_ops_available.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["afd_async_profile_protocol_version", None],
+)
+def test_profile_loader_requires_binding_protocol_version(monkeypatch, missing):
+    namespace = SimpleNamespace(
+        afd_async_dispatch_send=object(),
+        afd_async_dispatch_recv=object(),
+        afd_async_combine_send=object(),
+        afd_async_combine_recv=object(),
+        afd_async_profile_protocol_version=lambda: 1,
+    )
+    if missing is not None:
+        delattr(namespace, missing)
+    monkeypatch.setitem(
+        sys.modules, "torch", SimpleNamespace(ops=SimpleNamespace(afd_ascend=namespace))
+    )
+    monkeypatch.setattr(ops, "ensure_cam_p2p_ops_available", lambda: None)
+    ensure_cam_async_ops_available.cache_clear()
+    ensure_cam_async_profile_ops_available.cache_clear()
+    try:
+        ensure_cam_async_ops_available()
+        if missing:
+            with pytest.raises(RuntimeError, match="wire-version-1 binding"):
+                ensure_cam_async_profile_ops_available()
+        else:
+            ensure_cam_async_profile_ops_available()
+    finally:
+        ensure_cam_async_ops_available.cache_clear()
+        ensure_cam_async_profile_ops_available.cache_clear()
+
+
+@pytest.mark.parametrize("version", [0, 2])
+def test_profile_loader_rejects_wrong_wire_version(monkeypatch, version):
+    monkeypatch.setattr(ops, "ensure_cam_async_ops_available", lambda: None)
+    namespace = SimpleNamespace(
+        afd_async_profile_protocol_version=lambda: version,
+    )
+    monkeypatch.setitem(
+        sys.modules, "torch", SimpleNamespace(ops=SimpleNamespace(afd_ascend=namespace))
+    )
+    ensure_cam_async_profile_ops_available.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="wire version 1"):
+            ensure_cam_async_profile_ops_available()
+    finally:
+        ensure_cam_async_profile_ops_available.cache_clear()
+
+
+def test_profile_loader_rejects_missing_base_acl_symbol(monkeypatch):
+    def missing_symbol():
+        raise RuntimeError("missing aclnnAfdAsyncDispatchSend")
+
+    monkeypatch.setattr(ops, "ensure_cam_async_ops_available", lambda: None)
+    namespace = SimpleNamespace(
+        afd_async_profile_protocol_version=missing_symbol,
+    )
+    monkeypatch.setitem(
+        sys.modules, "torch", SimpleNamespace(ops=SimpleNamespace(afd_ascend=namespace))
+    )
+    ensure_cam_async_profile_ops_available.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="matching CANN operator package"):
+            ensure_cam_async_profile_ops_available()
+    finally:
+        ensure_cam_async_profile_ops_available.cache_clear()

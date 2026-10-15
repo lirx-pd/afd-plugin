@@ -258,9 +258,11 @@ def test_lease_defaults_and_duration_deadlines_keep_their_owners(worker_session,
 
 @pytest.mark.parametrize(
     "mode,busy,match",
-    [("FULL", False, "FULL_RUNTIME_UNSUPPORTED"), ("LIGHTWEIGHT", True, "profiler")],
+    [("FULL", False, "not configured"), ("LIGHTWEIGHT", True, "profiler")],
 )
-def test_prepare_rejects_full_and_existing_profiler(worker_session, mode, busy, match):
+def test_prepare_rejects_missing_full_backend_and_existing_profiler(
+    worker_session, mode, busy, match
+):
     session, _, _ = worker_session
     with pytest.raises(ValueError, match=match):
         session.prepare(prepare_command(mode=mode), backend_busy=busy)

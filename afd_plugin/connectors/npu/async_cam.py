@@ -583,7 +583,12 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
                 expert_token_nums.sum(dtype=torch.int64),
             )
         )
-        total_num_tokens, layer_idx, num_tokens = control.cpu().tolist()
+        if self.profile_session is None:
+            total_num_tokens, layer_idx, num_tokens = control.cpu().tolist()
+        else:
+            total_num_tokens, layer_idx, num_tokens = (
+                self.profile_session.tracer.read_ffn_control(control)
+            )
         if not 0 <= num_tokens <= recv_output.hidden_states.shape[0]:
             raise RuntimeError(
                 "AFD async CAM routed chunk count is outside dispatch-recv capacity"

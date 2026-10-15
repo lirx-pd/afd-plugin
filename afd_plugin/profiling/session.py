@@ -7,6 +7,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -14,11 +15,13 @@ from typing import TYPE_CHECKING
 from afd_plugin.profiling.storage import JsonRecordWriter
 
 if TYPE_CHECKING:
+    from afd_plugin.profiling.full import RuntimeFullProfiler
     from afd_plugin.profiling.tracing import DeviceTracer
 
 MAX_DURATION_S = 3600
 LEASE_GRACE_S = 60
 DRAIN_TIMEOUT_S = 2
+FULL_OPERATION_TIMEOUT_S = 10
 
 
 def _bounded_seconds(value: int | float | None, field: str, maximum: float) -> float:
@@ -44,6 +47,9 @@ class Capture:
     started_at_ns: int | None = None
     flush_deadline_ns: int = 0
     host_epoch_offset_ns: int = 0
+    mode: str = "LIGHTWEIGHT"
+    full: RuntimeFullProfiler | None = None
+    full_deadline_ns: int = 0
 
     def admits(self) -> bool:
         now = time.monotonic_ns()
@@ -60,6 +66,8 @@ class WorkerSession:
         output_dir: Path,
         tracer: DeviceTracer,
         identity: dict,
+        *,
+        full_factory: Callable[[Path], RuntimeFullProfiler] | None = None,
     ) -> None:
         self.worker_id = worker_id
         self.role = role
@@ -73,6 +81,14 @@ class WorkerSession:
         self._duration_s = 0.0
         self._lock = threading.Lock()
         self._last_command: tuple[str, dict] | None = None
+        self._full_factory = full_factory
+        self._full_poisoned = False
+
+    @property
+    def profiler_reusable(self) -> bool:
+        with self._lock:
+            full = self.capture.full if self.capture is not None else None
+            return not self._full_poisoned and (full is None or not full.busy)
 
     def _command(self, name: str, command: dict) -> bool:
         # RPC payloads cross a process boundary; reject malformed identities.
@@ -99,6 +115,12 @@ class WorkerSession:
                 return self._status()
             if self.state not in {"IDLE", "COMPLETED", "FAILED"}:
                 raise ValueError("a profiling session is already active")
+            if self._full_poisoned or (
+                self.capture is not None
+                and self.capture.full is not None
+                and self.capture.full.busy
+            ):
+                raise ValueError("runtime FULL backend is unavailable; restart worker")
             if self.tracer.pending_count():
                 raise ValueError("previous generation still owns device resources")
             if (
@@ -108,10 +130,11 @@ class WorkerSession:
                 raise ValueError("previous writer has not closed")
             if backend_busy:
                 raise ValueError("an existing NPU profiler is active")
-            if command.get("mode") != "LIGHTWEIGHT":
-                raise ValueError(
-                    "FULL_RUNTIME_UNSUPPORTED: blocked CAM stop is unverified"
-                )
+            mode = command.get("mode")
+            if mode not in {"LIGHTWEIGHT", "FULL"}:
+                raise ValueError("mode must be LIGHTWEIGHT or FULL")
+            if mode == "FULL" and self._full_factory is None:
+                raise ValueError("runtime FULL backend is not configured")
             duration = _bounded_seconds(
                 command.get("duration_s"), "duration_s", MAX_DURATION_S
             )
@@ -129,6 +152,10 @@ class WorkerSession:
                 self._generation,
                 writer,
                 deadline_ns=time.monotonic_ns() + int(lease * 1e9),
+                mode=mode,
+                full=self._full_factory(session_dir / self.worker_id / "full")
+                if mode == "FULL" and self._full_factory is not None
+                else None,
             )
             self._duration_s = duration
             self.tracer.begin_capture()
@@ -192,9 +219,13 @@ class WorkerSession:
                     "generation": capture.generation,
                     "identity": self.identity,
                     "requires_summary": True,
+                    "mode": capture.mode,
+                    "full_trace_dir": str(capture.full.trace_dir)
+                    if capture.full is not None
+                    else None,
                 }
             )
-            capture.accepting = True
+            capture.accepting = capture.full is None
             self.state = "STARTING"
             self.command_seq = command["command_seq"]
             self._last_command = ("commit", dict(command))
@@ -217,11 +248,31 @@ class WorkerSession:
         if not capture.stop_requested:
             capture.stop_requested = True
             capture.drain_deadline_ns = time.monotonic_ns() + int(DRAIN_TIMEOUT_S * 1e9)
+            if capture.full is not None:
+                capture.full.stop()
+                capture.full_deadline_ns = time.monotonic_ns() + int(
+                    FULL_OPERATION_TIMEOUT_S * 1e9
+                )
         self.state = "STOPPING"
 
     def status(self, command: dict | None = None) -> dict:
         with self._lock:
             return self._status()
+
+    def start_pending_full(self) -> None:
+        """Run startup on the original model thread, outside the session lock."""
+        with self._lock:
+            capture = self.capture
+            if (
+                capture is None
+                or self.state != "STARTING"
+                or capture.full is None
+                or capture.full.state != "STARTING"
+                or time.monotonic_ns() >= capture.deadline_ns
+            ):
+                return
+            full = capture.full
+        full.step(startup_only=True)
 
     def _status(self) -> dict:
         capture = self.capture
@@ -234,11 +285,18 @@ class WorkerSession:
             "command_seq": self.command_seq,
             "wall_time_ns": time.time_ns(),
             "monotonic_ns": time.monotonic_ns(),
-            "capabilities": ["LIGHTWEIGHT"],
+            "capabilities": ["LIGHTWEIGHT", "FULL"]
+            if self._full_factory is not None
+            else ["LIGHTWEIGHT"],
             "error": capture.error if capture else None,
             "details": {
                 "started_at_ns": capture.started_at_ns if capture else None,
                 "writer": capture.writer.snapshot() if capture else None,
+                "mode": capture.mode if capture else None,
+                "full": capture.full.snapshot()
+                if capture is not None and capture.full is not None
+                else None,
+                "profiler_poisoned": self._full_poisoned,
                 **self.tracer.snapshot(),
             },
         }
@@ -251,9 +309,34 @@ class WorkerSession:
                 return
             now = time.monotonic_ns()
             if self.state == "STARTING" and now >= capture.start_ns:
-                if capture.started_at_ns is None:
-                    capture.started_at_ns = time.time_ns()
-                self.state = "RUNNING"
+                if capture.full is not None:
+                    if capture.full.state == "PREPARED":
+                        capture.full.start()
+                        capture.full_deadline_ns = now + int(
+                            FULL_OPERATION_TIMEOUT_S * 1e9
+                        )
+                    if capture.full.started_at_ns is not None:
+                        capture.started_at_ns = capture.full.started_at_ns
+                        capture.accepting = True
+                        self.state = "RUNNING"
+                else:
+                    if capture.started_at_ns is None:
+                        capture.started_at_ns = time.time_ns()
+                    self.state = "RUNNING"
+            full = capture.full
+            if full is not None:
+                if full.error:
+                    capture.error = capture.error or full.error
+                    self._full_poisoned = True
+                elif (
+                    capture.full_deadline_ns
+                    and now >= capture.full_deadline_ns
+                    and not full.done.is_set()
+                    and (full.started_at_ns is None or capture.stop_requested)
+                ):
+                    phase = "stop" if capture.stop_requested else "start"
+                    capture.error = f"FULL profiler {phase} deadline exceeded"
+                    self._full_poisoned = True
             output_error = capture.writer.snapshot()["error"]
             capture.error = capture.error or output_error
             if now >= capture.deadline_ns or capture.error:
@@ -261,6 +344,8 @@ class WorkerSession:
             if not capture.error:
                 self.tracer.collect(capture)
             if not capture.stop_requested:
+                return
+            if full is not None and not full.done.is_set() and not self._full_poisoned:
                 return
             expired = now >= capture.drain_deadline_ns
             if self.tracer.pending_count() and not expired:

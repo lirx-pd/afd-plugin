@@ -11,6 +11,7 @@ import pytest
 from afd_plugin.compat.npu.profiler import (
     afd_npu_profiler_config,
     create_afd_npu_profiler,
+    create_runtime_npu_profiler,
     step_afd_npu_profiler,
     stop_afd_npu_profiler,
 )
@@ -110,6 +111,7 @@ def test_create_npu_profiler_uses_configured_schedule(monkeypatch):
         "repeat": 6,
         "skip_first": 7,
     }
+    assert profiler_module.profile_kwargs is not None
     assert profiler_module.profile_kwargs["record_shapes"] is True
     assert profiler_module.profile_kwargs["with_stack"] is True
     assert profiler_module.profile_kwargs["with_modules"] is True
@@ -123,6 +125,33 @@ def test_step_npu_profiler_ignores_disabled_profiler():
     step_afd_npu_profiler(profiler)
 
     assert profiler.steps == 1
+
+
+def test_runtime_profiler_reuses_backend_options_and_handler_without_step_schedule(
+    monkeypatch,
+):
+    profiler_module = _FakeTorchNPUProfiler()
+    monkeypatch.setitem(
+        sys.modules, "torch_npu", SimpleNamespace(profiler=profiler_module)
+    )
+    monkeypatch.setenv("AFD_NPU_FFN_PROFILER_ENABLE", "1")
+    monkeypatch.setenv("AFD_NPU_FFN_PROFILER_WITH_STACK", "1")
+    monkeypatch.setenv("AFD_NPU_FFN_PROFILER_DIR", "/static-output")
+    create_afd_npu_profiler("ffn")
+    assert profiler_module.profile_kwargs is not None
+    expected = dict(profiler_module.profile_kwargs)
+    expected["schedule"] = None
+    expected["on_trace_ready"] = ("handler", "/session/worker/full")
+    monkeypatch.setenv("AFD_NPU_FFN_PROFILER_ENABLE", "0")
+
+    profiler = create_runtime_npu_profiler("ffn", "/session/worker/full")
+
+    assert profiler is profiler_module.created_profiler
+    assert profiler_module.created_profiler.started is True
+    assert profiler_module.profile_kwargs == expected
+    assert profiler_module.trace_dir == "/session/worker/full"
+    assert afd_npu_profiler_config("ffn").enabled is False
+    assert afd_npu_profiler_config("ffn").trace_dir == "/static-output"
 
 
 def test_stop_npu_profiler_ignores_disabled_profiler():

@@ -312,6 +312,85 @@ actual vendor library path. Missing source operators fail startup.
 For startup, HCCL, CAM operator, and shutdown failures, see the
 [NPU troubleshooting guide](TROUBLESHOOTING.md).
 
+## Runtime profiling
+
+Set `AFD_CAM_PROFILE_ENABLE=1`, `AFD_CAM_PROFILE_TOKEN` to the same nonempty
+secret, and `AFD_CAM_PROFILE_DIR` to a writable output directory on every
+Attention and FFN server before startup. Install the plugin's endpoint entry
+point on every server and include `afd_profile` in `VLLM_PLUGINS`, preserving
+the existing `ascend,afd` entries. Keep static AFD profiling and upstream
+profiling stopped while a runtime session is active.
+
+Start one coordinator, listing each server API URL once, including FFN:
+
+```bash
+export AFD_CAM_PROFILE_TARGETS='["http://attention:8000", "http://ffn:8001"]'
+export AFD_CAM_PROFILE_TOKEN='<shared-secret>'
+export AFD_CAM_PROFILE_DIR='./cam-profiles'
+python -m afd_plugin.profiling.control --host 127.0.0.1 --port 8765
+```
+
+Both modes use the same API. `LIGHTWEIGHT` collects request relationships and
+explicit host/device phase spans. `FULL` adds the existing TorchNPU profiler
+with CPU/NPU activities, Level2, shape recording, configured stack/modules and
+the same TensorBoard trace handler:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8765/cam/profile/start \
+  -H "Authorization: Bearer ${AFD_CAM_PROFILE_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"FULL","duration":10.0}'
+```
+
+Use the returned `session_id` to query `GET /cam/profile/{session_id}` or stop
+early with `POST /cam/profile/{session_id}/stop`, using the same authorization
+header. The duration is a shared wall-clock window; native initialization can
+shorten each worker's active coverage. Inspect `details.started_at_ns` for the
+actual start. A window ending before all backends activate fails explicitly.
+Runtime FULL records continuously between explicit start and stop, without the
+static `WAIT/WARMUP/ACTIVE/REPEAT/SKIP_FIRST` schedule. The existing static
+profiler retains that schedule. Runtime does not modify environment variables;
+the role's `AFD_NPU_*_PROFILER_WITH_STACK` setting still applies.
+
+Each worker writes `<session_id>/<worker_id>.jsonl`. For FULL, the final worker
+status and coordinator manifest also contain `details.full.trace_dir`, the
+`<session_id>/<worker_id>/full/` output root. Native `*_ascend_pt` directories
+and any parsed output are produced there by the existing handler. Paths belong
+to the worker's filesystem. If daemon-worker restrictions prevent parsing,
+keep the raw data and parse the native directory separately:
+
+```bash
+python -c 'import sys; from torch_npu.profiler.profiler import analyse; analyse(sys.argv[1], max_process_number=1)' \
+  '<native-directory-ending-in-ascend_pt>'
+```
+
+Native operations keep the original model thread ownership. Idle Attention
+handles pending startup during the coordinator's status RPC, on the same
+thread as model execution. FFN handles startup while waiting for its existing
+control-data copy or stream completion: runtime-enabled workers use a
+preallocated pinned control buffer and query a completion Event, yielding the
+host thread between checks. Startup therefore does not require a new request.
+The original FFN full-device synchronization remains after the stream wait;
+workers with runtime profiling disabled keep the original blocking path.
+
+These waiting points only handle startup. Step and synchronized stop still
+run at the runner's original profiler step point; a FFN receive that never
+completes can still prevent stop. Missing the start window fails the coordinated
+session; a start/stop watchdog expiry or an exception disables further profiling
+until worker restart. Late completion does not restore reuse. Profiling never
+destroys the CAM communicator to force completion. Native calls holding the GIL
+can still stall Python control, as with the original profiler.
+
+`COMPLETED` confirms lifecycle completion; check the native files separately
+before claiming parsing success. Generic NPU component checks do not establish
+blocked CAM receive behavior, multi-rank numerical correctness, or profiling
+overhead on the `ascend910_93` target.
+
+With TorchNPU 2.10.0.post4, CANN 9.1.0 and Python 3.12, component tests pass
+with the default `WITH_STACK=0`. `WITH_STACK=1` crashes in native stop in both
+the existing static factory and runtime mode on the tested stack. The runtime
+path preserves that setting; it does not silently disable stack capture.
+
 ## W4A8 layered GMM (experimental, disabled by default)
 
 Set `AFD_ASYNC_CAM_LAYERED_GMM=1` on every FFN rank to use the two layered GMM

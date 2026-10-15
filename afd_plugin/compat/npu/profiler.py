@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Final, Literal, Protocol
 
 logger = logging.getLogger(__name__)
@@ -75,6 +75,19 @@ def create_afd_npu_profiler(role: AFDNPUProfilerRole) -> AFDNPUProfiler | None:
     config = afd_npu_profiler_config(role)
     if not config.enabled:
         return None
+    return _create_npu_profiler(role, config, runtime=False)
+
+
+def create_runtime_npu_profiler(
+    role: AFDNPUProfilerRole, trace_dir: str
+) -> AFDNPUProfiler:
+    config = replace(afd_npu_profiler_config(role), enabled=True, trace_dir=trace_dir)
+    return _create_npu_profiler(role, config, runtime=True)
+
+
+def _create_npu_profiler(
+    role: AFDNPUProfilerRole, config: AFDNPUProfilerConfig, *, runtime: bool
+) -> AFDNPUProfiler:
 
     import torch_npu
 
@@ -94,7 +107,9 @@ def create_afd_npu_profiler(role: AFDNPUProfilerRole) -> AFDNPUProfiler | None:
             torch_npu.profiler.ProfilerActivity.CPU,
             torch_npu.profiler.ProfilerActivity.NPU,
         ],
-        schedule=torch_npu.profiler.schedule(
+        schedule=None
+        if runtime
+        else torch_npu.profiler.schedule(
             wait=config.wait,
             warmup=config.warmup,
             active=config.active,
@@ -154,6 +169,7 @@ __all__ = [
     "AFDNPUProfiler",
     "afd_npu_profiler_config",
     "create_afd_npu_profiler",
+    "create_runtime_npu_profiler",
     "step_afd_npu_profiler",
     "stop_afd_npu_profiler",
 ]

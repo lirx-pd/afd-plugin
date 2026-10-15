@@ -320,10 +320,14 @@ export AFD_CAM_PROFILE_DIR='./cam-profiles'
 python -m afd_plugin.profiling.control --host 127.0.0.1 --port 8765
 ```
 
-Both modes use the same API. `LIGHTWEIGHT` collects request relationships and
-explicit host/device phase spans. `FULL` adds the existing TorchNPU profiler
+Both modes use the same API and run independently. `LIGHTWEIGHT` collects
+request relationships and explicit host/device phase spans without starting
+TorchNPU profiling. `FULL` runs only the existing TorchNPU profiler
 with CPU/NPU activities, Level2, shape recording, configured stack/modules and
-the same TensorBoard trace handler:
+the same TensorBoard trace handler. It does not collect lightweight records or
+create the lightweight Event pool and timestamp backend. Those resources are
+allocated on the first `LIGHTWEIGHT` prepare and reused by later lightweight
+sessions:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8765/cam/profile/start \
@@ -342,7 +346,9 @@ static `WAIT/WARMUP/ACTIVE/REPEAT/SKIP_FIRST` schedule. The existing static
 profiler retains that schedule. Runtime does not modify environment variables;
 the role's `AFD_NPU_*_PROFILER_WITH_STACK` setting still applies.
 
-Each worker writes `<session_id>/<worker_id>.jsonl`. For FULL, the final worker
+Each worker writes `<session_id>/<worker_id>.jsonl`. In `FULL` this contains
+only common `SESSION`/`SUMMARY` metadata; request pipeline reconstruction uses
+`LIGHTWEIGHT` output. For FULL, the final worker
 status and coordinator manifest also contain `details.full.trace_dir`, the
 `<session_id>/<worker_id>/full/` output root. Native `*_ascend_pt` directories
 and any parsed output are produced there by the existing handler. Paths belong

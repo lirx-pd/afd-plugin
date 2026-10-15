@@ -443,6 +443,35 @@ def test_worker_prepare_reports_real_output_creation_error(worker_session):
     assert output.read_text() == "existing output\n"
 
 
+def test_lightweight_factory_failure_does_not_start_writer(tmp_path, monkeypatch):
+    calls = []
+
+    def failed_tracer():
+        calls.append("tracer")
+        raise OSError("injected tracer initialization failure")
+
+    def unexpected_writer(*args):
+        calls.append("writer")
+        pytest.fail("failed tracer initialization must not leave a writer")
+
+    monkeypatch.setattr(session_module, "JsonRecordWriter", unexpected_writer)
+    session = WorkerSession(
+        "attention-dp0",
+        "attention",
+        tmp_path,
+        None,
+        {"pid": 7},
+        tracer_factory=failed_tracer,
+    )
+    with pytest.raises(OSError, match="tracer initialization failure"):
+        session.prepare(prepare_command(), backend_busy=False)
+    assert calls == ["tracer"]
+    assert session.state == "IDLE"
+    assert session.capture is None
+    assert session.tracer is None
+    assert not list(tmp_path.rglob("*.jsonl"))
+
+
 def test_worker_commit_and_stop_report_oserrors_and_allow_retry(
     worker_session, monkeypatch
 ):

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from afd_plugin.profiling.full import FFNDeviceWaiter
 from afd_plugin.profiling.model import host_span, span
 from afd_plugin.profiling.session import Capture
 
@@ -73,7 +74,19 @@ def tracer(monkeypatch):
     return tracer
 
 
-def test_ffn_control_is_read_only_after_copy_event_completes(tracer, monkeypatch):
+@pytest.fixture
+def device_waiter(monkeypatch):
+    waiter = FFNDeviceWaiter.__new__(FFNDeviceWaiter)
+    waiter.device = torch.device("cpu")
+    monkeypatch.setattr(
+        tracing.torch_npu.npu, "current_stream", lambda device: "ffn-stream"
+    )
+    return waiter
+
+
+def test_ffn_control_is_read_only_after_copy_event_completes(
+    device_waiter, monkeypatch
+):
     class ReadyEvent(FakeEvent):
         queries = 0
 
@@ -90,38 +103,38 @@ def test_ffn_control_is_read_only_after_copy_event_completes(tracer, monkeypatch
         assert ready.queries == 3
         return source.tolist()
 
-    tracer._ffn_ready = ready
-    tracer._ffn_control = SimpleNamespace(
+    device_waiter._ready = ready
+    device_waiter._control = SimpleNamespace(
         copy_=lambda tensor, *, non_blocking: copied.append((tensor, non_blocking)),
         tolist=read,
     )
-    tracer.session = SimpleNamespace(
+    device_waiter.session = SimpleNamespace(
         start_pending_full=lambda: started_on.append(threading.get_ident())
     )
     yields: list[float] = []
     monkeypatch.setattr(tracing.time, "sleep", yields.append)
 
-    assert tracer.read_ffn_control(source) == [17, 5, 3]
+    assert device_waiter.read_ffn_control(source) == [17, 5, 3]
     assert copied[0][0] is source and copied[0][1] is True
     assert started_on == [threading.get_ident()] * 2
     assert yields == [0, 0]
     assert len(ready.recorded_streams) == 1
 
 
-def test_completed_ffn_stream_does_not_pump_or_yield(tracer, monkeypatch):
+def test_completed_ffn_stream_does_not_pump_or_yield(device_waiter, monkeypatch):
     class CompletedEvent(FakeEvent):
         def query(self):
             return True
 
     ready = CompletedEvent()
-    tracer._ffn_ready = ready
+    device_waiter._ready = ready
 
     def unexpected():
         pytest.fail("completed work must not enter the cooperative wait")
 
-    tracer.session = SimpleNamespace(start_pending_full=unexpected)
+    device_waiter.session = SimpleNamespace(start_pending_full=unexpected)
     monkeypatch.setattr(tracing.time, "sleep", lambda _: unexpected())
-    tracer.wait_for_stream()
+    device_waiter.wait_for_stream()
     assert len(ready.recorded_streams) == 1
 
 

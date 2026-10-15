@@ -170,7 +170,8 @@ class AFDNPUFFNWorker(CAMProfileWorkerMixin, NPUWorker):
             if self.model_runner.connector.control_plane is None:
                 self.model_runner.execute_connector_driven_step()
                 if self.cam_profile_session is not None:
-                    self.cam_profile_session.tracer.wait_for_stream()
+                    assert self.cam_profile_session.device_waiter is not None
+                    self.cam_profile_session.device_waiter.wait_for_stream()
                 torch.npu.synchronize()
                 continue
 

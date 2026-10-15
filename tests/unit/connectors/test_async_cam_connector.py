@@ -631,7 +631,7 @@ def test_async_ffn_work_item_uses_cam_layer_and_token_metadata(monkeypatch, prof
 
     if profiling:
         connector.profile_session = SimpleNamespace(
-            tracer=SimpleNamespace(read_ffn_control=read_ffn_control)
+            device_waiter=SimpleNamespace(read_ffn_control=read_ffn_control)
         )
 
     def fake_recv_attn_output(*, stage_idx, layer_idx, batch_size, ubatch_idx):

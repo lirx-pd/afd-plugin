@@ -15,13 +15,16 @@ from typing import TYPE_CHECKING
 from afd_plugin.profiling.storage import JsonRecordWriter
 
 if TYPE_CHECKING:
-    from afd_plugin.profiling.full import RuntimeFullProfiler
+    import torch
+
+    from afd_plugin.profiling.full import FFNDeviceWaiter, RuntimeFullProfiler
     from afd_plugin.profiling.tracing import DeviceTracer
 
 MAX_DURATION_S = 3600
 LEASE_GRACE_S = 60
 DRAIN_TIMEOUT_S = 2
 FULL_OPERATION_TIMEOUT_S = 10
+POLL_INTERVAL_S = 0.005
 
 
 def _bounded_seconds(value: int | float | None, field: str, maximum: float) -> float:
@@ -53,26 +56,32 @@ class Capture:
 
     def admits(self) -> bool:
         now = time.monotonic_ns()
-        return self.accepting and self.start_ns <= now < self.deadline_ns
+        return (
+            self.mode == "LIGHTWEIGHT"
+            and self.accepting
+            and self.start_ns <= now < self.deadline_ns
+        )
 
 
 class WorkerSession:
-    """RPCs only change admission; the collector owns device reads and draining."""
+    """Own runtime control independently of either profiling backend."""
 
     def __init__(
         self,
         worker_id: str,
         role: str,
         output_dir: Path,
-        tracer: DeviceTracer,
+        tracer: DeviceTracer | None,
         identity: dict,
         *,
+        tracer_factory: Callable[[], DeviceTracer] | None = None,
         full_factory: Callable[[Path], RuntimeFullProfiler] | None = None,
     ) -> None:
         self.worker_id = worker_id
         self.role = role
         self.output_dir = output_dir
         self.tracer = tracer
+        self.device_waiter: FFNDeviceWaiter | None = None
         self.identity = identity
         self.capture: Capture | None = None
         self.state = "IDLE"
@@ -82,7 +91,39 @@ class WorkerSession:
         self._lock = threading.Lock()
         self._last_command: tuple[str, dict] | None = None
         self._full_factory = full_factory
+        self._tracer_factory = tracer_factory
         self._full_poisoned = False
+        self._shutdown = threading.Event()
+
+    def start(self, device: torch.device) -> None:
+        threading.Thread(
+            target=self._run, args=(device,), name="afd-cam-control", daemon=True
+        ).start()
+
+    def _run(self, device: torch.device) -> None:
+        import torch_npu
+
+        torch_npu.npu.set_device(device)
+        while not self._shutdown.wait(POLL_INTERVAL_S):
+            try:
+                self.tick()
+                capture = self.capture
+                tracer = self.tracer
+                # Retired generations retain slots until their device work completes.
+                if (
+                    capture is not None
+                    and capture.mode == "LIGHTWEIGHT"
+                    and tracer is not None
+                    and tracer.finalized(capture)
+                ):
+                    tracer.collect(capture)
+            except Exception as exc:
+                with self._lock:
+                    capture = self.capture
+                    if capture is not None:
+                        capture.error = f"{type(exc).__name__}: {exc}"
+                        self._stop(capture)
+                        capture.drain_deadline_ns = time.monotonic_ns()
 
     @property
     def profiler_reusable(self) -> bool:
@@ -121,7 +162,7 @@ class WorkerSession:
                 and self.capture.full.busy
             ):
                 raise ValueError("runtime FULL backend is unavailable; restart worker")
-            if self.tracer.pending_count():
+            if self.tracer is not None and self.tracer.pending_count():
                 raise ValueError("previous generation still owns device resources")
             if (
                 self.capture is not None
@@ -143,8 +184,20 @@ class WorkerSession:
                 "lease_s",
                 duration + LEASE_GRACE_S,
             )
+            if mode == "LIGHTWEIGHT" and self.tracer is None:
+                if self._tracer_factory is None:
+                    raise ValueError("LIGHTWEIGHT backend is not configured")
+                self.tracer = self._tracer_factory()
+            if mode == "LIGHTWEIGHT":
+                assert self.tracer is not None
+                self.tracer.session = self
             session_dir = self.output_dir / command["session_id"]
             session_dir.mkdir(parents=True, exist_ok=True)
+            full = (
+                self._full_factory(session_dir / self.worker_id / "full")
+                if mode == "FULL" and self._full_factory is not None
+                else None
+            )
             writer = JsonRecordWriter(session_dir / f"{self.worker_id}.jsonl")
             self._generation += 1
             self.capture = Capture(
@@ -153,12 +206,12 @@ class WorkerSession:
                 writer,
                 deadline_ns=time.monotonic_ns() + int(lease * 1e9),
                 mode=mode,
-                full=self._full_factory(session_dir / self.worker_id / "full")
-                if mode == "FULL" and self._full_factory is not None
-                else None,
+                full=full,
             )
             self._duration_s = duration
-            self.tracer.begin_capture()
+            if mode == "LIGHTWEIGHT":
+                assert self.tracer is not None
+                self.tracer.begin_capture()
             self.state = "PREPARED"
             self.command_seq = command["command_seq"]
             self._last_command = ("prepare", dict(command))
@@ -244,7 +297,11 @@ class WorkerSession:
             return self._status()
 
     def _stop(self, capture: Capture) -> None:
-        self.tracer.close_admission(capture)
+        if capture.mode == "LIGHTWEIGHT":
+            assert self.tracer is not None
+            self.tracer.close_admission(capture)
+        else:
+            capture.accepting = False
         if not capture.stop_requested:
             capture.stop_requested = True
             capture.drain_deadline_ns = time.monotonic_ns() + int(DRAIN_TIMEOUT_S * 1e9)
@@ -297,12 +354,18 @@ class WorkerSession:
                 if capture is not None and capture.full is not None
                 else None,
                 "profiler_poisoned": self._full_poisoned,
-                **self.tracer.snapshot(),
+                **(
+                    self.tracer.snapshot()
+                    if capture is not None
+                    and capture.mode == "LIGHTWEIGHT"
+                    and self.tracer is not None
+                    else {}
+                ),
             },
         }
 
     def tick(self) -> None:
-        """Called by the device-bound collector, never by an inference thread."""
+        """Called by the device-bound control thread, never an inference thread."""
         with self._lock:
             capture = self.capture
             if capture is None or self.state in {"COMPLETED", "FAILED"}:
@@ -317,7 +380,6 @@ class WorkerSession:
                         )
                     if capture.full.started_at_ns is not None:
                         capture.started_at_ns = capture.full.started_at_ns
-                        capture.accepting = True
                         self.state = "RUNNING"
                 else:
                     if capture.started_at_ns is None:
@@ -341,17 +403,33 @@ class WorkerSession:
             capture.error = capture.error or output_error
             if now >= capture.deadline_ns or capture.error:
                 self._stop(capture)
-            if not capture.error:
-                self.tracer.collect(capture)
+            tracer = self.tracer if capture.mode == "LIGHTWEIGHT" else None
+            if tracer is not None and not capture.error:
+                tracer.collect(capture)
             if not capture.stop_requested:
                 return
             if full is not None and not full.done.is_set() and not self._full_poisoned:
                 return
             expired = now >= capture.drain_deadline_ns
-            if self.tracer.pending_count() and not expired:
+            if tracer is not None and tracer.pending_count() and not expired:
                 return
-            if not self.tracer.finalized(capture):
-                self.tracer.finish_capture(capture)
+            if not capture.flush_deadline_ns:
+                if tracer is not None:
+                    tracer.finish_capture(capture)
+                else:
+                    capture.writer.submit(
+                        {
+                            "record_type": "SUMMARY",
+                            "worker_id": self.worker_id,
+                            "dropped_spans": 0,
+                            "dropped_metadata": 0,
+                            "unresolved_spans": 0,
+                            "dropped_records": capture.writer.snapshot()[
+                                "dropped_records"
+                            ],
+                            "error": capture.error,
+                        }
+                    )
                 capture.flush_deadline_ns = now + int(DRAIN_TIMEOUT_S * 1e9)
             capture.writer.close(0)
             output = capture.writer.snapshot()

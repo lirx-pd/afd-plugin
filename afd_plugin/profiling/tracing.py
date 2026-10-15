@@ -25,10 +25,9 @@ if TYPE_CHECKING:
 
 SPAN_CAPACITY = 128
 METADATA_CAPACITY = 16
-POLL_INTERVAL_S = 0.005
+RESOURCE_INIT_TIMEOUT_S = 2
 ANCHOR_INTERVAL_NS = 1_000_000_000
 NS_PER_DEVICE_TICK = 1000
-FFN_CONTROL_FIELDS = 3
 
 
 @dataclass(slots=True)
@@ -133,19 +132,18 @@ class DeviceTracer:
         ]
         self.anchor = torch_npu.npu.Event(enable_timing=True)
         self.anchor_stream = torch_npu.npu.Stream(device=device)
-        self._ffn_control = torch.empty(
-            (FFN_CONTROL_FIELDS,), dtype=torch.int64, pin_memory=True
-        )
-        self._ffn_ready = torch_npu.npu.Event()
-        # Resource allocation and synchronization are confined to worker startup.
+        # PREPARE must not wait for an unrelated, possibly blocked CAM receive.
         for slot in self.slots:
-            slot.begin.record()
-            slot.end.record()
+            slot.begin.record(self.anchor_stream)
+            slot.end.record(self.anchor_stream)
         for metadata in self.metadata_slots:
-            metadata.ready.record()
-        self.anchor.record()
-        self._ffn_ready.record()
-        torch_npu.npu.synchronize(device)
+            metadata.ready.record(self.anchor_stream)
+        self.anchor.record(self.anchor_stream)
+        deadline = time.monotonic() + RESOURCE_INIT_TIMEOUT_S
+        while not self.anchor.query():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("LIGHTWEIGHT event initialization deadline exceeded")
+            time.sleep(0.001)
         self._host_records: dict[str, tuple[Capture, dict]] = {}
         self._retained: dict[str, Execution] = {}
         self._span_seq = 0
@@ -159,26 +157,6 @@ class DeviceTracer:
         self._next_anchor = 0
         self._range: tuple[int, int] | None = None
         self._finalized_generation = 0
-        self._shutdown = threading.Event()
-
-    def start(self, session: WorkerSession) -> None:
-        self.session = session
-        threading.Thread(
-            target=self._run, name="afd-cam-collector", daemon=True
-        ).start()
-
-    def wait_for_stream(self) -> None:
-        """Keep FULL startup reachable during an existing FFN device wait."""
-        assert self.session is not None
-        self._ffn_ready.record(torch_npu.npu.current_stream(self.device))
-        while not self._ffn_ready.query():
-            self.session.start_pending_full()
-            time.sleep(0)
-
-    def read_ffn_control(self, control: torch.Tensor) -> list[int]:
-        self._ffn_control.copy_(control, non_blocking=True)
-        self.wait_for_stream()
-        return self._ffn_control.tolist()
 
     def begin_capture(self) -> None:
         self._dropped_spans = 0
@@ -198,6 +176,9 @@ class DeviceTracer:
         return Execution(self, capture, exec_ref)
 
     def new_work(self) -> Execution | None:
+        assert self.session is not None
+        if self.session.capture is None or not self.session.capture.admits():
+            return None
         with self.lock:
             self._work_seq += 1
             reference = f"{self.worker_id}:work:{self._work_seq}"
@@ -491,24 +472,6 @@ class DeviceTracer:
         self._anchors = []
         self._range = None
         self._next_anchor = 0
-
-    def _run(self) -> None:
-        torch_npu.npu.set_device(self.device)
-        assert self.session is not None
-        while not self._shutdown.wait(POLL_INTERVAL_S):
-            try:
-                self.session.tick()
-                # Retired generations retain resources until their own records complete.
-                capture = self.session.capture
-                if capture is not None and self.finalized(capture):
-                    self.collect(capture)
-            except Exception as exc:
-                capture = self.session.capture
-                if capture is not None:
-                    capture.error = f"{type(exc).__name__}: {exc}"
-                    capture.accepting = False
-                    capture.stop_requested = True
-                    capture.drain_deadline_ns = time.monotonic_ns()
 
 
 MAX_DURATION_ANCHORS = 3602

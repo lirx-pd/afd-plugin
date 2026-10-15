@@ -431,7 +431,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         if sequence >= 1 << 63:
             raise RuntimeError("CAM profiling sequence exhausted; restart workers")
         execution = None
-        if self.profile_session is not None:
+        if self.profile_session is not None and self.profile_session.tracer is not None:
             execution = self.profile_session.tracer.execution(
                 f"{self.profile_worker_id}:call:{sequence}"
             )
@@ -497,8 +497,9 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         if self.profile_session is None:
             total_num_tokens, layer_idx, num_tokens = control.cpu().tolist()
         else:
+            assert self.profile_session.device_waiter is not None
             total_num_tokens, layer_idx, num_tokens = (
-                self.profile_session.tracer.read_ffn_control(control)
+                self.profile_session.device_waiter.read_ffn_control(control)
             )
         if not 0 <= num_tokens <= recv_output.hidden_states.shape[0]:
             raise RuntimeError(
@@ -789,7 +790,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             metadata=metadata,
             states=states,
         )
-        if self.profile_session is not None:
+        if self.profile_session is not None and self.profile_session.tracer is not None:
             context.profile = self.profile_session.tracer.new_work()
         placeholder = kwargs.get("placeholder", self._placeholder)
         _log_cam_op_values(

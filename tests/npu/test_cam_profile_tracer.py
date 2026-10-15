@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -111,7 +112,7 @@ def _probe_streams(torch, tracer, session, output: Path) -> dict:
     assert not busy.query(), "busy stream completed before the collector probe"
     begin = time.monotonic()
     # Starting after both submissions makes the two-stream condition observable.
-    tracer.start(session)
+    session.start(tracer.device)
     _wait(
         lambda: any(
             record["record_type"] == "SPAN"
@@ -143,10 +144,73 @@ def _probe_streams(torch, tracer, session, output: Path) -> dict:
     }
 
 
+def _probe_lazy_prepare(torch, tracer, session, output: Path) -> dict:
+    from afd_plugin.profiling.analyze import reconstruct
+
+    assert tracer is None and session.tracer is None
+    assert session.status()["capabilities"] == ["LIGHTWEIGHT"]
+    matrix = torch.ones((4096, 4096), dtype=torch.float16, device="npu")
+    ready_target, busy_target = torch.empty_like(matrix), torch.empty_like(matrix)
+    torch.mm(matrix, matrix, out=ready_target)
+    torch.npu.synchronize()
+    busy = torch.npu.Stream()
+    with torch.npu.stream(busy):
+        for _ in range(BUSY_ITERATIONS):
+            torch.mm(matrix, matrix, out=busy_target)
+    pending_before = not busy.query()
+    assert pending_before, "unrelated work completed before lazy PREPARE"
+    session_id = str(uuid.uuid4())
+    begin = time.monotonic()
+    session.prepare(
+        {
+            "session_id": session_id,
+            "command_seq": 1,
+            "mode": "LIGHTWEIGHT",
+            "duration_s": 30,
+        },
+        backend_busy=False,
+    )
+    elapsed = time.monotonic() - begin
+    pending_after = not busy.query()
+    assert pending_after, "lazy PREPARE waited for unrelated device work"
+    _wait(busy.query, "unrelated finite work did not complete")
+    tracer = session.tracer
+    assert tracer is not None and session.capture.full is None
+    session.start(tracer.device)
+    session.commit(
+        {
+            "session_id": session_id,
+            "command_seq": 2,
+            "start_at_ns": time.time_ns() + START_DELAY_NS,
+            "clock_by_worker": {WORKER_ID: {"offset_ns": 0, "uncertainty_ns": 0}},
+        }
+    )
+    _wait(session.capture.admits, "lazy capture did not open admission")
+    execution = tracer.execution(f"{WORKER_ID}:call:1")
+    assert execution is not None
+    _source_call(session, execution)
+    with span(execution, "FFN_COMPUTE"):
+        torch.mm(matrix, matrix, out=ready_target)
+    status = _finish(session)
+    assert status["state"] == "COMPLETED", status
+    path = session.output_dir / session_id / f"{WORKER_ID}.jsonl"
+    reconstructed = reconstruct(_records(path))
+    assert reconstructed["data_quality"] == "COMPLETE", reconstructed["errors"]
+    assert len(reconstructed["spans"]) == 1
+    recorded = next(iter(reconstructed["spans"].values()))
+    assert recorded["timing"]["duration_ns"] > 0, recorded
+    return {
+        "pending_before_prepare": pending_before,
+        "pending_after_prepare": pending_after,
+        "prepare_seconds": elapsed,
+        "status": status,
+    }
+
+
 def _probe_metadata(torch, tracer, session, output: Path) -> dict:
     from afd_plugin.profiling.analyze import reconstruct
 
-    tracer.start(session)
+    session.start(tracer.device)
     trace = torch.empty((2, 2), dtype=torch.int64, device="npu")
     batch = torch.empty((11,), dtype=torch.int64, device="npu")
     value = torch.ones(16, device="npu")
@@ -203,7 +267,7 @@ def _probe_metadata(torch, tracer, session, output: Path) -> dict:
 
 
 def _probe_stop(torch, tracer, session, output: Path, *, host: bool = False) -> dict:
-    tracer.start(session)
+    session.start(tracer.device)
     path = _begin(session)
     execution = tracer.execution(f"{WORKER_ID}:call:1")
     assert execution is not None
@@ -275,7 +339,7 @@ def _probe_short(torch, tracer, session, output: Path) -> dict:
     status = session.stop({"session_id": session.capture.session_id, "command_seq": 3})
     assert status["details"]["started_at_ns"] is not None, status
     assert not tracer._anchors
-    tracer.start(session)
+    session.start(tracer.device)
     _wait(
         lambda: session.status()["state"] in {"COMPLETED", "FAILED"},
         "short capture did not finish",
@@ -313,23 +377,39 @@ def _probe(case: str, output: Path) -> None:
     device = torch.device("npu", int(os.environ.get("LOCAL_RANK", "0")))
     torch_npu.npu.set_device(device)
     output.mkdir(parents=True, exist_ok=True)
-    tracer = DeviceTracer(device, WORKER_ID, list(SOURCE_WORKERS), 2, 2)
-    session = WorkerSession(WORKER_ID, "ffn", output, tracer, {})
+    tracer = (
+        None
+        if case == "lazy_prepare"
+        else DeviceTracer(device, WORKER_ID, list(SOURCE_WORKERS), 2, 2)
+    )
+    session = WorkerSession(
+        WORKER_ID,
+        "ffn",
+        output,
+        tracer,
+        {},
+        tracer_factory=lambda: DeviceTracer(
+            device, WORKER_ID, list(SOURCE_WORKERS), 2, 2
+        ),
+    )
     try:
-        probes = {
+        probes: dict[str, Callable[..., dict]] = {
             "streams": _probe_streams,
             "metadata": _probe_metadata,
             "stop": _probe_stop,
             "short": _probe_short,
             "host_stop": _probe_host_stop,
+            "lazy_prepare": _probe_lazy_prepare,
         }
         result = probes[case](torch, tracer, session, output)
         (output / "probe-result.json").write_text(json.dumps(result, indent=2))
     finally:
-        tracer._shutdown.set()
+        session._shutdown.set()
 
 
-@pytest.mark.parametrize("case", ["streams", "metadata", "stop", "short", "host_stop"])
+@pytest.mark.parametrize(
+    "case", ["streams", "metadata", "stop", "short", "host_stop", "lazy_prepare"]
+)
 def test_device_tracer_component(case, tmp_path):
     if os.environ.get("AFD_RUN_ASCEND_OP_RUNTIME") != "1":
         pytest.skip("requires an allocated NPU and runtime opt-in")

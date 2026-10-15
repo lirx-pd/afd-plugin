@@ -7,12 +7,49 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from afd_plugin.compat.npu.profiler import (
     AFDNPUProfiler,
     AFDNPUProfilerRole,
     create_runtime_npu_profiler,
 )
+
+if TYPE_CHECKING:
+    import torch
+
+    from afd_plugin.profiling.session import WorkerSession
+
+FFN_CONTROL_FIELDS = 3
+
+
+class FFNDeviceWaiter:
+    def __init__(self, device: torch.device, session: WorkerSession) -> None:
+        import torch
+        import torch_npu
+
+        self.device = device
+        self.session = session
+        self._control = torch.empty(
+            (FFN_CONTROL_FIELDS,), dtype=torch.int64, pin_memory=True
+        )
+        self._ready = torch_npu.npu.Event()
+        # Warm the wait event before the FFN receive loop can block the device.
+        self._ready.record()
+        self._ready.synchronize()
+
+    def wait_for_stream(self) -> None:
+        import torch_npu
+
+        self._ready.record(torch_npu.npu.current_stream(self.device))
+        while not self._ready.query():
+            self.session.start_pending_full()
+            time.sleep(0)
+
+    def read_ffn_control(self, control: torch.Tensor) -> list[int]:
+        self._control.copy_(control, non_blocking=True)
+        self.wait_for_stream()
+        return self._control.tolist()
 
 
 class RuntimeFullProfiler:

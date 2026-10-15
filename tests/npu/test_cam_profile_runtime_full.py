@@ -118,24 +118,29 @@ def _probe_cooperative(output: Path) -> None:
     import torch
     import torch_npu
 
-    from afd_plugin.profiling.full import RuntimeFullProfiler
+    from afd_plugin.profiling.full import FFNDeviceWaiter, RuntimeFullProfiler
     from afd_plugin.profiling.session import WorkerSession
-    from afd_plugin.profiling.tracing import DeviceTracer
 
     os.environ["AFD_NPU_FFN_PROFILER_ENABLE"] = "0"
     os.environ["AFD_NPU_FFN_PROFILER_WITH_STACK"] = "0"
     device = torch.device("npu", int(os.environ.get("LOCAL_RANK", "0")))
     torch_npu.npu.set_device(device)
-    tracer = DeviceTracer(device, "ffn-test", ["attention-test"], 1, 1)
+
+    def unexpected_tracer():
+        raise AssertionError("FULL must not allocate LIGHTWEIGHT resources")
+
     session = WorkerSession(
         "ffn-test",
         "ffn",
         output,
-        tracer,
+        None,
         {},
         full_factory=partial(RuntimeFullProfiler, "ffn"),
+        tracer_factory=unexpected_tracer,
     )
-    tracer.start(session)
+    waiter = FFNDeviceWaiter(device, session)
+    session.device_waiter = waiter
+    session.start(device)
     matrix = torch.ones(
         (BUSY_MATRIX_SIZE, BUSY_MATRIX_SIZE), dtype=torch.float16, device=device
     )
@@ -171,7 +176,7 @@ def _probe_cooperative(output: Path) -> None:
         "deadline_ns": session.capture.deadline_ns,
     }
     start_pending_full = session.start_pending_full
-    wait_for_stream = tracer.wait_for_stream
+    wait_for_stream = waiter.wait_for_stream
 
     def observe_copy() -> None:
         diagnostics["pending_after_copy"] = not pending.query()
@@ -198,7 +203,7 @@ def _probe_cooperative(output: Path) -> None:
             )
 
     session.start_pending_full = observe_start
-    tracer.wait_for_stream = observe_copy
+    waiter.wait_for_stream = observe_copy
     queue_begin = time.monotonic()
     for _ in range(BUSY_ITERATIONS):
         torch.mm(matrix, matrix, out=target)
@@ -206,7 +211,7 @@ def _probe_cooperative(output: Path) -> None:
     diagnostics["pending_before_copy"] = not pending.query()
     assert diagnostics["pending_before_copy"], "work completed before receive-wait"
     read_begin = time.monotonic()
-    assert tracer.read_ffn_control(control) == [123, 5, 17]
+    assert waiter.read_ffn_control(control) == [123, 5, 17]
     diagnostics.update(
         wait_calls=wait_calls,
         queue_seconds=read_begin - queue_begin,
@@ -230,6 +235,14 @@ def _probe_cooperative(output: Path) -> None:
         assert time.monotonic() < deadline, session.status()
         time.sleep(0.001)
     assert session.state == "COMPLETED", session.status()
+    assert session.tracer is None
+    records = [
+        json.loads(line)
+        for path in output.rglob("*.jsonl")
+        for line in path.read_text().splitlines()
+    ]
+    assert records
+    assert all(record["record_type"] in {"SESSION", "SUMMARY"} for record in records)
     traces = list(runtime.trace_dir.rglob("trace_view.json"))
     assert traces, runtime.snapshot()
     events = []

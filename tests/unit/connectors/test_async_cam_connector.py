@@ -613,7 +613,8 @@ def test_async_combine_send_requires_dispatch_recv_token_metadata(monkeypatch):
         connector.send_ffn_output(_FakeTensor((4, 16)), context)
 
 
-def test_async_ffn_work_item_uses_cam_layer_and_token_metadata(monkeypatch):
+@pytest.mark.parametrize("profiling", [False, True])
+def test_async_ffn_work_item_uses_cam_layer_and_token_metadata(monkeypatch, profiling):
     connector = CAMAsyncAFDConnector(
         0,
         0,
@@ -622,6 +623,16 @@ def test_async_ffn_work_item_uses_cam_layer_and_token_metadata(monkeypatch):
         0,
     )
     connector.ffn_size = 2
+    controls = []
+
+    def read_ffn_control(control):
+        controls.append(control.tolist())
+        return controls[-1]
+
+    if profiling:
+        connector.profile_session = SimpleNamespace(
+            tracer=SimpleNamespace(read_ffn_control=read_ffn_control)
+        )
 
     def fake_recv_attn_output(*, stage_idx, layer_idx, batch_size, ubatch_idx):
         assert ubatch_idx == 0
@@ -662,6 +673,7 @@ def test_async_ffn_work_item_uses_cam_layer_and_token_metadata(monkeypatch):
     assert work_item.context.metadata.layer_idx == 11
     assert work_item.context.metadata.seq_lens == [5]
     assert states.dynamic_scales == "scales[:5]"
+    assert controls == ([[7, 11, 5]] if profiling else [])
 
 
 def test_async_ffn_work_item_uses_expert_counts_for_routed_tokens(monkeypatch):

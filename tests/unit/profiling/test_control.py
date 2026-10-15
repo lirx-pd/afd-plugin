@@ -19,7 +19,7 @@ from afd_plugin.profiling import control
 class FakeFleet:
     def __init__(self):
         self.offsets = {"attention": 5_000_000_000, "ffn": -7_000_000_000}
-        self.workers = {
+        self.workers: dict[str, list[dict]] = {
             role: [
                 {
                     "worker_id": f"{role}-dp{rank}",
@@ -108,21 +108,30 @@ def make_coordinator(tmp_path, fleet):
     return coordinator, client
 
 
-def test_session_covers_all_dp_workers_and_adjusts_each_host_clock(tmp_path):
+@pytest.mark.parametrize("mode", ["LIGHTWEIGHT", "FULL"])
+def test_session_covers_all_dp_workers_and_adjusts_each_host_clock(tmp_path, mode):
     async def run():
         fleet = FakeFleet()
+        for workers in fleet.workers.values():
+            for worker in workers:
+                worker["capabilities"] = ["LIGHTWEIGHT", "FULL"]
+                if mode == "FULL":
+                    worker["details"]["full"] = {
+                        "trace_dir": f"cam-profiles/{worker['worker_id']}/full",
+                        "state": "COMPLETED",
+                    }
         fleet.delay_s = 0.002
         coordinator, client = make_coordinator(tmp_path, fleet)
         async with client:
-            session = coordinator.start(
-                control.StartRequest(mode="LIGHTWEIGHT", duration=0.01)
-            )
+            session = coordinator.start(control.StartRequest(mode=mode, duration=0.01))
             await asyncio.wait_for(session.task, 2.0)
         assert session.state == "COMPLETED"
         assert session.snapshot()["expected_workers"] == 4
         assert session.data_quality == "COMPLETE"
         assert coordinator.active is None
         for _role, action, command in fleet.calls:
+            if action == "prepare":
+                assert command["mode"] == mode
             if action != "commit":
                 continue
             assert set(command) == {
@@ -142,6 +151,9 @@ def test_session_covers_all_dp_workers_and_adjusts_each_host_clock(tmp_path):
                 )
         manifest = json.loads((session.directory / "manifest.json").read_text())
         assert manifest["state"] == "COMPLETED"
+        assert manifest["mode"] == mode
+        if mode == "FULL":
+            assert all(w["details"]["full"]["trace_dir"] for w in manifest["workers"])
         assert manifest["clock_method"] == "empirical_http_midpoint_per_worker"
         assert not (session.directory / "manifest.json.tmp").exists()
 
@@ -411,6 +423,7 @@ def test_lifespan_recovers_and_drains_with_owned_client_cleanup(
         assert service.active is active
         assert not outbound.is_closed
     assert service.active is None
+    assert active is not None
     assert active.task.done()
     assert active.state == "COMPLETED"
     assert outbound.is_closed == (construction == "environment")

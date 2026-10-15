@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import os
 import socket
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from afd_plugin.profiling import runtime_profiling_enabled
+from afd_plugin.profiling.full import RuntimeFullProfiler
 
 if TYPE_CHECKING:
     import torch
@@ -67,9 +69,20 @@ class CAMProfileWorkerMixin:
                 "tp_size": connector.tp_size,
                 "protocol_version": 1,
             },
+            full_factory=partial(
+                self._create_cam_full_profiler,
+                "attention" if connector.topology.role == "attention" else "ffn",
+            ),
         )
         connector.profile_session = self.cam_profile_session
         tracer.start(self.cam_profile_session)
+
+    def _create_cam_full_profiler(
+        self, role: Literal["attention", "ffn"], trace_dir: Path
+    ) -> RuntimeFullProfiler:
+        full = RuntimeFullProfiler(role, trace_dir)
+        self.model_runner.prof = full
+        return full
 
     def _require_cam_profile_session(self) -> WorkerSession:
         if self.cam_profile_session is None:
@@ -94,7 +107,10 @@ class CAMProfileWorkerMixin:
                 return session.prepare(
                     command,
                     backend_busy=self._cam_native_profiler_active
-                    or self.model_runner.prof is not None,
+                    or (
+                        self.model_runner.prof is not None
+                        and not isinstance(self.model_runner.prof, RuntimeFullProfiler)
+                    ),
                 )
             if action == "commit":
                 return session.commit(command)
@@ -105,7 +121,11 @@ class CAMProfileWorkerMixin:
             return result
 
     def cam_profile_status(self, command: dict) -> dict:
-        return self._require_cam_profile_session().status(command)
+        session = self._require_cam_profile_session()
+        # Attention RPCs share the model thread; FFN RPCs do not.
+        if session.role == "attention":
+            session.start_pending_full()
+        return session.status(command)
 
     # Ascend 8d4409d6 NPUWorker.profile also owns a native profiler. Its large
     # backend setup remains upstream; this guard adds only runtime exclusivity.
@@ -116,12 +136,10 @@ class CAMProfileWorkerMixin:
         if (
             is_start
             and session is not None
-            and session.state
-            not in {
-                "IDLE",
-                "COMPLETED",
-                "FAILED",
-            }
+            and (
+                session.state not in {"IDLE", "COMPLETED", "FAILED"}
+                or not session.profiler_reusable
+            )
         ):
             raise ValueError("a runtime CAM profiling session is active")
         # ### PATCH END: CAM session exclusivity

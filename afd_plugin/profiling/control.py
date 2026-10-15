@@ -318,12 +318,7 @@ class ProfileCoordinator:
             if any(
                 session.request.mode not in w["capabilities"] for w in session.workers
             ):
-                reason = (
-                    "FULL_RUNTIME_UNSUPPORTED"
-                    if session.request.mode == "FULL"
-                    else "Worker capability missing: LIGHTWEIGHT"
-                )
-                raise RuntimeError(reason)
+                raise RuntimeError(f"Worker capability missing: {session.request.mode}")
             lease_s = session.request.duration + LEASE_GRACE_S
             max_rtt = await self._exchange(
                 session,

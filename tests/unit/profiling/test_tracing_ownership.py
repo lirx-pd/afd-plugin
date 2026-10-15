@@ -73,6 +73,58 @@ def tracer(monkeypatch):
     return tracer
 
 
+def test_ffn_control_is_read_only_after_copy_event_completes(tracer, monkeypatch):
+    class ReadyEvent(FakeEvent):
+        queries = 0
+
+        def query(self):
+            self.queries += 1
+            return self.queries == 3
+
+    ready = ReadyEvent()
+    started_on = []
+    copied = []
+    source = torch.tensor([17, 5, 3], dtype=torch.int64)
+
+    def read():
+        assert ready.queries == 3
+        return source.tolist()
+
+    tracer._ffn_ready = ready
+    tracer._ffn_control = SimpleNamespace(
+        copy_=lambda tensor, *, non_blocking: copied.append((tensor, non_blocking)),
+        tolist=read,
+    )
+    tracer.session = SimpleNamespace(
+        start_pending_full=lambda: started_on.append(threading.get_ident())
+    )
+    yields: list[float] = []
+    monkeypatch.setattr(tracing.time, "sleep", yields.append)
+
+    assert tracer.read_ffn_control(source) == [17, 5, 3]
+    assert copied[0][0] is source and copied[0][1] is True
+    assert started_on == [threading.get_ident()] * 2
+    assert yields == [0, 0]
+    assert len(ready.recorded_streams) == 1
+
+
+def test_completed_ffn_stream_does_not_pump_or_yield(tracer, monkeypatch):
+    class CompletedEvent(FakeEvent):
+        def query(self):
+            return True
+
+    ready = CompletedEvent()
+    tracer._ffn_ready = ready
+
+    def unexpected():
+        pytest.fail("completed work must not enter the cooperative wait")
+
+    tracer.session = SimpleNamespace(start_pending_full=unexpected)
+    monkeypatch.setattr(tracing.time, "sleep", lambda _: unexpected())
+    tracer.wait_for_stream()
+    assert len(ready.recorded_streams) == 1
+
+
 def test_span_admission_and_slot_registration_are_atomic_with_stop(tracer, monkeypatch):
     capture = _capture()
     execution = tracing.Execution(tracer, capture, "F0:call:1")

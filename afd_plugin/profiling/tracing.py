@@ -28,6 +28,7 @@ METADATA_CAPACITY = 16
 POLL_INTERVAL_S = 0.005
 ANCHOR_INTERVAL_NS = 1_000_000_000
 NS_PER_DEVICE_TICK = 1000
+FFN_CONTROL_FIELDS = 3
 
 
 @dataclass(slots=True)
@@ -132,6 +133,10 @@ class DeviceTracer:
         ]
         self.anchor = torch_npu.npu.Event(enable_timing=True)
         self.anchor_stream = torch_npu.npu.Stream(device=device)
+        self._ffn_control = torch.empty(
+            (FFN_CONTROL_FIELDS,), dtype=torch.int64, pin_memory=True
+        )
+        self._ffn_ready = torch_npu.npu.Event()
         # Resource allocation and synchronization are confined to worker startup.
         for slot in self.slots:
             slot.begin.record()
@@ -139,6 +144,7 @@ class DeviceTracer:
         for metadata in self.metadata_slots:
             metadata.ready.record()
         self.anchor.record()
+        self._ffn_ready.record()
         torch_npu.npu.synchronize(device)
         self._host_records: dict[str, tuple[Capture, dict]] = {}
         self._retained: dict[str, Execution] = {}
@@ -160,6 +166,19 @@ class DeviceTracer:
         threading.Thread(
             target=self._run, name="afd-cam-collector", daemon=True
         ).start()
+
+    def wait_for_stream(self) -> None:
+        """Keep FULL startup reachable during an existing FFN device wait."""
+        assert self.session is not None
+        self._ffn_ready.record(torch_npu.npu.current_stream(self.device))
+        while not self._ffn_ready.query():
+            self.session.start_pending_full()
+            time.sleep(0)
+
+    def read_ffn_control(self, control: torch.Tensor) -> list[int]:
+        self._ffn_control.copy_(control, non_blocking=True)
+        self.wait_for_stream()
+        return self._ffn_control.tolist()
 
     def begin_capture(self) -> None:
         self._dropped_spans = 0

@@ -40,7 +40,6 @@ constexpr static int TILING_KEY_BF16 = 100;
 constexpr static int TILING_KEY_FP16 = 101;
 
 constexpr static int INFO_NUM = 5; // number of valid batch-info fields; also start/end expert per chunk
-constexpr static int SOURCE_TRACE_FIELDS = 2;
 
 constexpr static int LIMIT_MAX_SEQ_LEN_MIN = 1;
 constexpr static int LIMIT_MAX_SEQ_LEN_MAX = 1024 * 256;
@@ -136,7 +135,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
         OPS_LOG_E(nodeName, "xShape dim1 is invalid, must be hiddenSize=%ld, but got dim1=%u.",
             hiddenSize, xShape->GetStorageShape().GetDim(1)), return ge::GRAPH_FAILED);
 
-    int64_t batchInfoNum = INFO_NUM + tpSize + routeExpertNumPerMoe * tpSize + SOURCE_TRACE_FIELDS * tpSize;
+    int64_t batchInfoNum = INFO_NUM + tpSize + routeExpertNumPerMoe * tpSize;
     OPS_ERR_IF(batchInfoShape == nullptr,
         OPS_LOG_E(nodeName, "batchInfoShape is null."), return ge::GRAPH_FAILED);
     OPS_ERR_IF(batchInfoShape->GetStorageShape().GetDimNum() != ONE_DIM,

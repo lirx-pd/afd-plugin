@@ -211,6 +211,27 @@ def test_enabled_worker_creates_tracer_only_for_lightweight(
             assert session.capture.writer.close(1.0)
 
 
+@pytest.mark.parametrize("mode", [None, "LIGHTWEIGHT"])
+def test_non_full_progress_does_not_wait_for_collector_lock(full_session, mode):
+    session, _, _ = full_session
+    if mode is not None:
+        session.prepare(prepare_command(mode=mode), backend_busy=False)
+    returned = threading.Event()
+
+    def advance():
+        session.advance_full()
+        returned.set()
+
+    owner = threading.Thread(target=advance)
+    try:
+        with session._lock:
+            owner.start()
+            assert returned.wait(1.0), "FULL check blocked behind unrelated collection"
+    finally:
+        owner.join(1.0)
+    assert not owner.is_alive()
+
+
 def test_runtime_owner_leaves_static_runner_profiler_separate_across_modes(
     full_session, monkeypatch
 ):

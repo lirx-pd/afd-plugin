@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from afd_plugin.profiling import npu as npu_module
 from afd_plugin.profiling.model import host_span, span
 from afd_plugin.profiling.npu import FFNDeviceWaiter
 from afd_plugin.profiling.session import Capture
@@ -26,6 +28,9 @@ class FakeEvent:
 
     def record(self, stream):
         self.recorded_streams.append(stream)
+
+    def query(self):
+        return bool(self.recorded_streams)
 
 
 class RecordingWriter:
@@ -58,10 +63,12 @@ def tracer(monkeypatch):
     tracer.metadata_slots = [
         tracing.MetadataSlot(
             FakeEvent(),
-            torch.zeros((1, 2), dtype=torch.int64),
             torch.zeros(7, dtype=torch.int64),
         )
     ]
+    tracer.tp_size = 1
+    tracer._free_slots = deque(tracer.slots)
+    tracer._free_metadata = deque(tracer.metadata_slots)
     tracer._host_records = {}
     tracer._retained = {}
     tracer._span_seq = 0
@@ -113,13 +120,13 @@ def test_ffn_control_is_read_only_after_copy_event_completes(
     device_waiter.session = SimpleNamespace(
         advance_full=lambda **kwargs: started_on.append(threading.get_ident())
     )
-    yields: list[float] = []
-    monkeypatch.setattr(tracing.time, "sleep", yields.append)
+    yields: list[bool] = []
+    monkeypatch.setattr(npu_module.os, "sched_yield", lambda: yields.append(True))
 
     assert device_waiter.read_ffn_control(source) == [17, 5, 3]
     assert copied[0][0] is source and copied[0][1] is True
     assert started_on == [threading.get_ident()] * 3
-    assert yields == [0, 0]
+    assert yields == [True, True]
     assert len(ready.recorded_streams) == 1
 
 
@@ -135,7 +142,7 @@ def test_completed_ffn_stream_does_not_pump_or_yield(device_waiter, monkeypatch)
         pytest.fail("completed work must not enter the cooperative wait")
 
     device_waiter.session = SimpleNamespace(advance_full=unexpected)
-    monkeypatch.setattr(tracing.time, "sleep", lambda _: unexpected())
+    monkeypatch.setattr(npu_module.os, "sched_yield", unexpected)
     device_waiter.wait_for_stream()
     assert len(ready.recorded_streams) == 1
 
@@ -151,12 +158,12 @@ def test_ffn_wait_checks_timing_event_after_control_copy(device_waiter, monkeypa
         advance_full=lambda **kwargs: progressed.append(kwargs)
     )
     yields = []
-    monkeypatch.setattr(tracing.time, "sleep", yields.append)
+    monkeypatch.setattr(npu_module.os, "sched_yield", lambda: yields.append(True))
 
     device_waiter.wait_for_stream()
 
     assert progressed == [{"allow_stop": True}]
-    assert yields == [0]
+    assert yields == [True]
 
 
 def test_full_dsv4_dbo_step_fits_before_device_events_complete(tracer):
@@ -164,6 +171,7 @@ def test_full_dsv4_dbo_step_fits_before_device_events_complete(tracer):
         tracing.EventSlot(FakeEvent(), FakeEvent())
         for _ in range(tracing.SPAN_CAPACITY)
     ]
+    tracer._free_slots = deque(tracer.slots)
     capture = _capture()
     kinds = (
         "ATTENTION",
@@ -250,7 +258,6 @@ def test_terminal_capture_cannot_reuse_or_modify_event_slots(tracer, terminal):
     old_event = tracing.EventSlot(FakeEvent(), FakeEvent(), capture=previous)
     old_metadata = tracing.MetadataSlot(
         FakeEvent(),
-        torch.zeros((1, 2), dtype=torch.int64),
         torch.zeros(7, dtype=torch.int64),
         capture=previous,
     )
@@ -262,7 +269,7 @@ def test_terminal_capture_cannot_reuse_or_modify_event_slots(tracer, terminal):
         tracer._finalized_generation = capture.generation
     with span(execution, "FFN_COMPUTE"), host_span(execution, "HOST_RECEIVE"):
         pass
-    tracer.defer_metadata(execution, torch.ones((1, 2)), torch.ones(7))
+    tracer.defer_metadata(execution, torch.ones(7))
     assert not tracer.retain_execution(execution)
     assert old_event.capture is previous and old_metadata.capture is previous
     assert tracer.slots[1].capture is None
@@ -273,7 +280,6 @@ def test_terminal_capture_cannot_reuse_or_modify_event_slots(tracer, terminal):
         assert not slot.begin.recorded_streams and not slot.end.recorded_streams
     for slot in tracer.metadata_slots:
         assert not slot.ready.recorded_streams
-        assert torch.count_nonzero(slot.trace) == 0
         assert torch.count_nonzero(slot.batch) == 0
 
 
@@ -302,7 +308,6 @@ def test_admitted_work_can_finish_metadata_and_spans_after_stop(tracer):
         pass
     tracer.defer_metadata(
         execution,
-        torch.ones((1, 2), dtype=torch.int64),
         torch.ones(7, dtype=torch.int64),
     )
     assert tracer.slots[0].ended
@@ -329,6 +334,32 @@ def test_completed_receive_reuses_observer_without_capture_slot_ownership(tracer
     assert tracer.pending_count() == 0
 
 
+@pytest.mark.parametrize("base", [0, 1, -1])
+def test_metadata_snapshot_uses_native_source_ranks_without_wire_identity(tracer, base):
+    capture = _capture()
+    execution = tracing.Execution(tracer, capture, "F0:work:1")
+    prefix = [2, base, 3, 0, 0, 0, 0]
+    source = torch.tensor(prefix, dtype=torch.int64)
+    tracer.source_workers = ["A0"]
+    tracer._clock = lambda _: None
+    tracer.reader = SimpleNamespace(read_raw=lambda _: 1)
+    tracer.defer_metadata(execution, source)
+    assert tracer.metadata_slots[0].tensor is source
+    source.fill_(-1)
+    if base:
+        with pytest.raises(ValueError, match="source rank outside"):
+            tracer.collect(capture)
+        return
+    tracer.collect(capture)
+    assert tracer.metadata_slots[0].tensor is None
+    record = capture.writer.records[0]
+    assert record["batch_info"] == prefix
+    assert record["source_call_ids"] == []
+    assert record["source_workers"] == ["A0"]
+    assert record["source_relation"] == "temporal_source_candidate"
+    assert len(tracer._free_metadata) == 1
+
+
 def test_ffn_stop_waits_for_previous_compute_fence(device_waiter, monkeypatch):
     queries = iter([False, False, True])
     device_waiter._ready = SimpleNamespace(
@@ -340,7 +371,7 @@ def test_ffn_stop_waits_for_previous_compute_fence(device_waiter, monkeypatch):
     device_waiter.session = SimpleNamespace(
         advance_full=lambda **kwargs: observed.append(kwargs)
     )
-    monkeypatch.setattr(tracing.time, "sleep", lambda _: None)
+    monkeypatch.setattr(npu_module.os, "sched_yield", lambda: None)
     device_waiter.wait_for_stream()
     assert observed == [{"allow_stop": False}, {"allow_stop": True}]
 
@@ -365,3 +396,24 @@ def test_receive_timestamp_failure_closes_capture_and_releases_work(tracer, fail
     assert capture.error and not capture.accepting
     assert tracer._dropped_spans == 1
     assert tracer.pending_count() == 0 and not capture.writer.records
+
+
+def test_full_event_pool_drops_without_waiting_and_reclaims_each_slot_once(tracer):
+    capture = _capture()
+    execution = tracing.Execution(tracer, capture, "F0:work:1")
+    tracer._clock = lambda _: None
+    tracer._range = None
+    tracer.reader = SimpleNamespace(read_raw=lambda event: 1)
+    for _ in range(3):
+        with span(execution, "FFN_COMPUTE"):
+            pass
+        with span(execution, "FFN_COMPUTE"):
+            pass
+        assert tracer.pending_count() == 1
+        assert len(tracer._free_slots) == 0
+        tracer.collect(capture)
+        tracer.collect(capture)
+        assert tracer.pending_count() == 0
+        assert list(tracer._free_slots) == tracer.slots
+    assert tracer._dropped_spans == 3
+    assert len(capture.writer.records) == 3

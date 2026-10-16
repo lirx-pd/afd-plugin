@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -85,7 +86,8 @@ class FFNDeviceWaiter:
         # TorchNPU may still report the timing Event pending after copy completion.
         while not self._ready.query() or not self.end.query():
             self.session.advance_full(allow_stop=self.begin.query())
-            time.sleep(0)
+            # Release the GIL without adding a timer delay to every receive.
+            os.sched_yield()
 
     def read_ffn_control(self, control: torch.Tensor) -> list[int]:
         self._control.copy_(control, non_blocking=True)

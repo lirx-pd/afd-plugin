@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Independent compact-prefix and profiling-tail layout contracts."""
+"""Profiling uses the compact metadata returned by unmodified CAM operators."""
 
 from __future__ import annotations
 
@@ -13,8 +13,6 @@ import pytest
 
 from afd_plugin.profiling import (
     BATCH_INFO_FIELDS,
-    SOURCE_TRACE_FIELDS,
-    WIRE_PROTOCOL_VERSION,
     batch_info_prefix_size,
 )
 
@@ -24,7 +22,7 @@ from afd_plugin.profiling import (
 )
 def test_compact_prefix_contract(tp_size, experts, prefix):
     assert batch_info_prefix_size(tp_size, experts) == prefix
-    assert (BATCH_INFO_FIELDS, SOURCE_TRACE_FIELDS, WIRE_PROTOCOL_VERSION) == (5, 2, 1)
+    assert BATCH_INFO_FIELDS == 5
 
 
 def test_layout_import_needs_no_device_runtime():
@@ -46,7 +44,7 @@ def test_layout_import_needs_no_device_runtime():
 
 
 @pytest.mark.parametrize("ready", [True, False])
-def test_tracer_host_slots_match_prefix_and_tail(monkeypatch, ready):
+def test_tracer_host_slots_match_native_metadata(monkeypatch, ready):
     torch = pytest.importorskip("torch")
     torch_npu = pytest.importorskip("torch_npu")
     from afd_plugin.profiling import tracing
@@ -79,4 +77,3 @@ def test_tracer_host_slots_match_prefix_and_tail(monkeypatch, ready):
     tracer = tracing.DeviceTracer(torch.device("cpu"), "ffn", ["a0", "a1"], 2, 3)
 
     assert all(slot.batch.shape == (13,) for slot in tracer.metadata_slots)
-    assert all(slot.trace.shape == (2, 2) for slot in tracer.metadata_slots)

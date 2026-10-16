@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -13,11 +14,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch_npu
 
-from afd_plugin.profiling import (
-    SOURCE_TRACE_FIELDS,
-    WIRE_PROTOCOL_VERSION,
-    batch_info_prefix_size,
-)
+from afd_plugin.profiling import batch_info_prefix_size
 from afd_plugin.profiling.npu import EventTimestampReader
 
 if TYPE_CHECKING:
@@ -45,11 +42,10 @@ class EventSlot:
 @dataclass(slots=True)
 class MetadataSlot:
     ready: torch_npu.npu.Event
-    trace: torch.Tensor
     batch: torch.Tensor
     capture: Capture | None = None
     exec_ref: str = ""
-    tensors: tuple[torch.Tensor, torch.Tensor] | None = None
+    tensor: torch.Tensor | None = None
     exported: bool = False
     armed: bool = False
 
@@ -109,6 +105,7 @@ class DeviceTracer:
         self.device = device
         self.worker_id = worker_id
         self.source_workers = source_workers
+        self.tp_size = tp_size
         self.clock_domain = f"{worker_id}:device"
         self.lock = threading.Lock()
         self.reader = EventTimestampReader()
@@ -123,14 +120,17 @@ class DeviceTracer:
         batch_size = batch_info_prefix_size(tp_size, expert_per_rank)
         self.metadata_slots = [
             MetadataSlot(
-                torch_npu.npu.Event(enable_timing=True),
+                torch_npu.npu.Event(),
                 torch.empty(
-                    (tp_size, SOURCE_TRACE_FIELDS), dtype=torch.int64, pin_memory=True
+                    (batch_size,),
+                    dtype=torch.int64,
+                    pin_memory=True,
                 ),
-                torch.empty((batch_size,), dtype=torch.int64, pin_memory=True),
             )
             for _ in range(METADATA_CAPACITY)
         ]
+        self._free_slots = deque(self.slots)
+        self._free_metadata = deque(self.metadata_slots)
         self.anchor = torch_npu.npu.Event(enable_timing=True)
         self.anchor_stream = torch_npu.npu.Stream(device=device)
         # PREPARE must not wait for an unrelated, possibly blocked CAM receive.
@@ -251,10 +251,10 @@ class DeviceTracer:
                 not capture.admits() and execution.exec_ref not in self._retained
             ):
                 return nullcontext()
-            slot = next((item for item in self.slots if item.capture is None), None)
-            if slot is None:
+            if not self._free_slots:
                 self._dropped_spans += 1
                 return nullcontext()
+            slot = self._free_slots.popleft()
             self._span_seq += 1
             stream = torch_npu.npu.current_stream(self.device)
             slot.capture = capture
@@ -331,9 +331,7 @@ class DeviceTracer:
             self._host_records[record["span_id"]] = (capture, record)
             return HostSpan(execution, record)
 
-    def defer_metadata(
-        self, execution: Execution, trace: torch.Tensor, batch: torch.Tensor
-    ) -> None:
+    def defer_metadata(self, execution: Execution, batch: torch.Tensor) -> None:
         with self.lock:
             if self.finalized(execution.capture) or (
                 not execution.capture.admits()
@@ -341,19 +339,16 @@ class DeviceTracer:
             ):
                 self._dropped_metadata += 1
                 return
-            slot = next(
-                (item for item in self.metadata_slots if item.capture is None), None
-            )
-            if slot is None:
+            if not self._free_metadata:
                 self._dropped_metadata += 1
                 return
+            slot = self._free_metadata.popleft()
             slot.capture = execution.capture
             slot.exec_ref = execution.exec_ref
-            slot.tensors = (trace, batch)
+            slot.tensor = batch
             slot.exported = False
             slot.armed = False
         # Preserve producer-stream ordering and tensor ownership through completion.
-        slot.trace.copy_(trace, non_blocking=True)
         slot.batch.copy_(batch, non_blocking=True)
         slot.ready.record(torch_npu.npu.current_stream(self.device))
         with self.lock:
@@ -362,8 +357,10 @@ class DeviceTracer:
     def pending_count(self) -> int:
         with self.lock:
             return (
-                sum(slot.capture is not None for slot in self.slots)
-                + sum(slot.capture is not None for slot in self.metadata_slots)
+                len(self.slots)
+                - len(self._free_slots)
+                + len(self.metadata_slots)
+                - len(self._free_metadata)
                 + int(self._anchor_pending)
                 + len(self._host_records)
                 + len(self._retained)
@@ -436,41 +433,33 @@ class DeviceTracer:
             with self.lock:
                 slot.capture = None
                 slot.record = None
+                self._free_slots.append(slot)
         for metadata_slot in metadata_slots:
-            if self.reader.read_raw(metadata_slot.ready) is None:
+            if not metadata_slot.ready.query():
                 continue
             if not metadata_slot.exported:
-                trace, batch = (
-                    metadata_slot.trace.tolist(),
-                    metadata_slot.batch.tolist(),
-                )
+                batch = metadata_slot.batch.tolist()
                 assert metadata_slot.capture is not None
-                if any(
-                    version != WIRE_PROTOCOL_VERSION or sequence <= 0
-                    for version, sequence in trace
-                ):
-                    metadata_slot.capture.error = "invalid CAM profiling wire identity"
-                    metadata_slot.capture.accepting = False
-                else:
-                    base = batch[1]
-                    if not 0 <= base <= len(self.source_workers) - len(trace):
-                        raise ValueError("CAM source rank outside profiling roster")
-                    metadata_slot.capture.writer.submit(
-                        {
-                            "record_type": "FFN_WORK",
-                            "ffn_work_id": metadata_slot.exec_ref,
-                            "layer_idx": batch[2],
-                            "source_call_ids": [
-                                f"{self.source_workers[base + index]}:call:{sequence}"
-                                for index, (_, sequence) in enumerate(trace)
-                            ],
-                            "source_relation": "source_candidate",
-                            "batch_info": batch,
-                        }
-                    )
+                base = batch[1]
+                if not 0 <= base <= len(self.source_workers) - self.tp_size:
+                    raise ValueError("CAM source rank outside profiling roster")
+                metadata_slot.capture.writer.submit(
+                    {
+                        "record_type": "FFN_WORK",
+                        "ffn_work_id": metadata_slot.exec_ref,
+                        "layer_idx": batch[2],
+                        "source_call_ids": [],
+                        "source_workers": self.source_workers[
+                            base : base + self.tp_size
+                        ],
+                        "source_relation": "temporal_source_candidate",
+                        "batch_info": batch,
+                    }
+                )
             with self.lock:
                 metadata_slot.capture = None
-                metadata_slot.tensors = None
+                metadata_slot.tensor = None
+                self._free_metadata.append(metadata_slot)
 
     def finalized(self, capture: Capture) -> bool:
         return self._finalized_generation == capture.generation

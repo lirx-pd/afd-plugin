@@ -369,9 +369,7 @@ def unified_buffer_requirements(config: HarnessConfig) -> dict[str, int]:
     local_experts = config.experts_per_rank
     tp = config.tp_size
     hidden = config.hidden_size
-    metadata_fields = BATCH_INFO_FIELDS + tp + local_experts * tp
-    metadata_bytes = align(INT64_BYTES * metadata_fields)
-    recv_metadata_bytes = align(INT64_BYTES * (metadata_fields + 2 * tp))
+    metadata_bytes = align(INT64_BYTES * (BATCH_INFO_FIELDS + tp + local_experts * tp))
     statistics_bytes = align(INT32_BYTES * (owners + experts) * MAX_AIV_COUNT)
     send_prefix = (
         IDS_CACHE_BYTES
@@ -402,7 +400,7 @@ def unified_buffer_requirements(config: HarnessConfig) -> dict[str, int]:
     )
     recv_buffers = (
         align(INT64_BYTES * BATCH_INFO_FIELDS)
-        + recv_metadata_bytes
+        + metadata_bytes
         + align(INT64_BYTES * local_experts)
         + align(INT32_BYTES * local_experts)
         + align(INT32_BYTES * local_experts)
@@ -1091,10 +1089,9 @@ class NativeHarness:
                         self.group_name,
                     ),
                 )
-                prefix_size = (
-                    5 + config.tp_size + config.experts_per_rank * config.tp_size
-                )
-                if tuple(info.shape) != (prefix_size + 2 * config.tp_size,):
+                if tuple(info.shape) != (
+                    5 + config.tp_size + config.experts_per_rank * config.tp_size,
+                ):
                     raise AssertionError(
                         f"Invalid compact metadata shape {tuple(info.shape)}"
                     )
@@ -1112,7 +1109,7 @@ class NativeHarness:
                 plan = pending.pop(key)
                 # Exact routing metadata is also a safety prerequisite for
                 # combine_send; reject it before feeding malformed DMA offsets.
-                validate_metadata(plan, layer_id, raw_info[:prefix_size], raw_counts)
+                validate_metadata(plan, layer_id, raw_info, raw_counts)
                 next_expert[tp_base] = end + 1
                 count = len(plan.rows)
                 expected_dtype = torch.int8 if config.dynamic_quant else self.dtype

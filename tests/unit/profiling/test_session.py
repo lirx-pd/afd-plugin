@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import uuid
 from types import SimpleNamespace
@@ -14,6 +15,37 @@ from afd_plugin.profiling import session as session_module
 from afd_plugin.profiling import storage
 from afd_plugin.profiling.session import WorkerSession
 from afd_plugin.profiling.worker import CAMProfileWorkerMixin
+
+
+@pytest.mark.parametrize("pending", [0, 1])
+def test_retired_collector_skips_idle_and_keeps_draining_owned_resources(
+    monkeypatch, pending
+):
+    collections = []
+    capture = SimpleNamespace(mode="LIGHTWEIGHT")
+    session = WorkerSession.__new__(WorkerSession)
+    session.capture = capture
+    session.tracer = SimpleNamespace(
+        finalized=lambda _: True,
+        pending_count=lambda: pending,
+        collect=lambda owner: collections.append(owner),
+    )
+    session.tick = lambda: None
+    sleeps = iter((None,))
+
+    def sleep(_):
+        if next(sleeps, True):
+            raise SystemExit
+
+    monkeypatch.setattr(session_module, "time", SimpleNamespace(sleep=sleep))
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        SimpleNamespace(npu=SimpleNamespace(set_device=lambda _: None)),
+    )
+    with pytest.raises(SystemExit):
+        session._run("cpu")
+    assert collections == ([capture] if pending else [])
 
 
 class FakeClock:

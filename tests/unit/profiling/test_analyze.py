@@ -485,3 +485,115 @@ def test_unknown_schema_and_overlapping_maps_are_rejected(records):
     records.append(dict(records[1]))
     with pytest.raises(ValueError, match="overlapping CLOCK_MAP"):
         reconstruct(records)
+
+
+@pytest.fixture
+def temporal_records(records):
+    for record in records:
+        if record["record_type"] == "SOURCE_CALL":
+            record["worker_id"] = "A0"
+        elif record["record_type"] == "FFN_WORK":
+            record.update(
+                source_call_ids=[],
+                source_workers=["A0"],
+                source_relation="temporal_source_candidate",
+            )
+    records.extend(
+        [
+            _span("send0", "A0", "call0", "DISPATCH_SEND", 10_000, 20_000),
+            _span("combine0", "A0", "call0", "COMBINE_RECV", 80_000, 95_000),
+            _span("send1", "A0", "call1", "DISPATCH_SEND", 100_000, 110_000),
+            _span("combine1", "A0", "call1", "COMBINE_RECV", 160_000, 170_000),
+            _span("recv0", "F0", "work0", "DISPATCH_RECV", 0, 30_000),
+            _span("recv1", "F0", "work1", "DISPATCH_RECV", 70_000, 80_000),
+            _span("recv2", "F1", "work2", "DISPATCH_RECV", 0, 35_000),
+            _span("recv3", "F0", "work3", "DISPATCH_RECV", 110_000, 130_000),
+        ]
+    )
+    return records
+
+
+def test_native_metadata_correlates_chunks_by_rank_layer_and_time(temporal_records):
+    result = reconstruct(temporal_records)
+    assert result["data_quality"] == "COMPLETE", result["errors"]
+    assert {
+        key: value["source_call_ids"] for key, value in result["ffn_works"].items()
+    } == {
+        "work0": ["call0"],
+        "work1": ["call0"],
+        "work2": ["call0"],
+        "work3": ["call1"],
+    }
+    assert all(
+        work["source_relation"] == "temporal_source_candidate"
+        for work in result["ffn_works"].values()
+    )
+    assert [row["duration_ns"] for row in result["ffn_compute_by_worker"]] == [
+        110_000,
+        70_000,
+    ]
+    random.Random(29).shuffle(temporal_records)
+    assert reconstruct(temporal_records) == result
+
+
+def test_temporal_correlation_keeps_ambiguous_candidates(temporal_records):
+    send1 = next(row for row in temporal_records if row.get("span_id") == "send1")
+    send1.update(
+        device_begin_ns=DEVICE_ORIGIN_NS + 25_000,
+        device_end_ns=DEVICE_ORIGIN_NS + 28_000,
+    )
+    result = reconstruct(temporal_records)
+    assert result["data_quality"] == "PARTIAL"
+    assert result["ffn_works"]["work0"]["source_call_ids"] == ["call0", "call1"]
+    assert any("2 source candidates for A0" in error for error in result["errors"])
+
+
+@pytest.mark.parametrize("missing", ["clock", "combine", "worker", "layer"])
+def test_temporal_correlation_never_fills_missing_evidence(temporal_records, missing):
+    if missing == "clock":
+        temporal_records = [
+            row
+            for row in temporal_records
+            if not (
+                row["record_type"] == "CLOCK_MAP" and row["clock_domain"] == "F0:device"
+            )
+        ]
+    elif missing == "combine":
+        temporal_records = [
+            row for row in temporal_records if row.get("span_id") != "combine0"
+        ]
+    else:
+        call = next(
+            row for row in temporal_records if row.get("source_call_id") == "call0"
+        )
+        call["worker_id" if missing == "worker" else "layer_idx"] = (
+            "other" if missing == "worker" else 8
+        )
+    result = reconstruct(temporal_records)
+    assert result["data_quality"] == "PARTIAL"
+    assert result["ffn_works"]["work0"]["source_call_ids"] == []
+    assert any(
+        "correlation" in error or "0 source candidates" in error
+        for error in result["errors"]
+    )
+
+
+def test_temporal_correlation_includes_clock_uncertainty(temporal_records):
+    receive = next(row for row in temporal_records if row.get("span_id") == "recv0")
+    receive["device_end_ns"] = DEVICE_ORIGIN_NS + 95_500
+    result = reconstruct(temporal_records)
+    assert result["ffn_works"]["work0"]["source_call_ids"] == ["call0"]
+    for row in temporal_records:
+        if row["record_type"] == "CLOCK_MAP":
+            row["uncertainty_ns"] = 0
+    result = reconstruct(temporal_records)
+    assert result["ffn_works"]["work0"]["source_call_ids"] == []
+    assert result["data_quality"] == "PARTIAL"
+
+
+@pytest.mark.parametrize("workers", [None, [], ["A0", "A0"], [123]])
+def test_temporal_correlation_rejects_invalid_source_roster(temporal_records, workers):
+    work = next(row for row in temporal_records if row.get("ffn_work_id") == "work0")
+    work["source_workers"] = workers
+    with pytest.raises(ValueError, match="source_workers"):
+        reconstruct(temporal_records)

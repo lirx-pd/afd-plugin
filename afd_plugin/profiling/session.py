@@ -116,6 +116,7 @@ class WorkerSession:
                     and capture.mode == "LIGHTWEIGHT"
                     and tracer is not None
                     and tracer.finalized(capture)
+                    and tracer.pending_count()
                 ):
                     tracer.collect(capture)
             except Exception as exc:
@@ -319,6 +320,9 @@ class WorkerSession:
 
     def advance_full(self, *, allow_stop: bool = True) -> None:
         """Advance native lifecycle on its model thread, outside the session lock."""
+        capture = self.capture
+        if capture is None or capture.full is None:
+            return
         with self._lock:
             capture = self.capture
             if capture is None or capture.full is None:

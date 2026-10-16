@@ -49,8 +49,8 @@ class Tracer:
         self.spans.append((execution.exec_ref, "DISPATCH_RECV"))
         return True
 
-    def defer_metadata(self, execution, source_trace, compact_metadata):
-        self.deferred.append((execution, source_trace, compact_metadata))
+    def defer_metadata(self, execution, batch_info):
+        self.deferred.append((execution, batch_info))
 
 
 @pytest.fixture
@@ -100,6 +100,7 @@ def connector(monkeypatch, *, role, enabled=True):
 def profile_session(tracer):
     return SimpleNamespace(
         tracer=tracer,
+        capture=SimpleNamespace(admits=lambda: tracer.active),
         advance_full=Mock(),
         device_waiter=SimpleNamespace(
             read_ffn_control=lambda control: control.tolist(),
@@ -131,12 +132,7 @@ def dispatch(connector, *, stage=0):
 
 def recv_outputs(connector):
     prefix_size = 5 + connector.tp_size * (1 + connector.expert_per_rank)
-    batch_info = torch.cat(
-        (
-            torch.arange(prefix_size, dtype=torch.int64),
-            torch.tensor([1, (1 << 32) + 7, 1, (1 << 32) + 9]),
-        )
-    )
+    batch_info = torch.arange(prefix_size, dtype=torch.int64)
     return (
         torch.empty((16, 16)),
         torch.ones((16,)),
@@ -145,26 +141,26 @@ def recv_outputs(connector):
     )
 
 
-def test_dispatch_sequence_survives_idle_and_new_session_with_original_owner(
+def test_local_call_identity_skips_idle_and_never_changes_native_comm_id(
     monkeypatch, ops
 ):
     attn = connector(monkeypatch, role="attention")
     attn._profile_sequence = 1 << 32
     without_session = dispatch(attn)
     first_tracer = Tracer()
-    attn.profile_session = SimpleNamespace(tracer=first_tracer)
+    attn.profile_session = profile_session(first_tracer)
     first_capture = dispatch(attn, stage=1)
     first_tracer.active = False
     idle = dispatch(attn)
     second_tracer = Tracer()
-    attn.profile_session = SimpleNamespace(tracer=second_tracer)
+    attn.profile_session = profile_session(second_tracer)
     second_capture = dispatch(attn)
 
     contexts = [without_session, first_capture, idle, second_capture]
-    expected = [(1 << 32) + offset for offset in range(1, 5)]
+    expected = [0, (1 << 32) + 1, 0, (1 << 32) + 2]
     assert [context.dispatch_seq for context in contexts] == expected
     assert [call.args[3] for call in ops.afd_async_dispatch_send.call_args_list] == (
-        expected
+        [attn.comm_id] * 4
     )
     assert without_session.profile is None
     assert idle.profile is None
@@ -182,7 +178,7 @@ def test_dispatch_sequence_survives_idle_and_new_session_with_original_owner(
     assert ops.afd_async_combine_recv.call_args.args[4] == 0
 
 
-def test_recv_defers_tail_views_and_preserves_full_combine_metadata(monkeypatch, ops):
+def test_recv_defers_whole_batch_and_preserves_full_combine_metadata(monkeypatch, ops):
     ffn = connector(monkeypatch, role="ffn")
     tracer = Tracer()
     ffn.profile_session = profile_session(tracer)
@@ -193,17 +189,10 @@ def test_recv_defers_tail_views_and_preserves_full_combine_metadata(monkeypatch,
 
     received = ffn.recv_attn_output(batch_size=2)
     states = received.context.states
-    execution, source_trace, prefix = tracer.deferred.pop()
+    execution, deferred_batch = tracer.deferred.pop()
 
     assert execution is received.context.profile
-    assert states.source_trace is source_trace
-    assert source_trace.shape == (ffn.tp_size, 2)
-    assert source_trace.tolist() == [[1, (1 << 32) + 7], [1, (1 << 32) + 9]]
-    assert source_trace.untyped_storage().data_ptr() == batch_info.data_ptr()
-    assert prefix.untyped_storage().data_ptr() == batch_info.data_ptr()
-    assert source_trace.storage_offset() == len(prefix)
-    assert len(prefix) == 5 + ffn.tp_size * (1 + ffn.expert_per_rank)
-    assert prefix.storage_offset() == 0
+    assert deferred_batch is batch_info
     assert states.token_nums_rankid_layeridx is batch_info
 
     ffn.send_ffn_output(received.hidden_states, received.context)
@@ -264,7 +253,6 @@ def test_no_capture_skips_metadata_views_and_keeps_full_metadata(
     ffn.send_ffn_output(received.hidden_states, received.context)
 
     assert received.context.profile is None
-    assert received.context.states.source_trace is None
     assert not tracer.deferred
     assert ops.afd_async_dispatch_recv.call_args.args[2] == 0
     assert ops.afd_async_combine_send.call_args.args[2] is batch_info

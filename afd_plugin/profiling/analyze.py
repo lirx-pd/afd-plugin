@@ -123,9 +123,15 @@ def _validate(record: dict) -> None:
     elif kind == "SOURCE_CALL":
         _integer(record, "layer_idx")
         _references(record, "fragment_ids")
+        if "worker_id" in record:
+            _text(record, "worker_id")
     elif kind == "FFN_WORK":
         _integer(record, "layer_idx")
         _references(record, "source_call_ids")
+        if record.get("source_relation") == "temporal_source_candidate":
+            _references(record, "source_workers")
+            if not record["source_workers"]:
+                raise ValueError("source_workers must not be empty")
     else:
         for field in ("worker_id", "exec_ref", "kind", "clock_domain", "producer_id"):
             _text(record, field)
@@ -233,6 +239,67 @@ def _union_duration(intervals: list[tuple[int, int]]) -> int:
     return total
 
 
+def _correlate_work(
+    works: dict[str, dict],
+    calls: dict[str, dict],
+    spans: dict[str, dict],
+    execution_spans: dict[str, list[str]],
+    errors: list[str],
+) -> None:
+    """Use rank, layer and causal time bounds; never pair calls by list order."""
+    # shortcut: temporal candidates; add a side channel if exact IDs are required.
+    windows = defaultdict(list)
+    for call_id, call in calls.items():
+        if "worker_id" not in call:
+            continue
+        bounds = {
+            spans[span_id]["kind"]: spans[span_id]["timing"]
+            for span_id in execution_spans[call_id]
+            if spans[span_id]["complete"] and spans[span_id]["timing"]["aligned"]
+        }
+        if "DISPATCH_SEND" not in bounds or "COMBINE_RECV" not in bounds:
+            continue
+        begin, end = bounds["DISPATCH_SEND"], bounds["COMBINE_RECV"]
+        windows[(call["worker_id"], call["layer_idx"])].append(
+            (
+                begin["relative_begin_us"] - begin["uncertainty_ns"] / NS_PER_US,
+                end["relative_end_us"] + end["uncertainty_ns"] / NS_PER_US,
+                call_id,
+            )
+        )
+    for work_id, work in works.items():
+        if work.get("source_relation") != "temporal_source_candidate":
+            continue
+        work["source_call_ids"] = []
+        receives = [
+            spans[span_id]["timing"]
+            for span_id in execution_spans[work_id]
+            if spans[span_id]["kind"] == "DISPATCH_RECV"
+            and spans[span_id]["complete"]
+            and spans[span_id]["timing"]["aligned"]
+        ]
+        if len(receives) != 1:
+            errors.append(
+                f"FFN_WORK {work_id}: missing aligned receive for correlation"
+            )
+            continue
+        receive = receives[0]
+        completed = receive["relative_end_us"]
+        uncertainty = receive["uncertainty_ns"] / NS_PER_US
+        for worker in work["source_workers"]:
+            candidates = sorted(
+                call_id
+                for begin, end, call_id in windows[(worker, work["layer_idx"])]
+                if begin <= completed + uncertainty and end >= completed - uncertainty
+            )
+            work["source_call_ids"].extend(candidates)
+            if len(candidates) != 1:
+                errors.append(
+                    f"FFN_WORK {work_id}: {len(candidates)} source candidates "
+                    f"for {worker}"
+                )
+
+
 def reconstruct(records: Iterable[dict]) -> dict:
     tables: dict[str, dict[str, dict]] = {kind: {} for kind in ID_FIELDS}
     headers = {}
@@ -328,6 +395,7 @@ def reconstruct(records: Iterable[dict]) -> dict:
                 (span["device_begin_ns"], span["device_end_ns"]),
             )
 
+    _correlate_work(works, calls, spans, execution_spans, errors)
     call_works = defaultdict(list)
     for work_id, work in sorted(works.items()):
         work["span_ids"] = execution_spans[work_id]

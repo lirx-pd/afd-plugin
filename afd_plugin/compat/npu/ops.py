@@ -8,8 +8,6 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
-from afd_plugin.profiling import WIRE_PROTOCOL_VERSION
-
 AFD_ASCEND_OPS_NAMESPACE = "afd_ascend"
 AFD_ASCEND_VENDOR_NAME = "afd-plugin"
 AFD_CUST_OPAPI_ENV = "AFD_CUST_OPAPI_LIB_PATH"
@@ -122,27 +120,6 @@ def ensure_cam_async_ops_available() -> None:
         ) from exc
 
 
-@lru_cache(maxsize=1)
-def ensure_cam_async_profile_ops_available() -> None:
-    """Require binding wire version 1 and loadable base ACLNN symbols."""
-    ensure_cam_async_ops_available()
-    import torch
-
-    try:
-        version = torch.ops.afd_ascend.afd_async_profile_protocol_version()
-    except (AttributeError, RuntimeError) as exc:
-        raise RuntimeError(
-            "Async CAM profiling requires a wire-version-1 binding and "
-            "its matching CANN operator package. Rebuild both with "
-            "AFD_BUILD_ASCEND_OPS=1."
-        ) from exc
-    if version != WIRE_PROTOCOL_VERSION:
-        raise RuntimeError(
-            f"Async CAM profiling requires wire version {WIRE_PROTOCOL_VERSION}, "
-            f"got {version}."
-        )
-
-
 __all__ = [
     "AFD_ASCEND_OPS_NAMESPACE",
     "AFD_ASCEND_VENDOR_NAME",
@@ -154,7 +131,6 @@ __all__ = [
     "CAM_OP_NAMESPACE",
     "ensure_afd_ascend_ops_loaded",
     "ensure_cam_async_ops_available",
-    "ensure_cam_async_profile_ops_available",
     "ensure_cam_p2p_ops_available",
     "get_afd_cann_vendor_path",
     "get_afd_cust_opapi_path",

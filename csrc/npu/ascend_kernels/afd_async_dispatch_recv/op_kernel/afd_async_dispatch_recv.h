@@ -21,8 +21,6 @@ namespace MoeDistributeDispatchImpl {
 constexpr uint64_t CAM_MAX_RANK_SIZE = 384;  // max NPUs supported by the Cam comm library
 constexpr uint32_t UB_ALIGN = 32;            // UB aligned to 32 bytes
 constexpr uint32_t BATCH_INFO_VAL_NUM = 5;   // number of batch-related info fields
-constexpr uint32_t WIRE_HEADER_FIELDS = 8;
-constexpr uint32_t SOURCE_TRACE_FIELDS = 2;
 constexpr uint32_t INFO_NUM = 5;             // number of valid batch-info fields; also start/end expert per chunk
 constexpr uint32_t DOUBLE = 2;
 
@@ -184,7 +182,7 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::Init(
     batchInfoTensor_ = ubBuffer_.GetWithOffset<int64_t>(bufSize / sizeof(int64_t), bufOffset);
     bufOffset += bufSize;
 
-    bufSize = MathCeil(sizeof(int64_t) * (INFO_NUM + tpSize_ + expertNumPerMoe_ * tpSize_ + SOURCE_TRACE_FIELDS * tpSize_), UB_ALIGN);
+    bufSize = MathCeil(sizeof(int64_t) * (INFO_NUM + tpSize_ + expertNumPerMoe_ *  tpSize_), UB_ALIGN);
     tpBatchInfoTensor_ = ubBuffer_.GetWithOffset<int64_t>(bufSize / sizeof(int64_t), bufOffset);
     bufOffset += bufSize;
 
@@ -326,7 +324,7 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::DispatchRecv()
 
         SyncFunc<HardEvent::S_MTE3>();
         DataCopyPad(batchInfoGMTensor_, tpBatchInfoTensor_,
-            {1U, (uint32_t)(sizeof(int64_t) * (INFO_NUM + tpSize_ + expertNumPerMoe_ * tpSize_ + SOURCE_TRACE_FIELDS * tpSize_)), 0U, 0U, 0U});
+            {1U, (uint32_t)(sizeof(int64_t) * (INFO_NUM + tpSize_ + expertNumPerMoe_ * tpSize_)), 0U, 0U, 0U});
         SyncFunc<HardEvent::MTE3_S>();
 
         for (uint32_t i = 0; i < expertNumPerMoe_; ++i) {
@@ -381,14 +379,10 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::DispatchRecvRo
     GlobalTensor<int64_t> dstBatchInfoGMTensor;
     dstBatchInfoGMTensor.SetGlobalBuffer((__gm__ int64_t *)(dstGM + attnWorkspaceOffset));
     DataCopyPad(batchInfoTensor_, dstBatchInfoGMTensor,
-        {1U, (uint32_t)(sizeof(int64_t) * WIRE_HEADER_FIELDS), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+        {1U, (uint32_t)(sizeof(int64_t) * BATCH_INFO_VAL_NUM), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
     SyncFunc<HardEvent::MTE2_S>();
     SyncFunc<HardEvent::S_MTE2>();
     tpBatchInfoTensor_(INFO_NUM + tpIndex) = batchInfoTensor_(MOE_PRE_TOKEN_NUM_INDEX);
-    // Snapshot before ClearFlags releases this source slot; copy out with metadata.
-    uint32_t traceOffset = INFO_NUM + tpSize_ + expertNumPerMoe_ * tpSize_ + SOURCE_TRACE_FIELDS * tpIndex;
-    tpBatchInfoTensor_(traceOffset) = batchInfoTensor_(BATCH_INFO_VAL_NUM + 1);
-    tpBatchInfoTensor_(traceOffset + 1) = batchInfoTensor_(BATCH_INFO_VAL_NUM);
 
     // reload expertRecvTokenNumTensor_
     GlobalTensor<int32_t> dstExpertRecvTokenNumGMTensor;
@@ -583,12 +577,12 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::ClearFlags(uin
     GlobalTensor<int64_t> dstBatchInfoGMTensor;
     dstBatchInfoGMTensor.SetGlobalBuffer((__gm__ int64_t *)(dstGM + attnWorkspaceOffset));
 
-    for (uint32_t i = 0; i < WIRE_HEADER_FIELDS; ++i) {
+    for (uint32_t i = 0; i < BATCH_INFO_VAL_NUM; ++i) {
         batchInfoTensor_(i) = 0;
     }
     SyncFunc<HardEvent::S_MTE3>();
     DataCopyPad(dstBatchInfoGMTensor, batchInfoTensor_,
-        {1U, sizeof(int64_t) * WIRE_HEADER_FIELDS, 0U, 0U, 0U});
+        {1U, sizeof(int64_t) * BATCH_INFO_VAL_NUM, 0U, 0U, 0U});
     SyncFunc<HardEvent::MTE3_S>();
 }
 

@@ -211,7 +211,6 @@ def _probe_metadata(torch, tracer, session, output: Path) -> dict:
     from afd_plugin.profiling.analyze import reconstruct
 
     session.start(tracer.device)
-    trace = torch.empty((2, 2), dtype=torch.int64, device="npu")
     batch = torch.empty((11,), dtype=torch.int64, device="npu")
     value = torch.ones(16, device="npu")
     results = []
@@ -219,21 +218,15 @@ def _probe_metadata(torch, tracer, session, output: Path) -> dict:
         path = _begin(session)
         expected = {}
         for index in range(METADATA_ITERATIONS):
-            sequence = generation * 1000 + index * 2 + 1
             execution = tracer.new_work()
             assert execution is not None
-            trace.copy_(torch.tensor([[1, sequence], [1, sequence + 1]]))
             batch.copy_(torch.tensor([2, 2, index, 0, 0, 0, 0, 0, 0, 0, 0]))
             with span(execution, "FFN_COMPUTE"):
                 value.add_(1)
-            tracer.defer_metadata(execution, trace, batch)
+            tracer.defer_metadata(execution, batch)
             tracer.release_execution(execution)
-            expected[execution.exec_ref] = [
-                f"attn-2:call:{sequence}",
-                f"attn-3:call:{sequence + 1}",
-            ]
+            expected[execution.exec_ref] = ["attn-2", "attn-3"]
             # The producer may reuse its wire buffers after the ordered D2H copy.
-            trace.zero_()
             batch.fill_(-1)
             _wait(
                 lambda: tracer.pending_count() == 0, "metadata slot was not reclaimed"
@@ -246,16 +239,22 @@ def _probe_metadata(torch, tracer, session, output: Path) -> dict:
             generation
         }
         assert {
-            work_id: work["source_call_ids"]
+            work_id: work["source_workers"]
             for work_id, work in reconstructed["ffn_works"].items()
         } == expected
         assert {
             work["layer_idx"] for work in reconstructed["ffn_works"].values()
         } == set(range(METADATA_ITERATIONS))
+        assert all(
+            len(work["batch_info"]) == 11
+            for work in reconstructed["ffn_works"].values()
+        )
         # This FFN-only probe intentionally has no Attention SOURCE_CALL records.
         assert reconstructed["data_quality"] == "PARTIAL"
-        assert len(reconstructed["errors"]) == 2 * METADATA_ITERATIONS
-        assert all("missing source_call" in error for error in reconstructed["errors"])
+        assert len(reconstructed["errors"]) == METADATA_ITERATIONS
+        assert all(
+            "missing aligned receive" in error for error in reconstructed["errors"]
+        )
         results.append(
             {
                 "generation": generation,

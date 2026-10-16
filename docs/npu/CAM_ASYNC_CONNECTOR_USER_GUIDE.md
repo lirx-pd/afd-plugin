@@ -337,7 +337,14 @@ with CPU/NPU activities, Level2, shape recording, configured stack/modules and
 the same TensorBoard trace handler. It does not collect lightweight records or
 create the lightweight Event pool and timestamp backend. Those resources are
 allocated on the first `LIGHTWEIGHT` prepare and reused by later lightweight
-sessions. The fixed pool holds 1,024 device spans per worker, covering a queued
+sessions. Both modes use the existing CAM operators and compact batch metadata;
+no profiling-specific binding, kernel, wire tail or `comm_id` is required.
+LIGHTWEIGHT copies that metadata once to a preallocated pinned buffer. Event
+slots use a free queue, and idle Attention calls skip identity allocation.
+Completed sessions stop scanning event pools once all resources are returned.
+Use a binding and CANN operator package built from the same upstream sources;
+older profiling builds with an extended wire tail have an incompatible layout.
+The fixed pool holds 1,024 device spans per worker, covering a queued
 DSV4 step with two microbatches (516 spans) even before events complete. Pool
 exhaustion is still reported as dropped data; tracing never stalls inference
 to wait for a free slot:
@@ -404,6 +411,15 @@ including extrapolation for an earlier receive start. Do not treat that duration
 as time spent entirely inside the capture window. Admitted work retains its
 compute/combine ownership through stop. Missing source relationships across
 session boundaries continue to produce PARTIAL data.
+
+Without a wire identity, the offline analyzer associates FFN work with source
+candidates using the source TP ranks, layer and the aligned interval between
+Attention dispatch-send and combine-recv. Clock uncertainty expands those bounds.
+`source_relation=temporal_source_candidate` denotes an inferred relationship,
+including when only one candidate remains; it is not a kernel-confirmed identity.
+Missing or multiple candidates produce PARTIAL data. All plausible candidates are
+retained, and FFN compute duration is still counted once per worker, rather than
+once for each candidate request.
 
 Missing the start window fails the coordinated
 session; a start/stop watchdog expiry or an exception disables further profiling

@@ -62,7 +62,6 @@ class CAMProfileWorkerMixin:
                 "attention_ranks": connector.attn_size,
                 "ffn_ranks": connector.ffn_size,
                 "tp_size": connector.tp_size,
-                "protocol_version": 1,
             },
             tracer_factory=partial(self._create_cam_tracer, connector),
             full_factory=partial(

@@ -90,6 +90,7 @@ def record_source_call(
         {
             "record_type": "SOURCE_CALL",
             "source_call_id": execution.exec_ref,
+            "worker_id": execution.tracer.worker_id,
             "group_id": group,
             "stage_idx": stage,
             "layer_idx": layer_idx,

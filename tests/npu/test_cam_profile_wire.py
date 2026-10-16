@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Opt-in profile-v1 communication and legacy numerical regression probes."""
+"""Opt-in unmodified CAM communication and numerical regression probes."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def test_profile_wire_roundtrip(
             "requires AFD_RUN_ASCEND_OP_RUNTIME=1 and allocated Ascend 910C devices"
         )
     if os.environ.get("SOC_VERSION", "").lower() != "910c":
-        pytest.skip("profile-v1 CAM is built only for SOC_VERSION=910c (ascend910_93)")
+        pytest.skip("native CAM is built only for SOC_VERSION=910c (ascend910_93)")
     visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
     if len([device for device in visible.split(",") if device.strip()]) < world_size:
         pytest.skip(f"requires at least {world_size} devices allocated with npu run")

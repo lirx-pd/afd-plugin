@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import ctypes
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from afd_plugin.profiling.npu import EventTimestampReader
+from afd_plugin.profiling import npu as npu_module
+from afd_plugin.profiling.npu import EventTimestampReader, FFNDeviceWaiter
 
 
 class TimestampFunction:
@@ -54,3 +56,22 @@ def test_runtime_error_is_not_replaced_with_synchronization(monkeypatch):
     with pytest.raises(RuntimeError, match="status 17"):
         reader.read_raw(event)
     assert function.calls == [77]
+
+
+def test_receive_wait_yields_without_timer_until_both_events_complete(monkeypatch):
+    device = ModuleType("torch_npu")
+    device.npu = SimpleNamespace(current_stream=lambda _: "stream")
+    monkeypatch.setitem(sys.modules, "torch_npu", device)
+    yields = []
+    monkeypatch.setattr(npu_module.os, "sched_yield", lambda: yields.append(True))
+    waiter = FFNDeviceWaiter.__new__(FFNDeviceWaiter)
+    waiter.device = "npu:0"
+    ready, end = iter((False, True, True)), iter((False, True))
+    waiter._ready = SimpleNamespace(record=lambda _: None, query=lambda: next(ready))
+    waiter.end = SimpleNamespace(query=lambda: next(end))
+    fences, progressed = iter((False, True)), []
+    waiter.begin = SimpleNamespace(query=lambda: next(fences))
+    waiter.session = SimpleNamespace(advance_full=lambda **kw: progressed.append(kw))
+    waiter.wait_for_stream()
+    assert yields == [True, True]
+    assert progressed == [{"allow_stop": False}, {"allow_stop": True}]

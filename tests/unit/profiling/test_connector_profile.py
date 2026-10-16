@@ -27,6 +27,7 @@ class Tracer:
         self.spans = []
         self.deferred = []
         self.released = []
+        self.transitions = []
 
     @contextmanager
     def span(self, execution, name):
@@ -44,6 +45,9 @@ class Tracer:
 
     def release_execution(self, execution):
         self.released.append(execution)
+
+    def transition(self, execution, phase):
+        self.transitions.append(phase)
 
     def record_metadata(self, execution, control):
         self.deferred.append((execution, control))
@@ -193,6 +197,7 @@ def test_recv_reuses_control_copy_and_preserves_full_combine_metadata(monkeypatc
     assert ops.afd_async_combine_send.call_args.args[2] is batch_info
     torch.testing.assert_close(batch_info, original)
     assert tracer.released == [execution]
+    assert tracer.transitions == ["WAIT"]
 
 
 @pytest.mark.parametrize("active_at_completion", [False, True])

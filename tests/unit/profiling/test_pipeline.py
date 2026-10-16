@@ -174,3 +174,10 @@ def test_long_lightweight_duration_keeps_full_limit():
         StartRequest(mode="FULL", duration=86400.0)
     with pytest.raises(ValidationError):
         StartRequest(mode="LIGHTWEIGHT", duration=604801.0)
+
+
+def test_pipeline_mark_count_rejects_boolean_summary():
+    rows = capture("a0", "attention")
+    rows[1]["native_marks"] = False
+    with pytest.raises(ValueError, match="native_marks"):
+        reconstruct(rows)

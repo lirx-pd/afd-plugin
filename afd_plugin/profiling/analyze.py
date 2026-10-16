@@ -118,6 +118,8 @@ def _validate(record: dict) -> None:
             _integer(record, field)
         if "native_spans" in record:
             _integer(record, "native_spans")
+        if "native_marks" in record:
+            _integer(record, "native_marks")
         return
     if kind not in ID_FIELDS:
         raise ValueError(f"unsupported record_type: {kind}")

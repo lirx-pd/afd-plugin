@@ -45,6 +45,8 @@ from afd_plugin.connectors import (
     AFDForwardContextMetadata,
 )
 from afd_plugin.model_executor.models.forward_context import use_afd_metadata_provider
+from afd_plugin.profiling import runtime_profiling_enabled
+from afd_plugin.profiling.model import begin_profile_step
 from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
     _resolve_world_ranks,
@@ -423,6 +425,9 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         # ### PATCH START: scope AFD metadata provider/replay and profiler step.
         step_afd_npu_profiler(self.prof)
+        pipeline = (
+            begin_profile_step(self.connector) if runtime_profiling_enabled() else None
+        )
         use_fullgraph_replay_hook = (
             self.vllm_config.compilation_config.cudagraph_mode
             in (CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY)
@@ -479,6 +484,8 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             self._afd_is_graph_capturing = previous_is_graph_capturing
             self._afd_is_graph_replaying = previous_is_graph_replaying
             self._afd_is_profile = previous_is_profile
+            if pipeline is not None:
+                pipeline.tracer.idle(pipeline.capture)
         # ### PATCH END: scope AFD metadata provider/replay and profiler step.
 
     # Patch reason: native V2 shutdown does not know about AFD's profiler,

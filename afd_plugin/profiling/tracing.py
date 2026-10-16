@@ -148,8 +148,13 @@ class DeviceTracer:
         if self.finalized(execution.capture):
             return
         execution.pending = max(0, execution.pending - 1)
-        if not execution.pending:
-            self.transition(execution, "WAIT")
+
+    def idle(self, capture: Capture) -> None:
+        if self.finalized(capture) or self._ended:
+            return
+        for execution in self._streams.values():
+            if execution.capture is capture:
+                self.transition(execution, "WAIT")
 
     def pending_count(self) -> int:
         return sum(execution.pending for execution in self._streams.values())

@@ -986,6 +986,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             )
         if context.profile is not None:
             context.profile.tracer.release_execution(context.profile)
+            context.profile.tracer.transition(context.profile, "WAIT")
 
     def _require_initialized(self) -> None:
         if not self._initialized:

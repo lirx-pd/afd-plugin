@@ -389,10 +389,12 @@ a background thread packs the dedicated worker directory into
 verifies the gzip data and makes the archive durable before removing the raw
 directory. Each worker then retains one archive and one small JSONL file.
 Compression does not block native stop or parse traces during inference.
-Wait for `details.native_profiler.archive_state=COMPLETED` before copying or
-analyzing a finished capture; `archive_error` reports failures and the raw data
-or completed archive remains available for recovery. Raw data and the temporary
-archive coexist while compression runs.
+Wait for the final `.tar.gz` file before copying or analyzing a finished capture;
+session completion can precede archiving. Live worker status exposes
+`details.native_profiler.archive_state` and `archive_error`; the coordinator
+manifest retains its stop-time snapshot. On failure, raw data or a completed
+archive remains available for recovery. Raw data and the temporary archive
+coexist while compression runs.
 
 Export the aligned pipeline offline with the matching TorchNPU/CANN environment:
 

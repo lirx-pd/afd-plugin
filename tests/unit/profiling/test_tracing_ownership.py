@@ -69,6 +69,7 @@ def test_three_pipeline_states_without_stage_names_or_identity(tracer):
         with tracer.span(execution, kind):
             pass
     tracer.release_execution(execution)
+    tracer.idle(capture)
     assert [c.args[0] for c in native._mark.call_args_list] == [
         "afd.cam|COMPUTE",
         "afd.cam|COMMUNICATION",
@@ -137,4 +138,18 @@ def test_exception_returns_stream_to_wait(tracer):
     tracer, _, native = tracer
     with pytest.raises(ValueError), tracer.span(tracer.new_work(), "ATTENTION"):
         raise ValueError("model failure")
+    assert native._mark.call_args.args[0] == "afd.cam|WAIT"
+
+
+def test_layer_release_does_not_break_adjacent_compute(tracer):
+    tracer, capture, native = tracer
+    for _ in range(100):
+        execution = tracer.execution()
+        assert tracer.retain_execution(execution)
+        with tracer.span(execution, "RESTORE_MERGE"):
+            pass
+        tracer.release_execution(execution)
+    assert native._mark.call_count == 1
+    tracer.idle(capture)
+    assert native._mark.call_count == 2
     assert native._mark.call_args.args[0] == "afd.cam|WAIT"

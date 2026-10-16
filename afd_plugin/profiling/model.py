@@ -13,7 +13,7 @@ from afd_plugin.profiling import runtime_profiling_enabled
 if TYPE_CHECKING:
     from torch.nn import Module
 
-    from afd_plugin.connectors import AFDForwardContextMetadata
+    from afd_plugin.connectors import AFDConnectorBase, AFDForwardContextMetadata
     from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
     from afd_plugin.profiling.tracing import Execution, Span
 
@@ -42,6 +42,17 @@ def begin_profile_call(metadata: AFDForwardContextMetadata) -> Execution | None:
         metadata.profile_attention = None
         return attention
     return cast("CAMAsyncAFDConnector", metadata.connector).begin_profile_call()
+
+
+def begin_profile_step(connector: AFDConnectorBase) -> Execution | None:
+    """Keep inter-layer compute contiguous; idle only at the model-step boundary."""
+    session = cast("CAMAsyncAFDConnector", connector).profile_session
+    if session is None or session.tracer is None:
+        return None
+    execution = session.tracer.execution()
+    if execution is not None:
+        execution.tracer.transition(execution, "COMPUTE")
+    return execution
 
 
 def install_attention_hooks(

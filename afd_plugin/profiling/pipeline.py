@@ -23,7 +23,7 @@ def native_pipeline(events: list[dict], header: dict) -> list[dict]:
         device = "Physic Stream Id" in event.get("args", {})
         if (phase == "END" and device) or (phase != "END" and not device):
             continue
-        if phase not in PHASES | {"END"}:
+        if phase != "END" and phase not in PHASES:
             raise ValueError("invalid pipeline phase")
         timestamp = int(Decimal(str(event["ts"])) * NS_PER_US)
         if timestamp < 0:

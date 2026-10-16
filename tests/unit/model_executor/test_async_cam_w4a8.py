@@ -21,7 +21,7 @@ from afd_plugin.model_executor.npu.async_cam_w4a8 import (  # noqa: E402
     AsyncCAMW4A8Executor,
     W4A8LayerWeights,
 )
-from afd_plugin.profiling.model import span  # noqa: E402
+from afd_plugin.profiling.model import transition  # noqa: E402
 
 
 def weights(layer_idx=0, per_channel=True):
@@ -220,7 +220,7 @@ def test_runner_preserves_raw_context_and_chunk_capacity():
             "cast": cast,
             "CAMAsyncAFDConnector": SimpleNamespace,
             "AFDAsyncTransferState": SimpleNamespace,
-            "span": span,
+            "transition": transition,
         },
     )
     method(runner)
@@ -477,3 +477,34 @@ def test_model_extraction_skips_heterogeneous_semantics(monkeypatch):
     specs, reason = method(layers)
     assert specs == []
     assert "heterogeneous" in reason
+
+
+def test_ffn_failure_returns_pipeline_to_wait():
+    idle = []
+    capture = object()
+    connector = SimpleNamespace(
+        control_plane=None,
+        profile_session=SimpleNamespace(
+            capture=capture,
+            tracer=SimpleNamespace(idle=idle.append),
+        ),
+    )
+
+    def failed():
+        raise ValueError("FFN compute failed")
+
+    runner = SimpleNamespace(
+        connector=connector, prof=None, _ffn_forward_connector_driven=failed
+    )
+    method = runner_method(
+        "execute_connector_driven_step",
+        {
+            "cast": cast,
+            "CAMAsyncAFDConnector": SimpleNamespace,
+            "runtime_profiling_enabled": lambda: True,
+            "step_afd_npu_profiler": lambda profiler: None,
+        },
+    )
+    with pytest.raises(ValueError, match="FFN compute failed"):
+        method(runner)
+    assert idle == [capture]

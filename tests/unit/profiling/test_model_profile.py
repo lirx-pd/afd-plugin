@@ -4,33 +4,39 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from afd_plugin.profiling.model import begin_profile_call, install_attention_hooks
+from afd_plugin.profiling.model import begin_profile_call, install_pipeline_hook
 
 
-def test_disabled_pipeline_never_reads_profiling_interfaces(monkeypatch):
-    monkeypatch.delenv("AFD_CAM_PROFILE_ENABLE", raising=False)
-    assert begin_profile_call(SimpleNamespace()) is None
+def test_idle_pipeline_has_no_layer_lookup():
+    assert begin_profile_call(SimpleNamespace(profile_pipeline=None)) is None
 
 
-def test_pipeline_reuses_hook_stream_without_call_identity(monkeypatch):
-    monkeypatch.setenv("AFD_CAM_PROFILE_ENABLE", "1")
-    execution = object()
-    metadata = SimpleNamespace(profile_attention=execution)
+def test_pipeline_caches_track_but_checks_admission_each_layer():
+    tracer = SimpleNamespace(retain_execution=Mock(return_value=True))
+    execution = SimpleNamespace(tracer=tracer)
+    metadata = SimpleNamespace(profile_pipeline=execution)
     assert begin_profile_call(metadata) is execution
-    assert metadata.profile_attention is None
-    metadata.connector = SimpleNamespace(begin_profile_call=lambda: execution)
     assert begin_profile_call(metadata) is execution
+    assert metadata.profile_pipeline is execution
+    tracer.retain_execution.return_value = False
+    assert begin_profile_call(metadata) is None
 
 
-def test_attention_hook_emits_only_compute_transition():
+def test_model_hook_refreshes_stream_for_each_dbo_child_and_generation():
     module = SimpleNamespace(register_forward_pre_hook=Mock())
-    execution = SimpleNamespace(tracer=SimpleNamespace(transition=Mock()))
+    tracer = SimpleNamespace(execution=Mock(), transition=Mock())
     metadata = SimpleNamespace(
-        connector=SimpleNamespace(begin_profile_call=lambda: execution),
-        profile_attention=None,
+        connector=SimpleNamespace(profile_session=SimpleNamespace(tracer=tracer)),
+        profile_pipeline=None,
     )
-    install_attention_hooks(module, lambda: metadata)
+    install_pipeline_hook(module, lambda: metadata)
     hook = module.register_forward_pre_hook.call_args.args[0]
+    for _ in range(3):
+        execution = SimpleNamespace(tracer=tracer)
+        tracer.execution.return_value = execution
+        hook(module, ())
+        assert metadata.profile_pipeline is execution
+        tracer.transition.assert_called_with(execution, "COMPUTE")
+    tracer.execution.return_value = None
     hook(module, ())
-    assert metadata.profile_attention is execution
-    execution.tracer.transition.assert_called_once_with(execution, "COMPUTE")
+    assert metadata.profile_pipeline is None

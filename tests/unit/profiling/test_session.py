@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import uuid
 from types import SimpleNamespace
@@ -570,3 +571,74 @@ def test_ffn_stop_fence_is_queried_only_for_pending_native_stop(worker_session):
     assert session.capture.profiler.state == "STOPPING"
     session.advance_profiler(stop_ready=lambda: True)
     assert session.capture.profiler.finished
+
+
+def test_idle_control_blocks_without_periodic_ticks(tmp_path, monkeypatch):
+    calls = []
+    session = WorkerSession("a0", "attention", tmp_path, None, {})
+
+    class ParkedError(Exception):
+        pass
+
+    class Wake:
+        def clear(self):
+            pass
+
+        def wait(self, timeout):
+            calls.append(timeout)
+            raise ParkedError
+
+    session._wake = Wake()
+    monkeypatch.setattr(session_module.WorkerSession, "tick", lambda self: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        SimpleNamespace(npu=SimpleNamespace(set_device=lambda device: None)),
+    )
+    with pytest.raises(ParkedError):
+        session._run(None)
+    assert calls == [None]
+
+
+def test_control_sleeps_to_deadline_and_wakes_on_commands(worker_session):
+    session, tracer, clock = worker_session
+    assert session._next_timeout() is None
+    session_id = str(uuid.uuid4())
+    session.prepare(
+        {
+            "session_id": session_id,
+            "command_seq": 1,
+            "mode": "LIGHTWEIGHT",
+            "duration_s": 10,
+        },
+        backend_busy=False,
+    )
+    assert session._wake.is_set()
+    assert session._next_timeout() == 70
+    session._wake.clear()
+    session.commit(
+        {
+            "session_id": session_id,
+            "command_seq": 2,
+            "start_at_ns": clock.time_ns() + int(1e9),
+            "clock_by_worker": {
+                session.worker_id: {"offset_ns": 0, "uncertainty_ns": 0}
+            },
+        }
+    )
+    assert session._wake.is_set()
+    assert session._next_timeout() == 1
+    clock.advance(1)
+    session.tick()
+    session._wake.clear()
+    session.advance_profiler()
+    assert session._wake.is_set()
+    session.tick()
+    assert session._next_timeout() == 10
+    session.stop({"session_id": session_id, "command_seq": 3})
+    session.advance_profiler()
+    session.tick()
+    assert session.capture.writer.close(2)
+    session.tick()
+    assert session.state == "COMPLETED"
+    assert session._next_timeout() is None

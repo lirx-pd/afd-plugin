@@ -252,9 +252,20 @@ def test_lightweight_collects_only_layer_ranges_without_inline_analysis(monkeypa
         "torch_npu.profiler._profiler_action_controller",
         SimpleNamespace(ProfActionController=lambda *args: None),
     )
+    disabled = []
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu.profiler.profiler_interface",
+        SimpleNamespace(
+            _disable_event_record=lambda: disabled.append(
+                profiler_module.created_profiler.started
+            )
+        ),
+    )
     create_runtime_npu_profiler(
         "attention", "/session/worker/lightweight", lightweight=True
     )
+    assert disabled == [True]
     config = profiler_module.profile_kwargs
     assert config["activities"] == ["npu"]
     for field in (

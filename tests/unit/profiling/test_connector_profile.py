@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -28,11 +27,6 @@ class Tracer:
         self.deferred = []
         self.released = []
         self.transitions = []
-
-    @contextmanager
-    def span(self, execution, name):
-        self.spans.append((execution.exec_ref, name))
-        yield
 
     def execution(self):
         return Execution(self, "pipeline") if self.active else None
@@ -100,11 +94,12 @@ def connector(monkeypatch, *, role, enabled=True):
 def profile_session(tracer):
     return SimpleNamespace(
         tracer=tracer,
-        capture=SimpleNamespace(admits=lambda: tracer.active),
+        capture=SimpleNamespace(admits=lambda: tracer.active, mode="LIGHTWEIGHT"),
         advance_profiler=Mock(),
         device_waiter=SimpleNamespace(
             read_ffn_control=lambda control: control.tolist(),
             begin_receive=Mock(),
+            wait_for_stream=Mock(),
             end_receive=Mock(),
             begin=object(),
             end=object(),
@@ -167,11 +162,8 @@ def test_local_call_identity_skips_idle_and_never_changes_native_comm_id(
 
     attn.recv_ffn_output(torch.empty((2, 16)), ubatch_idx=1, context=first_capture)
 
-    assert first_tracer.spans == [
-        (first_capture.profile.exec_ref, "DISPATCH_SEND"),
-        (first_capture.profile.exec_ref, "COMBINE_RECV"),
-    ]
-    assert second_tracer.spans == [(second_capture.profile.exec_ref, "DISPATCH_SEND")]
+    assert first_tracer.transitions == ["COMMUNICATION", "WAIT"]
+    assert second_tracer.transitions == ["COMMUNICATION"]
     assert ops.afd_async_combine_recv.call_args.args[4] == 0
 
 
@@ -197,7 +189,7 @@ def test_recv_reuses_control_copy_and_preserves_full_combine_metadata(monkeypatc
     assert ops.afd_async_combine_send.call_args.args[2] is batch_info
     torch.testing.assert_close(batch_info, original)
     assert tracer.released == [execution]
-    assert tracer.transitions == ["WAIT"]
+    assert tracer.transitions == ["WAIT", "COMMUNICATION", "WAIT"]
 
 
 @pytest.mark.parametrize("active_at_completion", [False, True])
@@ -222,9 +214,7 @@ def test_receive_admits_only_after_device_completion(
     assert ops.afd_async_dispatch_recv.call_count == 1
     assert bool(received.context.profile) == active_at_completion
     assert not tracer.deferred
-    assert tracer.spans == (
-        [] if active_at_completion else [("pipeline", "DISPATCH_RECV")]
-    )
+    assert tracer.transitions == ([] if active_at_completion else ["WAIT"])
 
 
 @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "idle"])
@@ -261,3 +251,38 @@ def test_no_capture_skips_metadata_views_and_keeps_full_metadata(
         context = dispatch(attn)
         assert not hasattr(context, "dispatch_seq")
         assert ops.afd_async_dispatch_send.call_args.args[3] == 0
+
+
+@pytest.mark.parametrize("mode", [None, "LIGHTWEIGHT", "FULL"])
+def test_layered_receive_skips_host_reads_but_keeps_completion_fences(
+    monkeypatch, ops, mode
+):
+    ffn = connector(monkeypatch, role="ffn")
+    ffn.layered_gmm_enabled = True
+    ffn.profile_session = profile_session(Tracer(active=mode == "LIGHTWEIGHT"))
+    if mode is None:
+        ffn.profile_session.capture = None
+    else:
+        ffn.profile_session.capture.mode = mode
+    waiter = ffn.profile_session.device_waiter
+    waiter.read_ffn_control = Mock(side_effect=lambda control: control.tolist())
+    outputs = recv_outputs(ffn)
+    ops.afd_async_dispatch_recv.return_value = outputs
+
+    def reject_control(*args, **kwargs):
+        raise AssertionError("unused device control tensor constructed")
+
+    if mode != "FULL":
+        monkeypatch.setattr(torch, "stack", reject_control)
+    received = ffn.recv_attn_output()
+    assert received.context.states.token_nums_rankid_layeridx is outputs[2]
+    waiter.begin_receive.assert_called_once()
+    if mode == "FULL":
+        assert received.context.states.host_control == [0, 2, 4]
+        waiter.read_ffn_control.assert_called_once()
+        waiter.wait_for_stream.assert_not_called()
+    else:
+        assert received.context.states.host_control is None
+        waiter.read_ffn_control.assert_not_called()
+        waiter.wait_for_stream.assert_called_once()
+        ffn.profile_session.advance_profiler.assert_called_once()

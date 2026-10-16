@@ -25,8 +25,6 @@ if TYPE_CHECKING:
 LEASE_GRACE_S = 60
 DRAIN_TIMEOUT_S = 2
 PROFILER_OPERATION_TIMEOUT_S = 10
-POLL_INTERVAL_S = 0.005
-RUNNING_POLL_INTERVAL_S = 0.1
 
 
 def _bounded_seconds(value: int | float | None, field: str, maximum: float) -> float:
@@ -90,6 +88,7 @@ class WorkerSession:
         self._generation = 0
         self._duration_s = 0.0
         self._lock = threading.Lock()
+        self._wake = threading.Event()
         self._last_command: tuple[str, dict] | None = None
         self._profiler_factory = profiler_factory
         self._tracer_factory = tracer_factory
@@ -105,13 +104,7 @@ class WorkerSession:
 
         torch_npu.npu.set_device(device)
         while True:
-            time.sleep(
-                RUNNING_POLL_INTERVAL_S
-                if self.state == "RUNNING"
-                and self.capture is not None
-                and self.capture.mode == "LIGHTWEIGHT"
-                else POLL_INTERVAL_S
-            )
+            self._wake.clear()
             try:
                 self.tick()
             except Exception as exc:
@@ -121,6 +114,35 @@ class WorkerSession:
                         capture.error = f"{type(exc).__name__}: {exc}"
                         self._stop(capture)
                         capture.drain_deadline_ns = time.monotonic_ns()
+            with self._lock:
+                timeout = self._next_timeout()
+            self._wake.wait(timeout)
+
+    def _next_timeout(self) -> float | None:
+        """Called under the session lock; state changes wake the control thread."""
+        capture = self.capture
+        if capture is None or self.state in {"COMPLETED", "FAILED"}:
+            return None
+        deadlines = []
+        now = time.monotonic_ns()
+        if not capture.stop_requested:
+            deadlines.append(capture.deadline_ns)
+            if self.state == "STARTING" and now < capture.start_ns:
+                deadlines.append(capture.start_ns)
+        if (
+            capture.profiler is not None
+            and not capture.profiler.finished
+            and not self._profiler_poisoned
+            and capture.profiler_deadline_ns
+            and (capture.started_at_ns is None or capture.stop_requested)
+        ):
+            deadlines.append(capture.profiler_deadline_ns)
+        if capture.stop_requested:
+            if now < capture.drain_deadline_ns:
+                deadlines.append(capture.drain_deadline_ns)
+            if capture.flush_deadline_ns:
+                deadlines.append(capture.flush_deadline_ns)
+        return max(0, (min(deadlines) - now) / 1e9) if deadlines else None
 
     @property
     def profiler_reusable(self) -> bool:
@@ -199,7 +221,9 @@ class WorkerSession:
             profiler = self._profiler_factory(
                 session_dir / self.worker_id / mode.lower(), mode
             )
-            writer = JsonRecordWriter(session_dir / f"{self.worker_id}.jsonl")
+            writer = JsonRecordWriter(
+                session_dir / f"{self.worker_id}.jsonl", on_change=self._wake.set
+            )
             self._generation += 1
             self.capture = Capture(
                 command["session_id"],
@@ -216,6 +240,7 @@ class WorkerSession:
             self.state = "PREPARED"
             self.command_seq = command["command_seq"]
             self._last_command = ("prepare", dict(command))
+            self._wake.set()
             return self._status()
 
     def commit(self, command: dict) -> dict:
@@ -289,6 +314,7 @@ class WorkerSession:
             self.state = "STARTING"
             self.command_seq = command["command_seq"]
             self._last_command = ("commit", dict(command))
+            self._wake.set()
             return self._status()
 
     def stop(self, command: dict) -> dict:
@@ -301,6 +327,7 @@ class WorkerSession:
                 self._stop(capture)
             self.command_seq = command["command_seq"]
             self._last_command = ("stop", dict(command))
+            self._wake.set()
             return self._status()
 
     def _stop(self, capture: Capture) -> None:
@@ -370,6 +397,7 @@ class WorkerSession:
             and not capture.stop_requested
         ):
             capture.accepting = True
+        self._wake.set()
 
     def _status(self) -> dict:
         capture = self.capture

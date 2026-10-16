@@ -4,8 +4,7 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch_npu
@@ -16,38 +15,11 @@ if TYPE_CHECKING:
     from afd_plugin.profiling.session import Capture, WorkerSession
 
 RANGE_PREFIX = "afd.cam"
-COMPUTE_STAGES = frozenset(
-    {
-        "COMPUTE",
-        "ATTENTION",
-        "ATTENTION_GATE",
-        "GATE",
-        "SHARED_EXPERT",
-        "RESTORE_MERGE",
-        "FFN_COMPUTE",
-    }
-)
-COMMUNICATION_STAGES = frozenset({"COMMUNICATION", "DISPATCH_SEND", "COMBINE_SEND"})
-WAIT_STAGES = frozenset({"WAIT", "DISPATCH_RECV", "COMBINE_RECV", "DBO_HOST_WAIT"})
+PHASE_MESSAGES = {
+    phase: f"afd.cam|{phase}" for phase in ("COMPUTE", "COMMUNICATION", "WAIT")
+}
 MAX_PIPELINE_STREAMS = 64
 MAX_PENDING_EXECUTIONS = 1024
-
-
-class Span:
-    __slots__ = ("execution", "phase", "message")
-
-    def __init__(self, execution: Execution, phase: str) -> None:
-        self.execution = execution
-        self.phase = phase
-        self.message = f"afd.cam|{phase}"
-
-    def __enter__(self) -> Span:
-        self.execution.tracer.transition(self.execution, self.phase)
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
-        if exc_type is not None:
-            self.execution.tracer.transition(self.execution, "WAIT")
 
 
 @dataclass(slots=True)
@@ -59,7 +31,6 @@ class Execution:
     stream: tuple[int, int, int]
     pending: int = 0
     phase: str = ""
-    scopes: dict[str, Span] = field(default_factory=dict)
 
 
 class DeviceTracer:
@@ -92,45 +63,26 @@ class DeviceTracer:
                 self._dropped_spans += 1
                 return None
             execution = Execution(self, capture, stream)
-            execution.scopes = {
-                phase: Span(execution, phase)
-                for phase in ("COMPUTE", "COMMUNICATION", "WAIT")
-            }
             self._streams[stream] = execution
         return execution
 
     def new_work(self) -> Execution | None:
         return self.execution()
 
-    def span(self, execution: Execution, kind: str) -> Span | nullcontext:
-        if self.finalized(execution.capture) or self._ended:
-            return nullcontext()
-        if not execution.pending and not execution.capture.admits():
-            return nullcontext()
-        if kind in COMPUTE_STAGES:
-            return execution.scopes["COMPUTE"]
-        if kind in COMMUNICATION_STAGES:
-            return execution.scopes["COMMUNICATION"]
-        if kind in WAIT_STAGES:
-            return execution.scopes["WAIT"]
-        return nullcontext()
-
-    def host_span(self, execution: Execution, kind: str) -> Span | nullcontext:
-        # DBO yields put this stream in WAIT; other streams remain independent.
-        return self.span(execution, kind)
-
     def transition(self, execution: Execution, phase: str) -> None:
         if execution.phase == phase or self._ended or self.finalized(execution.capture):
             return
         try:
             torch_npu._C._mstx._mark(
-                execution.scopes[phase].message, *execution.stream, RANGE_PREFIX
+                PHASE_MESSAGES[phase], *execution.stream, RANGE_PREFIX
             )
             execution.phase = phase
             self._recorded_marks += 1
         except Exception as error:
             execution.capture.error = f"native pipeline mark failed: {error}"
             self._dropped_spans += 1
+            assert self.session is not None
+            self.session._wake.set()
 
     def close_admission(self, capture: Capture) -> None:
         capture.accepting = False
@@ -148,6 +100,9 @@ class DeviceTracer:
         if self.finalized(execution.capture):
             return
         execution.pending = max(0, execution.pending - 1)
+        if execution.capture.stop_requested:
+            assert self.session is not None
+            self.session._wake.set()
 
     def idle(self, capture: Capture) -> None:
         if self.finalized(capture) or self._ended:

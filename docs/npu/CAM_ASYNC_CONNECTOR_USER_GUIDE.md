@@ -335,10 +335,13 @@ Both modes use the TorchNPU profiling backend used by vLLM-Ascend.
 on Attention and FFN streams, without layer, request, token or causal identities.
 It uses NPU-only `Level_none` and the `afd.cam` MSTX domain. A native device mark
 is submitted only when a stream changes phase; adjacent compute regions across
-layers share one state. Stream tracks, phase scopes and three short messages are
-reused. CPU operator callbacks, kernel/task profiling, shapes, stacks/modules,
+layers share one state. Stream tracks and three short messages are reused;
+model/DBO entry caches the track instead of hooking every Attention layer.
+CPU operator callbacks, kernel/task profiling, shapes, stacks/modules,
 memory, FLOPs and hardware counters are off. There are no timing Event pools,
-collector scans, request snapshots or relationship records.
+collector scans, request snapshots or relationship records. LIGHTWEIGHT also
+disables TorchNPU's Python Event recording wrappers while retaining completion
+fences. Control and JSONL writer threads sleep until notified or a deadline expires.
 
 Send phases are COMMUNICATION; receives and DBO yields are WAIT. CAM fuses
 transfer and polling, so WAIT includes receiving data. These are stream pipeline
@@ -351,7 +354,9 @@ and closes a stream waiting indefinitely for its peer.
 
 `FULL` retains CPU/NPU activities, Level2, shape recording and configured
 stack/modules. Both modes use unchanged upstream CAM operators; `csrc` and the
-wire protocol are unchanged. FFN copies only its mandatory three control values.
+wire protocol are unchanged. Layered FFN keeps layer selection on device and
+skips unused host control copies in LIGHTWEIGHT and idle mode. Legacy FFN and
+FULL retain their three control values.
 The stream/MSTX bindings target TorchNPU 2.10 and need revalidation on upgrades.
 
 For continuous long-running collection, LIGHTWEIGHT accepts up to seven days;

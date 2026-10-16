@@ -27,7 +27,7 @@ def _probe(output: Path) -> None:
     from torch_npu.profiler.profiler import analyse
 
     from afd_plugin.profiling.analyze import export_chrome_trace
-    from afd_plugin.profiling.model import span
+    from afd_plugin.profiling.model import transition
     from afd_plugin.profiling.native import RuntimeProfiler
     from afd_plugin.profiling.native_trace import native_directory, read_native_trace
     from afd_plugin.profiling.session import WorkerSession
@@ -80,9 +80,9 @@ def _probe(output: Path) -> None:
                 if mode == "LIGHTWEIGHT":
                     execution = tracer.execution()
                     assert execution is not None and tracer.retain_execution(execution)
-                    for phase in ("ATTENTION", "GATE", "DISPATCH_SEND", "COMBINE_RECV"):
-                        with span(execution, phase):
-                            torch.mm(x, x, out=targets[index])
+                    for phase in ("COMPUTE", "COMPUTE", "COMMUNICATION", "WAIT"):
+                        transition(execution, phase)
+                        torch.mm(x, x, out=targets[index])
                     tracer.release_execution(execution)
                 else:
                     torch.mm(x, x, out=targets[index])
@@ -197,8 +197,8 @@ def _probe_cam_pipeline(output: Path) -> None:
         def wrapped(name):
             def invoke(*args):
                 phase = "COMMUNICATION" if name.endswith("send") else "WAIT"
-                with tracer.span(execution, phase):
-                    result = originals[name](*args)
+                tracer.transition(execution, phase)
+                result = originals[name](*args)
                 if name == "dispatch_recv":
                     tracer.transition(execution, "COMPUTE")
                 return result

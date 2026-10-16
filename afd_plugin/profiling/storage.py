@@ -11,6 +11,7 @@ import queue
 import shutil
 import tarfile
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 ARCHIVE_BUFFER_BYTES = 1024 * 1024
@@ -28,6 +29,8 @@ class JsonRecordWriter:
         path: Path,
         max_records: int = 4096,
         max_bytes: int = 256 * 1024 * 1024,
+        *,
+        on_change: Callable[[], None] = lambda: None,
     ) -> None:
         if max_records <= 0 or max_bytes <= 0:
             raise ValueError("max_records and max_bytes must be positive")
@@ -35,6 +38,8 @@ class JsonRecordWriter:
         self._max_bytes = max_bytes
         self._lock = threading.Lock()
         self._stopping = threading.Event()
+        self._ready = threading.Event()
+        self._on_change = on_change
         self._closed = False
         self._written_records = 0
         self._dropped_records = 0
@@ -63,12 +68,14 @@ class JsonRecordWriter:
                 self._dropped_records += 1
                 return False
             self._pending_records += 1
+            self._ready.set()
             return True
 
     def close(self, timeout_s: float) -> bool:
         """Stop admission and wait at most timeout_s; inspect snapshot for errors."""
         with self._lock:
             self._stopping.set()
+            self._ready.set()
         self._thread.join(timeout=timeout_s)
         return not self._thread.is_alive()
 
@@ -88,6 +95,7 @@ class JsonRecordWriter:
             if self._error is None:
                 self._error = reason
             self._stopping.set()
+        self._on_change()
 
     def _drop(self, count: int) -> None:
         with self._lock:
@@ -123,8 +131,10 @@ class JsonRecordWriter:
         batch = []
         try:
             while not (self._stopping.is_set() and self._queue.empty()):
+                self._ready.wait()
+                self._ready.clear()
                 try:
-                    batch = [self._queue.get(timeout=0.05)]
+                    batch = [self._queue.get_nowait()]
                 except queue.Empty:
                     continue
                 for _ in range(63):
@@ -134,6 +144,8 @@ class JsonRecordWriter:
                         break
                 self._write_batch(batch)
                 batch = []
+                if not self._queue.empty():
+                    self._ready.set()
                 if self._error is not None:
                     break
         except Exception as exc:
@@ -152,6 +164,7 @@ class JsonRecordWriter:
                 self._fail(f"{type(exc).__name__}: {exc}")
             with self._lock:
                 self._closed = True
+            self._on_change()
 
 
 def archive_native_trace(directory: Path) -> Path:

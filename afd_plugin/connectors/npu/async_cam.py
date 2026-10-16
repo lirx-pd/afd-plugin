@@ -69,7 +69,7 @@ from afd_plugin.distributed import (
     init_afd_process_group,
 )
 from afd_plugin.profiling import runtime_profiling_enabled
-from afd_plugin.profiling.model import span
+from afd_plugin.profiling.model import transition
 from afd_plugin.validation import cam_receive_capacity, validate_graph_capacity
 
 if TYPE_CHECKING:
@@ -715,26 +715,26 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             dynamic_quant=self.dynamic_quant,
             group_name=self.group_name,
         )
-        with span(context.profile, "DISPATCH_SEND"):
-            torch.ops.afd_ascend.afd_async_dispatch_send(
-                hidden_states,
-                topk_ids,
-                self.comm_args,
-                self.comm_id,
-                self.max_num_batched_tokens,
-                states.batch_size,
-                states.hidden_size,
-                states.topk,
-                self.ffn_size,
-                self.attn_size,
-                self.expert_per_rank,
-                self.world_rank,
-                self.topology.world_size,
-                states.layer_idx,
-                self.tp_size,
-                self.dynamic_quant,
-                self.group_name,
-            )
+        transition(context.profile, "COMMUNICATION")
+        torch.ops.afd_ascend.afd_async_dispatch_send(
+            hidden_states,
+            topk_ids,
+            self.comm_args,
+            self.comm_id,
+            self.max_num_batched_tokens,
+            states.batch_size,
+            states.hidden_size,
+            states.topk,
+            self.ffn_size,
+            self.attn_size,
+            self.expert_per_rank,
+            self.world_rank,
+            self.topology.world_size,
+            states.layer_idx,
+            self.tp_size,
+            self.dynamic_quant,
+            self.group_name,
+        )
         self._pending_attention_payloads.setdefault(
             context.metadata.stage_idx, []
         ).append(
@@ -806,23 +806,23 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             world_size=self.topology.world_size,
             group_name=self.group_name,
         )
-        with span(context.profile, "COMBINE_RECV"):
-            output = torch.ops.afd_ascend.afd_async_combine_recv(
-                placeholder,
-                topk_ids,
-                topk_weights,
-                self.comm_args,
-                self.comm_id,
-                states.batch_size,
-                states.hidden_size,
-                states.topk,
-                self.ffn_size,
-                self.attn_size,
-                self.expert_per_rank,
-                self.world_rank,
-                self.topology.world_size,
-                self.group_name,
-            )
+        transition(context.profile, "WAIT")
+        output = torch.ops.afd_ascend.afd_async_combine_recv(
+            placeholder,
+            topk_ids,
+            topk_weights,
+            self.comm_args,
+            self.comm_id,
+            states.batch_size,
+            states.hidden_size,
+            states.topk,
+            self.ffn_size,
+            self.attn_size,
+            self.expert_per_rank,
+            self.world_rank,
+            self.topology.world_size,
+            self.group_name,
+        )
         _log_cam_op_values("async_combine_recv", "outputs", output=output)
         return output
 
@@ -876,35 +876,41 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             waiter.begin_receive()
         tracer = session.tracer if session is not None else None
         execution = tracer.new_work() if tracer is not None else None
-        with span(execution, "DISPATCH_RECV"):
-            outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(
-                placeholder,
-                self.comm_args,
-                self.comm_id,
-                self.max_num_batched_tokens,
-                states.hidden_size,
-                states.topk,
-                self.ffn_size,
-                self.attn_size,
-                self.expert_per_rank,
-                self.world_rank,
-                self.topology.world_size,
-                self.tp_size,
-                self.dynamic_quant,
-                self.group_name,
-            )
+        transition(execution, "WAIT")
+        outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(
+            placeholder,
+            self.comm_args,
+            self.comm_id,
+            self.max_num_batched_tokens,
+            states.hidden_size,
+            states.topk,
+            self.ffn_size,
+            self.attn_size,
+            self.expert_per_rank,
+            self.world_rank,
+            self.topology.world_size,
+            self.tp_size,
+            self.dynamic_quant,
+            self.group_name,
+        )
         hidden_states, dynamic_scales, batch_info, expert_token_nums = outputs
         if waiter is not None:
             assert session is not None
-            control = torch.stack(
-                (
-                    batch_info[0],
-                    batch_info[2],
-                    expert_token_nums.sum(dtype=torch.int64),
+            if self.layered_gmm_enabled and (
+                session.capture is None or session.capture.mode != "FULL"
+            ):
+                # Layer selection stays on device; keep only lifecycle fences.
+                waiter.wait_for_stream()
+                session.advance_profiler()
+            else:
+                control = torch.stack(
+                    (
+                        batch_info[0],
+                        batch_info[2],
+                        expert_token_nums.sum(dtype=torch.int64),
+                    )
                 )
-            )
-            host_control = waiter.read_ffn_control(control)
-            states.host_control = host_control[:3]
+                states.host_control = waiter.read_ffn_control(control)[:3]
             if tracer is not None:
                 # A receive already pending at capture start has no begin marker.
                 execution = execution or tracer.new_work()
@@ -967,23 +973,23 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             tp_size=self.tp_size,
             group_name=self.group_name,
         )
-        with span(context.profile, "COMBINE_SEND"):
-            states.send_completion = torch.ops.afd_ascend.afd_async_combine_send(
-                ffn_output,
-                self.comm_args,
-                token_nums_rankid_layeridx,
-                self.comm_id,
-                self.max_num_batched_tokens,
-                states.hidden_size,
-                states.topk,
-                self.ffn_size,
-                self.attn_size,
-                self.expert_per_rank,
-                self.world_rank,
-                self.topology.world_size,
-                self.tp_size,
-                self.group_name,
-            )
+        transition(context.profile, "COMMUNICATION")
+        states.send_completion = torch.ops.afd_ascend.afd_async_combine_send(
+            ffn_output,
+            self.comm_args,
+            token_nums_rankid_layeridx,
+            self.comm_id,
+            self.max_num_batched_tokens,
+            states.hidden_size,
+            states.topk,
+            self.ffn_size,
+            self.attn_size,
+            self.expert_per_rank,
+            self.world_rank,
+            self.topology.world_size,
+            self.tp_size,
+            self.group_name,
+        )
         if context.profile is not None:
             context.profile.tracer.release_execution(context.profile)
             context.profile.tracer.transition(context.profile, "WAIT")

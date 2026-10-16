@@ -279,7 +279,7 @@ def _probe_cam_idle(output: Path) -> None:
     import torch
     import torch_npu  # noqa: F401
 
-    from afd_plugin.profiling.model import span
+    from afd_plugin.profiling.model import transition
     from afd_plugin.profiling.native import RuntimeProfiler
     from afd_plugin.profiling.npu import FFNDeviceWaiter
     from afd_plugin.profiling.session import Capture
@@ -339,8 +339,8 @@ def _probe_cam_idle(output: Path) -> None:
                         )
                     )
                     execution = tracer.new_work()
-                with span(execution, "DISPATCH_RECV"):
-                    values = original(*args)
+                transition(execution, "WAIT")
+                values = original(*args)
                 completed = torch_npu.npu.Event()
                 completed.record()
                 assert not completed.query(), "sender arrived before the idle probe"

@@ -165,6 +165,7 @@ def test_single_stage_gathers_once_at_dense_or_output_boundary(monkeypatch, dens
         torch.arange(1),
         SimpleNamespace(
             stage_idx=0,
+            profile_pipeline=None,
             connector=SimpleNamespace(
                 send_attn_output=lambda *args, **kwargs: None,
                 recv_ffn_output=lambda ref_tensor, ubatch_idx, context=None: ref_tensor,

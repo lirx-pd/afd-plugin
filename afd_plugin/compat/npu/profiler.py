@@ -151,6 +151,11 @@ def _create_npu_profiler(
             profiler, profiler.prof_if, profiler.on_trace_ready
         )
     profiler.start()
+    if lightweight:
+        from torch_npu.profiler.profiler_interface import _disable_event_record
+
+        # NPU-only capture still installs CPU record_function on every Event query.
+        _disable_event_record()
     return profiler
 
 

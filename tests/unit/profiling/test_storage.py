@@ -159,3 +159,13 @@ def test_writer_contains_background_io_failures(tmp_path, monkeypatch, failure):
     assert snapshot["closed"] is True
     assert snapshot["pending_records"] == 0
     assert snapshot["written_records"] + snapshot["dropped_records"] == 2
+
+
+def test_writer_notifies_control_on_failure_and_close(tmp_path):
+    changed = threading.Event()
+    writer = JsonRecordWriter(tmp_path / "records.jsonl", on_change=changed.set)
+    assert writer.submit({"invalid": object()})
+    assert changed.wait(2)
+    assert writer.close(2)
+    assert writer.snapshot()["closed"]
+    assert writer.snapshot()["error"]

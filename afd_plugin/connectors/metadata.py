@@ -304,11 +304,11 @@ class AFDForwardContextMetadata:
     num_stages: int
     transaction_id: str | None = None
     tokens_unpadded_lens: list[int] = field(default_factory=list)
-    profile_attention: Execution | None = None
+    profile_pipeline: Execution | None = None
 
     def clone(self) -> AFDForwardContextMetadata:
         cloned = copy.copy(self)
-        cloned.profile_attention = None
+        cloned.profile_pipeline = None
         cloned.tokens_start_loc = list(self.tokens_start_loc)
         cloned.requests_start_loc = list(self.requests_start_loc)
         cloned.tokens_lens = list(self.tokens_lens)

@@ -1,47 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Sparse model-boundary hooks with explicit native stage ownership."""
+"""Cache pipeline tracks at model entry and mark only phase boundaries."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import nullcontext
 from typing import TYPE_CHECKING, cast
-
-from afd_plugin.profiling import runtime_profiling_enabled
 
 if TYPE_CHECKING:
     from torch.nn import Module
 
     from afd_plugin.connectors import AFDConnectorBase, AFDForwardContextMetadata
     from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
-    from afd_plugin.profiling.tracing import Execution, Span
+    from afd_plugin.profiling.tracing import Execution
 
 
-def span(execution: Execution | None, kind: str) -> Span | nullcontext:
-    return (
-        execution.tracer.span(execution, kind)
-        if execution is not None
-        else nullcontext()
-    )
-
-
-def host_span(execution: Execution | None, kind: str) -> Span | nullcontext:
-    return (
-        execution.tracer.host_span(execution, kind)
-        if execution is not None
-        else nullcontext()
-    )
+def transition(execution: Execution | None, phase: str) -> None:
+    if execution is not None:
+        execution.tracer.transition(execution, phase)
 
 
 def begin_profile_call(metadata: AFDForwardContextMetadata) -> Execution | None:
-    if not runtime_profiling_enabled():
-        return None
-    attention = metadata.profile_attention
-    if attention is not None:
-        metadata.profile_attention = None
-        return attention
-    return cast("CAMAsyncAFDConnector", metadata.connector).begin_profile_call()
+    execution = metadata.profile_pipeline
+    if execution is not None and execution.tracer.retain_execution(execution):
+        return execution
+    return None
 
 
 def begin_profile_step(connector: AFDConnectorBase) -> Execution | None:
@@ -55,20 +38,16 @@ def begin_profile_step(connector: AFDConnectorBase) -> Execution | None:
     return execution
 
 
-def install_attention_hooks(
+def install_pipeline_hook(
     module: Module,
     metadata_provider: Callable[[], AFDForwardContextMetadata | None],
 ) -> None:
-    """Retain native V4 forward and attach timing only to its Attention module."""
+    """One hook per model also runs on each native DBO child stream."""
 
-    def begin(attention_module, args) -> None:
+    def begin(model_module, args) -> None:
         metadata = metadata_provider()
         if metadata is None:
             return
-        connector = cast("CAMAsyncAFDConnector", metadata.connector)
-        execution = connector.begin_profile_call()
-        metadata.profile_attention = execution
-        if execution is not None:
-            execution.tracer.transition(execution, "COMPUTE")
+        metadata.profile_pipeline = begin_profile_step(metadata.connector)
 
     module.register_forward_pre_hook(begin)

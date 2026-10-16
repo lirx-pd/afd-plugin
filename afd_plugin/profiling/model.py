@@ -42,7 +42,7 @@ def install_pipeline_hook(
     module: Module,
     metadata_provider: Callable[[], AFDForwardContextMetadata | None],
 ) -> None:
-    """One hook per model also runs on each native DBO child stream."""
+    """Initialize once per forward, including each native DBO child stream."""
 
     def begin(model_module, args) -> None:
         metadata = metadata_provider()
@@ -50,4 +50,5 @@ def install_pipeline_hook(
             return
         metadata.profile_pipeline = begin_profile_step(metadata.connector)
 
-    module.register_forward_pre_hook(begin)
+    # vLLM's compiled model __call__ bypasses model hooks, even in eager mode.
+    module.layers[module.start_layer].register_forward_pre_hook(begin)

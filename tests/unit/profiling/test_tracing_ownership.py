@@ -13,6 +13,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from afd_plugin.profiling.model import begin_profile_call, install_pipeline_hook
 from afd_plugin.profiling.session import Capture
 
 
@@ -132,3 +133,45 @@ def test_layer_release_does_not_break_adjacent_compute(tracer):
     tracer.idle(capture)
     assert native._mark.call_count == 2
     assert native._mark.call_args.args[0] == "afd.cam|WAIT"
+
+
+@pytest.mark.parametrize("start_layer", [0, 1])
+def test_compiled_model_entry_retains_and_releases_every_call(tracer, start_layer):
+    torch = pytest.importorskip("torch")
+    tracer, capture, _ = tracer
+    metadata = SimpleNamespace(
+        connector=SimpleNamespace(profile_session=SimpleNamespace(tracer=tracer))
+    )
+
+    class Layer(torch.nn.Module):
+        def forward(self):
+            execution = begin_profile_call(metadata)
+            assert execution is not None
+            assert tracer.pending_count() == 1
+            tracer.release_execution(execution)
+
+    class CompiledModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.start_layer = start_layer
+            self.layers = torch.nn.ModuleList(
+                [torch.nn.Identity()] * start_layer + [Layer()]
+            )
+
+        def forward(self):
+            return self.layers[self.start_layer]()
+
+        def __call__(self):
+            # Match support_torch_compile's eager path: no Module._call_impl.
+            metadata.profile_pipeline = None
+            return self.forward()
+
+    model = CompiledModel()
+    install_pipeline_hook(model, lambda: metadata)
+    tracing = importlib.import_module("afd_plugin.profiling.tracing")
+    for _ in range(tracing.MAX_PENDING_EXECUTIONS + 1):
+        model()
+        assert tracer.pending_count() == 0
+    tracer.finish_capture(capture)
+    assert tracer.snapshot()["unresolved_spans"] == 0
+    assert tracer.snapshot()["dropped_spans"] == 0

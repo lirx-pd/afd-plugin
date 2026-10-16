@@ -23,14 +23,15 @@ def test_pipeline_caches_track_but_checks_admission_each_layer():
 
 
 def test_model_hook_refreshes_stream_for_each_dbo_child_and_generation():
-    module = SimpleNamespace(register_forward_pre_hook=Mock())
+    layer = SimpleNamespace(register_forward_pre_hook=Mock())
+    module = SimpleNamespace(layers=[None, layer], start_layer=1)
     tracer = SimpleNamespace(execution=Mock(), transition=Mock())
     metadata = SimpleNamespace(
         connector=SimpleNamespace(profile_session=SimpleNamespace(tracer=tracer)),
         profile_pipeline=None,
     )
     install_pipeline_hook(module, lambda: metadata)
-    hook = module.register_forward_pre_hook.call_args.args[0]
+    hook = layer.register_forward_pre_hook.call_args.args[0]
     for _ in range(3):
         execution = SimpleNamespace(tracer=tracer)
         tracer.execution.return_value = execution

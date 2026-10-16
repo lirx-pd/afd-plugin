@@ -352,6 +352,17 @@ request pairing is inferred. The initial interval before a stream's first marker
 is unobserved. A native host END marker clips queued work at the capture boundary
 and closes a stream waiting indefinitely for its peer.
 
+Clock alignment groups workers by Linux boot ID, rather than hostname. Workers
+on the coordinator's host use zero offset; workers sharing another host receive
+one common estimate. After preparation, three status probes bound each worker's
+clock offset between `worker_time - response_received` and
+`worker_time - request_sent`. The intersection of these bounds determines the
+host's offset and uncertainty, without assuming symmetric network/RPC latency.
+Inconsistent bounds fail the session before commit. Hosts without a boot ID
+retain separate worker estimates. Cross-host uncertainty describes calibration
+time and assumes stable clock offsets during capture; it does not measure native
+device-to-host timestamp mapping error or guarantee zero drift in long captures.
+
 `FULL` retains CPU/NPU activities, Level2, shape recording and configured
 stack/modules. Both modes use unchanged upstream CAM operators; `csrc` and the
 wire protocol are unchanged. Layered FFN keeps layer selection on device and

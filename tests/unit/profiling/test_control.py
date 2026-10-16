@@ -8,12 +8,14 @@ import errno
 import json
 import time
 import uuid
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from afd_plugin import profiling
 from afd_plugin.profiling import control
 
 
@@ -30,6 +32,8 @@ class FakeFleet:
                     "command_seq": 0,
                     "wall_time_ns": 0,
                     "monotonic_ns": 0,
+                    "host_clock_id": f"{role}-boot-id",
+                    "host": "same-hostname",
                     "capabilities": ["LIGHTWEIGHT"],
                     "error": None,
                     "details": {},
@@ -109,6 +113,11 @@ def make_coordinator(tmp_path, fleet):
     return coordinator, client
 
 
+def test_non_linux_host_clock_identity_is_unknown(monkeypatch):
+    monkeypatch.setattr(profiling, "sys", SimpleNamespace(platform="darwin"))
+    assert profiling.host_clock_id() is None
+
+
 @pytest.mark.parametrize("mode", ["LIGHTWEIGHT", "FULL"])
 def test_session_covers_all_dp_workers_and_adjusts_each_host_clock(tmp_path, mode):
     async def run():
@@ -155,8 +164,192 @@ def test_session_covers_all_dp_workers_and_adjusts_each_host_clock(tmp_path, mod
         assert all(
             w["details"]["native_profiler"]["trace_dir"] for w in manifest["workers"]
         )
-        assert manifest["clock_method"] == "empirical_http_midpoint_per_worker"
+        assert manifest["clock_method"] == "host_clock_interval_intersection"
         assert not (session.directory / "manifest.json.tmp").exists()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["LIGHTWEIGHT", "FULL"])
+def test_local_workers_keep_zero_offset_despite_rpc_delays(tmp_path, mode):
+    async def run():
+        fleet = FakeFleet()
+        fleet.offsets = {"attention": 0, "ffn": 0}
+        fleet.delay_s = 0.003
+        coordinator, client = make_coordinator(tmp_path, fleet)
+        coordinator.host_clock_id = "local-boot-id"
+        for workers in fleet.workers.values():
+            for worker in workers:
+                worker["host_clock_id"] = coordinator.host_clock_id
+                worker["capabilities"] = [mode]
+        async with client:
+            session = coordinator.start(control.StartRequest(mode=mode, duration=0.005))
+            await asyncio.wait_for(session.task, 2.0)
+        assert session.state == "COMPLETED", session.errors
+        assert len(session.clock_by_worker) == 4
+        assert all(
+            clock == {"offset_ns": 0, "uncertainty_ns": 0}
+            for clock in session.clock_by_worker.values()
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("known_host", [True, False])
+def test_remote_workers_share_only_verified_host_clocks(tmp_path, known_host):
+    async def run():
+        fleet = FakeFleet()
+        if known_host:
+            fleet.offsets = {"attention": -7_000_000_000, "ffn": -7_000_000_000}
+        for workers in fleet.workers.values():
+            for worker in workers:
+                if known_host:
+                    worker["host_clock_id"] = "remote-boot-id"
+                else:
+                    worker.pop("host_clock_id")
+        coordinator, client = make_coordinator(tmp_path, fleet)
+        async with client:
+            session = coordinator.start(
+                control.StartRequest(mode="LIGHTWEIGHT", duration=0.005)
+            )
+            await asyncio.wait_for(session.task, 2.0)
+        assert session.state == "COMPLETED", session.errors
+        for worker_id, clock in session.clock_by_worker.items():
+            actual = fleet.offsets[worker_id.split("-")[0]]
+            assert abs(clock["offset_ns"] - actual) <= clock["uncertainty_ns"]
+        if known_host:
+            assert (
+                len({tuple(c.items()) for c in session.clock_by_worker.values()}) == 1
+            )
+
+    asyncio.run(run())
+
+
+def test_request_bounds_include_asymmetric_worker_queueing(tmp_path, monkeypatch):
+    async def run():
+        fleet = FakeFleet()
+        coordinator, client = make_coordinator(tmp_path, fleet)
+        origin = 1_700_000_000_000_000_000
+        walls = iter([origin, origin + 101])
+        monotonic = iter([1_000, 1_101])
+        monkeypatch.setattr(
+            control,
+            "time",
+            SimpleNamespace(
+                time_ns=lambda: next(walls), monotonic_ns=lambda: next(monotonic)
+            ),
+        )
+
+        async def response(request):
+            # Two workers sample near opposite ends of the same RPC round trip.
+            workers = fleet.workers["attention"]
+            for worker, delay in zip(workers, [7, 96], strict=True):
+                worker["wall_time_ns"] = origin - 1_000 + delay
+            return httpx.Response(200, json={"workers": workers})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as probe:
+            coordinator.client = probe
+            _, bounds, elapsed = await coordinator._request(
+                "http://attention", "status", {}
+            )
+        await client.aclose()
+        assert elapsed == 101
+        assert bounds == {
+            "attention-dp0": (-1_094, -993),
+            "attention-dp1": (-1_005, -904),
+        }
+        assert all(lower <= -1_000 <= upper for lower, upper in bounds.values())
+
+    asyncio.run(run())
+
+
+def test_host_bounds_intersect_all_workers_and_probes_with_integer_rounding(
+    tmp_path, monkeypatch
+):
+    async def run():
+        fleet = FakeFleet()
+        coordinator, client = make_coordinator(tmp_path, fleet)
+        workers = fleet.workers["attention"]
+        session = control.Session(
+            str(uuid.uuid4()),
+            control.StartRequest(mode="LIGHTWEIGHT", duration=1),
+            tmp_path,
+            workers=workers,
+        )
+        probes = iter(
+            [
+                {"attention-dp0": (-100, 0), "attention-dp1": (-90, -10)},
+                {"attention-dp0": (-75, -30), "attention-dp1": (-60, -35)},
+                {"attention-dp0": (-45, -34), "attention-dp1": (-43, -36)},
+            ]
+        )
+
+        async def exchange(current, action, command):
+            assert current is session and action == "status"
+            return next(probes), 100
+
+        monkeypatch.setattr(coordinator, "_exchange", exchange)
+        async with client:
+            await coordinator._calibrate_clocks(session)
+        # Feasible offsets are [-43, -36]; the integer bound must include both ends.
+        assert list(session.clock_by_worker.values()) == [
+            {"offset_ns": -40, "uncertainty_ns": 4},
+            {"offset_ns": -40, "uncertainty_ns": 4},
+        ]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("local_host", [False, True])
+def test_inconsistent_host_samples_roll_back_without_committing(tmp_path, local_host):
+    async def run():
+        fleet = FakeFleet()
+        coordinator, client = make_coordinator(tmp_path, fleet)
+        coordinator.host_clock_id = "local-boot-id"
+        for workers in fleet.workers.values():
+            for worker in workers:
+                worker["host_clock_id"] = (
+                    coordinator.host_clock_id if local_host else "same-boot-id"
+                )
+        async with client:
+            session = coordinator.start(
+                control.StartRequest(mode="LIGHTWEIGHT", duration=1)
+            )
+            await asyncio.wait_for(session.task, 2.0)
+        assert session.state == "FAILED"
+        assert session.data_quality == "INVALID"
+        assert any("Inconsistent host clock" in error for error in session.errors)
+        assert all(action != "commit" for _, action, _ in fleet.calls)
+        assert {role for role, action, _ in fleet.calls if action == "stop"} == {
+            "attention",
+            "ffn",
+        }
+
+    asyncio.run(run())
+
+
+def test_stop_during_calibration_never_commits(tmp_path, monkeypatch):
+    async def run():
+        fleet = FakeFleet()
+        coordinator, client = make_coordinator(tmp_path, fleet)
+        exchange = coordinator._exchange
+
+        async def stop_after_probe(session, action, command, **kwargs):
+            result = await exchange(session, action, command, **kwargs)
+            if action == "status" and all(
+                worker["state"] == "PREPARED" for worker in session.workers
+            ):
+                coordinator.stop(session.session_id)
+            return result
+
+        monkeypatch.setattr(coordinator, "_exchange", stop_after_probe)
+        async with client:
+            session = coordinator.start(
+                control.StartRequest(mode="LIGHTWEIGHT", duration=1)
+            )
+            await asyncio.wait_for(session.task, 2.0)
+        assert session.state == "COMPLETED", session.errors
+        assert all(action != "commit" for _, action, _ in fleet.calls)
 
     asyncio.run(run())
 
@@ -521,9 +714,14 @@ def test_restart_restores_terminal_session_without_contacting_workers(tmp_path):
         fleet = FakeFleet()
         coordinator, client = make_coordinator(tmp_path, fleet)
         previous = save_previous_session(coordinator, fleet, state="COMPLETED")
+        previous.clock_method = "empirical_http_midpoint_per_worker"
+        coordinator._persist(previous)
         async with client:
             await coordinator.recover()
         assert coordinator.get(previous.session_id).state == "COMPLETED"
+        assert coordinator.get(previous.session_id).snapshot()["clock_method"] == (
+            "empirical_http_midpoint_per_worker"
+        )
         assert not fleet.calls
 
     asyncio.run(run())

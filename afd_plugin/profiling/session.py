@@ -12,7 +12,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from afd_plugin.profiling import MAX_DURATION_S, MAX_LIGHTWEIGHT_DURATION_S
+from afd_plugin.profiling import (
+    MAX_DURATION_S,
+    MAX_LIGHTWEIGHT_DURATION_S,
+    host_clock_id,
+)
 from afd_plugin.profiling.storage import JsonRecordWriter
 
 if TYPE_CHECKING:
@@ -82,6 +86,7 @@ class WorkerSession:
         self.tracer = tracer
         self.device_waiter: FFNDeviceWaiter | None = None
         self.identity = identity
+        self.host_clock_id = host_clock_id()
         self.capture: Capture | None = None
         self.state = "IDLE"
         self.command_seq = 0
@@ -296,6 +301,7 @@ class WorkerSession:
                     "start_host_ns": start_host_ns,
                     "generation": capture.generation,
                     "identity": self.identity,
+                    "host_clock_id": self.host_clock_id,
                     "requires_summary": True,
                     "mode": capture.mode,
                     "view": "pipeline" if capture.mode == "LIGHTWEIGHT" else "full",
@@ -408,6 +414,7 @@ class WorkerSession:
             "state": self.state,
             "session_id": capture.session_id if capture else None,
             "command_seq": self.command_seq,
+            "host_clock_id": self.host_clock_id,
             "wall_time_ns": time.time_ns(),
             "monotonic_ns": time.monotonic_ns(),
             "capabilities": ["LIGHTWEIGHT", "FULL"]

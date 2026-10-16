@@ -24,7 +24,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from afd_plugin.profiling import MAX_DURATION_S, MAX_LIGHTWEIGHT_DURATION_S
+from afd_plugin.profiling import (
+    MAX_DURATION_S,
+    MAX_LIGHTWEIGHT_DURATION_S,
+    host_clock_id,
+)
 
 HTTP_TIMEOUT_S = 10.0
 POLL_INTERVAL_S = 0.1
@@ -33,6 +37,7 @@ START_TIMEOUT_S = 30.0
 STOP_TIMEOUT_S = 15.0
 LEASE_GRACE_S = 60.0
 NANOSECONDS_PER_SECOND = 1_000_000_000
+CLOCK_CALIBRATION_SAMPLES = 3
 TERMINAL_STATES = frozenset(("COMPLETED", "FAILED"))
 
 
@@ -63,6 +68,7 @@ class WorkerSnapshot(BaseModel):
     command_seq: int
     wall_time_ns: int
     monotonic_ns: int
+    host_clock_id: str | None = None
     capabilities: list[str]
     error: Any = None
     details: dict[str, Any] = Field(default_factory=dict)
@@ -77,6 +83,7 @@ class Session:
     workers: list[dict[str, Any]] = field(default_factory=list)
     roster: dict[str, tuple[str, ...]] = field(default_factory=dict)
     clock_by_worker: dict[str, dict[str, int]] = field(default_factory=dict)
+    clock_method: str = "host_clock_interval_intersection"
     errors: list[str] = field(default_factory=list)
     start_at_ns: int | None = None
     data_quality: str = "INVALID"
@@ -94,7 +101,7 @@ class Session:
             "workers": self.workers,
             "roster": self.roster,
             "start_at_ns": self.start_at_ns,
-            "clock_method": "empirical_http_midpoint_per_worker",
+            "clock_method": self.clock_method,
             "clock_by_worker": self.clock_by_worker,
             "data_quality": self.data_quality,
             "errors": self.errors,
@@ -130,6 +137,7 @@ class ProfileCoordinator:
         self.token = token
         self.output_directory = output_directory
         self.client = client
+        self.host_clock_id = host_clock_id()
         self.sessions: dict[str, Session] = {}
         self.keys: dict[str, str] = {}
         self.active: Session | None = None
@@ -170,6 +178,7 @@ class ProfileCoordinator:
                     for target, workers in payload["roster"].items()
                 },
                 clock_by_worker=payload["clock_by_worker"],
+                clock_method=payload["clock_method"],
                 errors=payload["errors"],
                 start_at_ns=payload["start_at_ns"],
                 data_quality=payload["data_quality"],
@@ -258,7 +267,7 @@ class ProfileCoordinator:
 
     async def _request(
         self, target: str, action: str, command: dict[str, Any]
-    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, int]], int]:
+    ) -> tuple[list[dict[str, Any]], dict[str, tuple[int, int]], int]:
         wall_before = time.time_ns()
         monotonic_before = time.monotonic_ns()
         response = await asyncio.wait_for(
@@ -272,33 +281,33 @@ class ProfileCoordinator:
             HTTP_TIMEOUT_S,
         )
         elapsed = time.monotonic_ns() - monotonic_before
+        wall_after = time.time_ns()
         response.raise_for_status()
         payload = response.json()
         workers = [WorkerSnapshot.model_validate(item) for item in payload["workers"]]
         if not workers:
             raise ValueError(f"{target}: empty worker roster")
-        midpoint = wall_before + elapsed // 2
-        # The entire HTTP round trip covers queueing and serial worker responses.
-        # This is an empirical bound, not a clock synchronization guarantee.
+        # A worker reads its clock between request send and response receipt.
+        # These bounds include RPC queueing without assuming symmetric latency.
         clocks = {
-            worker.worker_id: {
-                "offset_ns": worker.wall_time_ns - midpoint,
-                "uncertainty_ns": elapsed,
-            }
+            worker.worker_id: (
+                worker.wall_time_ns - wall_after,
+                worker.wall_time_ns - wall_before,
+            )
             for worker in workers
         }
         return [worker.model_dump() for worker in workers], clocks, elapsed
 
     async def _exchange(
         self, session: Session, action: str, command: dict[str, Any], *, discover=False
-    ) -> int:
+    ) -> tuple[dict[str, tuple[int, int]], int]:
         results = await asyncio.gather(
             *(self._request(target, action, command) for target in self.targets),
             return_exceptions=True,
         )
         workers: list[dict[str, Any]] = []
         roster: dict[str, tuple[str, ...]] = {}
-        clocks: dict[str, dict[str, int]] = {}
+        clocks: dict[str, tuple[int, int]] = {}
         failures: list[str] = []
         max_rtt = 0
         for target, result in zip(self.targets, results, strict=True):
@@ -320,8 +329,6 @@ class ProfileCoordinator:
                 failures.append("Profiling requires both attention and FFN workers")
         elif roster != session.roster:
             failures.append("Worker roster changed or a participant is missing")
-        if action == "prepare":
-            session.clock_by_worker = clocks
         if action != "status" or not discover:
             for worker in workers:
                 if worker["session_id"] != session.session_id:
@@ -330,6 +337,46 @@ class ProfileCoordinator:
                     failures.append(f"{worker['worker_id']}: {worker['error']}")
         if failures:
             raise RuntimeError("; ".join(failures))
+        return clocks, max_rtt
+
+    async def _calibrate_clocks(self, session: Session) -> int:
+        hosts = {
+            worker["worker_id"]: ("host", worker["host_clock_id"])
+            if worker["host_clock_id"]
+            else ("worker", worker["worker_id"])
+            for worker in session.workers
+        }
+        bounds: dict[tuple[str, str], tuple[int, int]] = {}
+        if self.host_clock_id:
+            bounds[("host", self.host_clock_id)] = (0, 0)
+        max_rtt = 0
+        for _ in range(CLOCK_CALIBRATION_SAMPLES):
+            if session.stop_requested.is_set():
+                return max_rtt
+            samples, elapsed = await self._exchange(
+                session, "status", {"session_id": session.session_id}
+            )
+            max_rtt = max(max_rtt, elapsed)
+            for worker_id, (lower, upper) in samples.items():
+                host = hosts[worker_id]
+                if host in bounds:
+                    previous_lower, previous_upper = bounds[host]
+                    lower, upper = (
+                        max(lower, previous_lower),
+                        min(upper, previous_upper),
+                    )
+                if lower > upper:
+                    raise ValueError(
+                        "Inconsistent host clock samples during calibration"
+                    )
+                bounds[host] = (lower, upper)
+        session.clock_by_worker = {}
+        for worker_id, host in hosts.items():
+            lower, upper = bounds[host]
+            session.clock_by_worker[worker_id] = {
+                "offset_ns": (lower + upper) // 2,
+                "uncertainty_ns": (upper - lower + 1) // 2,
+            }
         return max_rtt
 
     async def _run(self, session: Session) -> None:
@@ -342,7 +389,7 @@ class ProfileCoordinator:
             ):
                 raise RuntimeError(f"Worker capability missing: {session.request.mode}")
             lease_s = session.request.duration + LEASE_GRACE_S
-            max_rtt = await self._exchange(
+            _, max_rtt = await self._exchange(
                 session,
                 "prepare",
                 {
@@ -355,6 +402,8 @@ class ProfileCoordinator:
             )
             if any(worker["state"] != "PREPARED" for worker in session.workers):
                 raise RuntimeError("Not all workers reached PREPARED")
+            if not session.stop_requested.is_set():
+                max_rtt = max(max_rtt, await self._calibrate_clocks(session))
             if not session.stop_requested.is_set():
                 await self._commit_and_record(session, max_rtt, lease_s)
         except Exception as error:

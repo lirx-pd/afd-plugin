@@ -167,6 +167,7 @@ def test_lifecycle_uses_monotonic_admission_and_per_worker_clock(worker_session)
     prepared = session.prepare(prepare_command(), backend_busy=False)
     capture = session.capture
     assert prepared["state"] == "PREPARED"
+    assert prepared["host_clock_id"] == session_module.host_clock_id()
     assert not capture.admits()
     offset = 5_000_000_000
     local_start = clock.time_ns() + 100_000_000
@@ -205,6 +206,7 @@ def test_lifecycle_uses_monotonic_admission_and_per_worker_clock(worker_session)
     path = session.output_dir / capture.session_id / "attention-dp0.jsonl"
     records = [json.loads(line) for line in path.read_text().splitlines()]
     assert [record["record_type"] for record in records] == ["SESSION", "FINISHED"]
+    assert records[0]["host_clock_id"] == prepared["host_clock_id"]
 
 
 def test_command_retries_are_idempotent_and_stale_commands_are_rejected(worker_session):

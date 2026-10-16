@@ -19,7 +19,6 @@ import torch
 import torch.nn as nn
 from transformers import DeepseekV2Config
 from vllm.config import VllmConfig
-from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -49,7 +48,6 @@ from afd_plugin.profiling.model import (
     begin_profile_call,
     host_span,
     install_attention_hooks,
-    record_source_call,
     span,
 )
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
@@ -271,12 +269,7 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         afd_metadata = get_afd_metadata_from_forward_context()
         if afd_metadata is None:
             raise RuntimeError("Async CAM requires AFD forward metadata")
-        sequence, execution = begin_profile_call(afd_metadata)
-        if execution is not None and self.use_sequence_parallel_moe:
-            # Ascend 8d4409d6 sp_shard/sp_reduce_scatter produce equal TP row shards.
-            afd_metadata.profile_sp_origin = (
-                get_tensor_model_parallel_rank() * hidden_states.shape[0]
-            )
+        execution = begin_profile_call(afd_metadata)
         with span(execution, "GATE"):
             topk_weights, topk_ids = (
                 deepseek_v4_attention_gate.compute_attention_gate_topk(
@@ -299,11 +292,7 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
                 stage_idx=afd_metadata.stage_idx,
                 seq_len=int(dispatch_payload.hidden_states.shape[0]),
             ),
-            dispatch_seq=sequence,
             profile=execution,
-        )
-        record_source_call(
-            execution, afd_metadata, self.layer_idx, dispatch_payload.layout
         )
         receive = send_async_cam_remote_call(
             afd_metadata.connector,
@@ -312,12 +301,10 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
             topk_weights=dispatch_payload.topk_weights,
             topk_ids=dispatch_payload.topk_ids,
         )
-        with span(execution, "SHARED_EXPERT"):
-            shared_output = (
-                self.shared_experts(hidden_states)
-                if self.shared_experts is not None
-                else None
-            )
+        shared_output = None
+        if self.shared_experts is not None:
+            with span(execution, "SHARED_EXPERT"):
+                shared_output = self.shared_experts(hidden_states)
         with host_span(execution, "DBO_HOST_WAIT"):
             maybe_apply_dbo_yield(hidden_states, role="attention")
         output = receive()

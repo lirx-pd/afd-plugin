@@ -179,6 +179,7 @@ class _FakeTorchNPUProfiler:
 
     class ProfilerLevel:
         Level2 = "level2"
+        Level_none = "level_none"
 
     class AiCMetrics:
         AiCoreNone = "aicore_none"
@@ -201,7 +202,8 @@ class _FakeTorchNPUProfiler:
         self.schedule_kwargs = kwargs
         return kwargs
 
-    def tensorboard_trace_handler(self, trace_dir):
+    def tensorboard_trace_handler(self, trace_dir, **kwargs):
+        self.handler_kwargs = kwargs
         self.trace_dir = trace_dir
         return ("handler", trace_dir)
 
@@ -237,3 +239,36 @@ def test_ffn_stop_preserves_native_cleanup_without_synchronizing(
     _stop_ffn_trace(interface)
     expected = (["flops"] if flops else []) + ["native", "gc", "events"]
     assert calls == (expected if valid else [])
+
+
+def test_lightweight_collects_only_layer_ranges_without_inline_analysis(monkeypatch):
+    profiler_module = _FakeTorchNPUProfiler()
+    monkeypatch.setitem(
+        sys.modules, "torch_npu", SimpleNamespace(profiler=profiler_module)
+    )
+    monkeypatch.setenv("AFD_NPU_ATTENTION_PROFILER_WITH_STACK", "1")
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu.profiler._profiler_action_controller",
+        SimpleNamespace(ProfActionController=lambda *args: None),
+    )
+    create_runtime_npu_profiler(
+        "attention", "/session/worker/lightweight", lightweight=True
+    )
+    config = profiler_module.profile_kwargs
+    assert config["activities"] == ["npu"]
+    for field in (
+        "record_shapes",
+        "profile_memory",
+        "with_flops",
+        "with_stack",
+        "with_modules",
+    ):
+        assert config[field] is False
+    assert config["schedule"] is None
+    experimental = config["experimental_config"]
+    assert experimental["profiler_level"] == "level_none"
+    assert experimental["aic_metrics"] == "aicore_none"
+    assert profiler_module.handler_kwargs == {"analyse_flag": False}
+    assert experimental["mstx"] is True
+    assert experimental["mstx_domain_include"] == ["afd.cam"]

@@ -628,12 +628,6 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
             )
             if not already_sequence_parallel:
                 residual = native.sequence_parallel_chunk(residual)
-            if self.cam_profile_enabled:
-                afd_metadata = get_afd_metadata_from_forward_context()
-                if afd_metadata is not None:
-                    afd_metadata.profile_sp_origin = (
-                        native.get_tensor_model_parallel_rank() * hidden_states.shape[0]
-                    )
 
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states,

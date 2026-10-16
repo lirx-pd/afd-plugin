@@ -4,10 +4,16 @@
 
 from __future__ import annotations
 
+import gzip
 import json
+import os
 import queue
+import shutil
+import tarfile
 import threading
 from pathlib import Path
+
+ARCHIVE_BUFFER_BYTES = 1024 * 1024
 
 
 class JsonRecordWriter:
@@ -146,3 +152,34 @@ class JsonRecordWriter:
                 self._fail(f"{type(exc).__name__}: {exc}")
             with self._lock:
                 self._closed = True
+
+
+def archive_native_trace(directory: Path) -> Path:
+    """Replace a finalized native directory only after a durable verified archive."""
+    target = directory.with_name(directory.name + ".tar.gz")
+    temporary = target.with_name(target.name + ".tmp")
+    if directory.is_symlink() or any(
+        path.is_symlink() for path in directory.rglob("*")
+    ):
+        raise ValueError("native capture contains symlinks")
+    try:
+        with temporary.open("xb") as output:
+            with tarfile.open(fileobj=output, mode="w:gz", compresslevel=1) as archive:
+                archive.add(directory, arcname=directory.name)
+            output.flush()
+            os.fsync(output.fileno())
+        # Consume the gzip footer before deleting the original data.
+        with gzip.open(temporary, "rb") as source:
+            while source.read(ARCHIVE_BUFFER_BYTES):
+                pass
+        temporary.replace(target)
+        parent = os.open(directory.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+        shutil.rmtree(directory)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return target

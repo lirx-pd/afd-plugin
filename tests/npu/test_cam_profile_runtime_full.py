@@ -31,7 +31,7 @@ def _probe(output: Path) -> None:
     import torch
     import torch_npu
 
-    from afd_plugin.profiling.full import RuntimeFullProfiler
+    from afd_plugin.profiling.native import RuntimeProfiler
 
     for key, value in {
         "ENABLE": "0",
@@ -53,7 +53,7 @@ def _probe(output: Path) -> None:
             torch.mm(matrix, matrix, out=target)
             torch_npu.npu.synchronize()
             for mode in ("idle", "active"):
-                runtime = RuntimeFullProfiler("attention", output / mode)
+                runtime = RuntimeProfiler("attention", output / mode)
                 runtime.start()
                 runtime.step()
                 assert runtime.state == "RUNNING", runtime.snapshot()
@@ -119,7 +119,7 @@ def _probe_cooperative(output: Path) -> None:
     import torch
     import torch_npu
 
-    from afd_plugin.profiling.full import RuntimeFullProfiler
+    from afd_plugin.profiling.native import RuntimeProfiler
     from afd_plugin.profiling.npu import FFNDeviceWaiter
     from afd_plugin.profiling.session import WorkerSession
 
@@ -137,7 +137,7 @@ def _probe_cooperative(output: Path) -> None:
         output,
         None,
         {},
-        full_factory=partial(RuntimeFullProfiler, "ffn"),
+        profiler_factory=partial(RuntimeProfiler, "ffn"),
         tracer_factory=unexpected_tracer,
     )
     waiter = FFNDeviceWaiter(device, session)
@@ -170,14 +170,14 @@ def _probe_cooperative(output: Path) -> None:
             "clock_by_worker": {"ffn-test": {"offset_ns": 0, "uncertainty_ns": 0}},
         }
     )
-    runtime = session.capture.full
+    runtime = session.capture.profiler
     observations: list[dict] = []
     wait_calls = 0
     diagnostics = {
         "start_ns": session.capture.start_ns,
         "deadline_ns": session.capture.deadline_ns,
     }
-    advance_full = session.advance_full
+    advance_profiler = session.advance_profiler
     wait_for_stream = waiter.wait_for_stream
 
     def observe_copy() -> None:
@@ -192,7 +192,7 @@ def _probe_cooperative(output: Path) -> None:
             diagnostics["pending_after_event_record"] = pending_before
             diagnostics["first_full_state"] = runtime.state
             diagnostics["first_session_state"] = session.state
-        advance_full(**kwargs)
+        advance_profiler(**kwargs)
         if runtime.started_at_ns is not None and not observations:
             session.tick()
             observations.append(
@@ -204,7 +204,7 @@ def _probe_cooperative(output: Path) -> None:
                 }
             )
 
-    session.advance_full = observe_start
+    session.advance_profiler = observe_start
     waiter.wait_for_stream = observe_copy
     waiter.begin_receive()
     queue_begin = time.monotonic()
@@ -279,8 +279,11 @@ def _probe_cam_idle(output: Path) -> None:
     import torch
     import torch_npu  # noqa: F401
 
-    from afd_plugin.profiling.full import RuntimeFullProfiler
-    from afd_plugin.profiling.npu import EventTimestampReader, FFNDeviceWaiter
+    from afd_plugin.profiling.model import span
+    from afd_plugin.profiling.native import RuntimeProfiler
+    from afd_plugin.profiling.npu import FFNDeviceWaiter
+    from afd_plugin.profiling.session import Capture
+    from afd_plugin.profiling.tracing import DeviceTracer
     from tests.npu.async_cam_common import HarnessConfig, NativeHarness
 
     os.environ["AFD_NPU_FFN_PROFILER_WITH_STACK"] = "0"
@@ -304,13 +307,17 @@ def _probe_cam_idle(output: Path) -> None:
             )
             target = torch.empty_like(matrix)
             waiter = FFNDeviceWaiter(
-                harness.device, SimpleNamespace(advance_full=lambda **kwargs: None)
+                harness.device, SimpleNamespace(advance_profiler=lambda **kwargs: None)
             )
-            reader = EventTimestampReader()
-        for variant in ("start_before_receive", "start_during_receive"):
 
-            def receive(*args, variant=variant):
-                runtime = RuntimeFullProfiler("ffn", output / variant)
+        for mode, variant in (
+            (mode, variant)
+            for mode in ("FULL", "LIGHTWEIGHT")
+            for variant in ("start_before_receive", "start_during_receive")
+        ):
+
+            def receive(*args, variant=variant, mode=mode):
+                runtime = RuntimeProfiler("ffn", output / mode / variant, mode)
                 if variant == "start_before_receive":
                     runtime.start()
                     runtime.step(startup_only=True)
@@ -318,9 +325,25 @@ def _probe_cam_idle(output: Path) -> None:
                         for _ in range(ITERATIONS):
                             torch.mm(matrix, matrix, out=target)
                 waiter.begin_receive()
-                values = original(*args)
-                waiter.end_receive()
-                assert not waiter.end.query(), "sender arrived before the idle probe"
+                execution = None
+                if mode == "LIGHTWEIGHT":
+                    tracer = DeviceTracer(harness.device, "f0")
+                    tracer.session = SimpleNamespace(
+                        capture=Capture(
+                            "idle-probe",
+                            1,
+                            SimpleNamespace(),
+                            accepting=runtime.state == "RUNNING",
+                            deadline_ns=time.monotonic_ns()
+                            + int(config.timeout_seconds * 1e9),
+                        )
+                    )
+                    execution = tracer.new_work()
+                with span(execution, "DISPATCH_RECV"):
+                    values = original(*args)
+                completed = torch_npu.npu.Event()
+                completed.record()
+                assert not completed.query(), "sender arrived before the idle probe"
                 if variant == "start_during_receive":
                     runtime.start()
                     runtime.step(startup_only=True)
@@ -334,7 +357,7 @@ def _probe_cam_idle(output: Path) -> None:
                 runtime.step()
                 seconds = time.monotonic() - begin
                 assert runtime.state == "COMPLETED", runtime.snapshot()
-                assert seconds < 10 and not waiter.end.query(), (
+                assert seconds < 10 and not completed.query(), (
                     seconds,
                     runtime.snapshot(),
                 )
@@ -344,7 +367,7 @@ def _probe_cam_idle(output: Path) -> None:
                     events.extend(
                         trace if isinstance(trace, list) else trace["traceEvents"]
                     )
-                if variant == "start_before_receive":
+                if mode == "FULL" and variant == "start_before_receive":
                     kernels = sum(
                         "Task Type" in e.get("args", {})
                         and "aclnnMm_" in e.get("name", "")
@@ -354,6 +377,7 @@ def _probe_cam_idle(output: Path) -> None:
                     assert sum(e.get("name") == CPU_MARKER for e in events) == 1
                 results.append(
                     {
+                        "mode": mode,
                         "variant": variant,
                         "stop_seconds": seconds,
                         "state": runtime.snapshot(),
@@ -364,10 +388,7 @@ def _probe_cam_idle(output: Path) -> None:
                     (batch[0], batch[2], counts.sum(dtype=torch.int64))
                 )
                 assert waiter.read_ffn_control(control) == [16, 1, 16]
-                begin = reader.read_raw(waiter.begin)
-                end = reader.read_raw(waiter.end)
-                assert begin is not None and end is not None and end > begin
-                results[-1]["receive_duration_us"] = end - begin
+                assert completed.query()
                 return values
 
             harness.operations["dispatch_recv"] = receive

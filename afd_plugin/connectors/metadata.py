@@ -18,8 +18,6 @@ if TYPE_CHECKING:
     from torch.distributed.distributed_c10d import ProcessGroup
 
     from afd_plugin.connectors.base import AFDConnectorBase
-    from afd_plugin.profiling.fragments import InputSnapshot
-    from afd_plugin.profiling.model import AttentionProfile
     from afd_plugin.profiling.tracing import Execution
 
 
@@ -259,7 +257,6 @@ class AFDTransferContext:
 
     metadata: AFDTransferMetadata
     states: AFDTransferState | None = None
-    dispatch_seq: int = 0
     profile: Execution | None = None
 
 
@@ -307,15 +304,10 @@ class AFDForwardContextMetadata:
     num_stages: int
     transaction_id: str | None = None
     tokens_unpadded_lens: list[int] = field(default_factory=list)
-    profile_fragments: dict[tuple[int, int, int, int], list[str]] | None = None
-    profile_sp_origin: int | None = None
-    profile_attention: AttentionProfile | None = None
-    profile_snapshot: InputSnapshot | None = None
+    profile_attention: Execution | None = None
 
     def clone(self) -> AFDForwardContextMetadata:
         cloned = copy.copy(self)
-        cloned.profile_fragments = None
-        cloned.profile_sp_origin = None
         cloned.profile_attention = None
         cloned.tokens_start_loc = list(self.tokens_start_loc)
         cloned.requests_start_loc = list(self.requests_start_loc)

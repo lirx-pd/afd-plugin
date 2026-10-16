@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import sys
 import threading
 import uuid
 from types import SimpleNamespace
@@ -15,37 +14,6 @@ from afd_plugin.profiling import session as session_module
 from afd_plugin.profiling import storage
 from afd_plugin.profiling.session import WorkerSession
 from afd_plugin.profiling.worker import CAMProfileWorkerMixin
-
-
-@pytest.mark.parametrize("pending", [0, 1])
-def test_retired_collector_skips_idle_and_keeps_draining_owned_resources(
-    monkeypatch, pending
-):
-    collections = []
-    capture = SimpleNamespace(mode="LIGHTWEIGHT")
-    session = WorkerSession.__new__(WorkerSession)
-    session.capture = capture
-    session.tracer = SimpleNamespace(
-        finalized=lambda _: True,
-        pending_count=lambda: pending,
-        collect=lambda owner: collections.append(owner),
-    )
-    session.tick = lambda: None
-    sleeps = iter((None,))
-
-    def sleep(_):
-        if next(sleeps, True):
-            raise SystemExit
-
-    monkeypatch.setattr(session_module, "time", SimpleNamespace(sleep=sleep))
-    monkeypatch.setitem(
-        sys.modules,
-        "torch_npu",
-        SimpleNamespace(npu=SimpleNamespace(set_device=lambda _: None)),
-    )
-    with pytest.raises(SystemExit):
-        session._run("cpu")
-    assert collections == ([capture] if pending else [])
 
 
 class FakeClock:
@@ -63,6 +31,39 @@ class FakeClock:
         elapsed = int(seconds * 1_000_000_000)
         self.wall += elapsed
         self.monotonic += elapsed
+
+
+class ImmediateProfiler:
+    def __init__(self, path, mode, clock):
+        self.trace_dir = path
+        self.mode = mode
+        self.clock = clock
+        self.state = "PREPARED"
+        self.started_at_ns = None
+        self.error = None
+        self.busy = False
+
+    @property
+    def finished(self):
+        return self.state in {"COMPLETED", "FAILED"}
+
+    def start(self):
+        self.state = "STARTING"
+        self.busy = True
+
+    def step(self, **kwargs):
+        if self.state == "STARTING":
+            self.state = "RUNNING"
+            self.started_at_ns = self.clock.time_ns()
+        elif self.state == "STOPPING":
+            self.state = "COMPLETED"
+            self.busy = False
+
+    def stop(self):
+        self.state = "STOPPING" if self.busy else "COMPLETED"
+
+    def snapshot(self):
+        return {"state": self.state, "trace_dir": str(self.trace_dir)}
 
 
 class FakeTracer:
@@ -94,6 +95,9 @@ class FakeTracer:
     def finalized(self, capture):
         return capture.generation in self.finalized_generations
 
+    def end_capture(self, capture):
+        pass
+
     def finish_capture(self, capture):
         self.finalized_generations.add(capture.generation)
         capture.writer.submit(
@@ -108,7 +112,14 @@ def worker_session(tmp_path, monkeypatch):
     clock = FakeClock()
     monkeypatch.setattr(session_module, "time", clock)
     tracer = FakeTracer()
-    session = WorkerSession("attention-dp0", "attention", tmp_path, tracer, {"pid": 7})
+    session = WorkerSession(
+        "attention-dp0",
+        "attention",
+        tmp_path,
+        tracer,
+        {"pid": 7},
+        profiler_factory=lambda path, mode: ImmediateProfiler(path, mode, clock),
+    )
     yield session, tracer, clock
     if session.capture:
         assert session.capture.writer.close(1.0)
@@ -144,6 +155,8 @@ def stop_command(session):
 
 def finish_writer(session):
     session.tick()
+    session.advance_profiler()
+    session.tick()
     assert session.capture.writer.close(1.0)
     session.tick()
 
@@ -169,13 +182,13 @@ def test_lifecycle_uses_monotonic_admission_and_per_worker_clock(worker_session)
     assert capture.clock_offset_ns == offset
     assert capture.clock_uncertainty_ns == 17
     assert capture.start_ns == clock.monotonic_ns() + 100_000_000
-    assert capture.host_epoch_offset_ns == (
-        clock.time_ns() - clock.monotonic_ns() - offset
-    )
     assert not capture.admits()
     clock.advance(0.1)
-    assert capture.admits()
+    assert not capture.admits()
     session.tick()
+    session.advance_profiler()
+    session.tick()
+    assert capture.admits()
     assert session.status()["state"] == "RUNNING"
     assert session.status()["details"]["started_at_ns"] == clock.time_ns()
     clock.advance(0.2)
@@ -186,7 +199,7 @@ def test_lifecycle_uses_monotonic_admission_and_per_worker_clock(worker_session)
     assert status["error"] is None
     assert status["worker_id"] == "attention-dp0"
     assert status["pid"] == 7
-    assert status["capabilities"] == ["LIGHTWEIGHT"]
+    assert status["capabilities"] == ["LIGHTWEIGHT", "FULL"]
     assert tracer.finalized_generations == {capture.generation}
     path = session.output_dir / capture.session_id / "attention-dp0.jsonl"
     records = [json.loads(line) for line in path.read_text().splitlines()]
@@ -290,7 +303,7 @@ def test_lease_defaults_and_duration_deadlines_keep_their_owners(worker_session,
 
 @pytest.mark.parametrize(
     "mode,busy,match",
-    [("FULL", False, "not configured"), ("LIGHTWEIGHT", True, "profiler")],
+    [("LIGHTWEIGHT", True, "profiler")],
 )
 def test_prepare_rejects_missing_full_backend_and_existing_profiler(
     worker_session, mode, busy, match
@@ -311,7 +324,7 @@ def test_prepare_rejects_missing_full_backend_and_existing_profiler(
         {"command_seq": True},
         {"duration_s": 0},
         {"duration_s": None},
-        {"duration_s": 3601},
+        {"duration_s": 604801},
         {"duration_s": True},
         {"duration_s": float("nan")},
         {"duration_s": float("inf")},
@@ -353,27 +366,6 @@ def test_prepared_lease_expires_without_commit_and_flushes_idle_output(worker_se
     assert session.state == "COMPLETED"
     assert session.capture.stop_requested
     assert session.capture.started_at_ns is None
-
-
-def test_retired_generation_blocks_new_prepare_until_device_resources_release(
-    worker_session,
-):
-    session, tracer, clock = worker_session
-    session.prepare(prepare_command(), backend_busy=False)
-    tracer.pending = 1
-    session.stop(stop_command(session))
-    session.tick()
-    assert session.state == "STOPPING"
-    clock.advance(session_module.DRAIN_TIMEOUT_S + 0.1)
-    finish_writer(session)
-    assert session.state == "FAILED"
-    previous = session.capture
-    with pytest.raises(ValueError, match="device resources"):
-        session.prepare(prepare_command(), backend_busy=False)
-    assert session.capture is previous
-    tracer.pending = 0
-    session.prepare(prepare_command(), backend_busy=False)
-    assert session.capture.generation == previous.generation + 1
 
 
 def test_writer_flush_timeout_fails_and_blocks_reuse_until_closed(
@@ -494,6 +486,7 @@ def test_lightweight_factory_failure_does_not_start_writer(tmp_path, monkeypatch
         None,
         {"pid": 7},
         tracer_factory=failed_tracer,
+        profiler_factory=lambda path, mode: ImmediateProfiler(path, mode, None),
     )
     with pytest.raises(OSError, match="tracer initialization failure"):
         session.prepare(prepare_command(), backend_busy=False)
@@ -546,3 +539,34 @@ def test_disabled_worker_does_not_initialize_device_profiling(monkeypatch):
     assert worker.cam_profile_session is None
     with pytest.raises(ValueError, match="not enabled"):
         worker.cam_profile_status({})
+
+
+def test_day_long_pipeline_is_admitted_but_full_is_bounded(worker_session):
+    session, _, _ = worker_session
+    with pytest.raises(ValueError, match="duration_s"):
+        session.prepare(
+            prepare_command(mode="FULL", duration_s=86400), backend_busy=False
+        )
+    session.prepare(prepare_command(duration_s=86400), backend_busy=False)
+    assert session._duration_s == 86400
+
+
+def test_ffn_stop_fence_is_queried_only_for_pending_native_stop(worker_session):
+    session, _, clock = worker_session
+    session.prepare(prepare_command(), backend_busy=False)
+    session.commit(commit_command(session, clock))
+    clock.advance(0.1)
+    session.tick()
+
+    def forbidden():
+        raise AssertionError("unnecessary native query")
+
+    session.advance_profiler(stop_ready=forbidden)
+    session.tick()
+    assert session.state == "RUNNING"
+    session.advance_profiler(stop_ready=forbidden)
+    session.stop(stop_command(session))
+    session.advance_profiler(stop_ready=lambda: False)
+    assert session.capture.profiler.state == "STOPPING"
+    session.advance_profiler(stop_ready=lambda: True)
+    assert session.capture.profiler.finished

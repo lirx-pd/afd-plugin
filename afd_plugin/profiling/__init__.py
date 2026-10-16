@@ -8,6 +8,8 @@ import os
 
 PROFILE_ENABLE_ENV = "AFD_CAM_PROFILE_ENABLE"
 BATCH_INFO_FIELDS = 5
+MAX_DURATION_S = 3600
+MAX_LIGHTWEIGHT_DURATION_S = 7 * 24 * MAX_DURATION_S
 
 
 def batch_info_prefix_size(tp_size: int, expert_per_rank: int) -> int:

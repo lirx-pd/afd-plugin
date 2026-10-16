@@ -330,24 +330,36 @@ export AFD_CAM_PROFILE_DIR='./cam-profiles'
 python -m afd_plugin.profiling.control --host 127.0.0.1 --port 8765
 ```
 
-Both modes use the same API and run independently. `LIGHTWEIGHT` collects
-request relationships and explicit host/device phase spans without starting
-TorchNPU profiling. `FULL` runs only the existing TorchNPU profiler
-with CPU/NPU activities, Level2, shape recording, configured stack/modules and
-the same TensorBoard trace handler. It does not collect lightweight records or
-create the lightweight Event pool and timestamp backend. Those resources are
-allocated on the first `LIGHTWEIGHT` prepare and reused by later lightweight
-sessions. Both modes use the existing CAM operators and compact batch metadata;
-no profiling-specific binding, kernel, wire tail or `comm_id` is required.
-LIGHTWEIGHT copies that metadata once to a preallocated pinned buffer. Event
-slots use a free queue, and idle Attention calls skip identity allocation.
-Completed sessions stop scanning event pools once all resources are returned.
-Use a binding and CANN operator package built from the same upstream sources;
-older profiling builds with an extended wire tail have an incompatible layout.
-The fixed pool holds 1,024 device spans per worker, covering a queued
-DSV4 step with two microbatches (516 spans) even before events complete. Pool
-exhaustion is still reported as dropped data; tracing never stalls inference
-to wait for a free slot:
+Both modes use the TorchNPU profiling backend used by vLLM-Ascend.
+`LIGHTWEIGHT` records a continuous **COMPUTE**, **COMMUNICATION**, **WAIT** pipeline
+on Attention and FFN streams, without layer, request, token or causal identities.
+It uses NPU-only `Level_none` and the `afd.cam` MSTX domain. A native device mark
+is submitted only when a stream changes phase; adjacent compute regions across
+layers share one state. Stream tracks, phase scopes and three short messages are
+reused. CPU operator callbacks, kernel/task profiling, shapes, stacks/modules,
+memory, FLOPs and hardware counters are off. There are no timing Event pools,
+collector scans, request snapshots or relationship records.
+
+Send phases are COMMUNICATION; receives and DBO yields are WAIT. CAM fuses
+transfer and polling, so WAIT includes receiving data. These are stream pipeline
+states, including gaps between submissions, rather than pure kernel busy time.
+Streams remain separate so DBO overlap is preserved. Native timestamps and the
+coordinator's clock offset/uncertainty align Attention and FFN tracks; no layer or
+request pairing is inferred. The initial interval before a stream's first marker
+is unobserved. A native host END marker clips queued work at the capture boundary
+and closes a stream waiting indefinitely for its peer.
+
+`FULL` retains CPU/NPU activities, Level2, shape recording and configured
+stack/modules. Both modes use unchanged upstream CAM operators; `csrc` and the
+wire protocol are unchanged. FFN copies only its mandatory three control values.
+The stream/MSTX bindings target TorchNPU 2.10 and need revalidation on upgrades.
+
+For continuous long-running collection, LIGHTWEIGHT accepts up to seven days;
+FULL retains its one-hour limit. For example, use
+`{"mode":"LIGHTWEIGHT","duration":86400.0}` for one day. Collection does not
+sample or discard intervals. Storage still grows with phase transitions;
+removing identities and duplicate records reduces that growth, rather than
+placing a fixed bound on the entire capture.
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8765/cam/profile/start \
@@ -361,81 +373,60 @@ early with `POST /cam/profile/{session_id}/stop`, using the same authorization
 header. The duration is a shared wall-clock window; native initialization can
 shorten each worker's active coverage. Inspect `details.started_at_ns` for the
 actual start. A window ending before all backends activate fails explicitly.
-Runtime FULL records continuously between explicit start and stop, without the
+Both runtime modes record continuously between explicit start and stop, without the
 static `WAIT/WARMUP/ACTIVE/REPEAT/SKIP_FIRST` schedule. The existing static
 profiler retains that schedule. Runtime does not modify environment variables;
-the role's `AFD_NPU_*_PROFILER_WITH_STACK` setting still applies.
+the role's `AFD_NPU_*_PROFILER_WITH_STACK` setting applies to FULL only.
 
-Each worker writes `<session_id>/<worker_id>.jsonl`. In `FULL` this contains
-only common `SESSION`/`SUMMARY` metadata; request pipeline reconstruction uses
-`LIGHTWEIGHT` output. For FULL, the final worker
-status and coordinator manifest also contain `details.full.trace_dir`, the
-`<session_id>/<worker_id>/full/` output root. Native `*_ascend_pt` directories
-and any parsed output are produced there by the existing handler. Paths belong
-to the worker's filesystem. Use a local filesystem for FULL capture and archive
-the files after completion: CANN stop drains its uploader synchronously, and a
-slow network filesystem can exceed the native stop deadline and block worker
-RPCs. If daemon-worker restrictions prevent parsing,
-keep the raw data and parse the native directory separately:
+Each worker writes only common `SESSION`/`SUMMARY` records to
+`<session_id>/<worker_id>.jsonl`, independent of the number of requests or layers.
+FULL output remains in `<session_id>/<worker_id>/full/`. For both modes,
+`details.native_profiler.trace_dir` identifies the native output location.
+
+During LIGHTWEIGHT capture, CANN writes its native raw files. After native stop,
+a background thread packs the dedicated worker directory into
+`<session_id>/<worker_id>/lightweight.tar.gz` using fast gzip compression. It
+verifies the gzip data and makes the archive durable before removing the raw
+directory. Each worker then retains one archive and one small JSONL file.
+Compression does not block native stop or parse traces during inference.
+Wait for `details.native_profiler.archive_state=COMPLETED` before copying or
+analyzing a finished capture; `archive_error` reports failures and the raw data
+or completed archive remains available for recovery. Raw data and the temporary
+archive coexist while compression runs.
+
+Export the aligned pipeline offline with the matching TorchNPU/CANN environment:
 
 ```bash
-python -c 'import sys; from torch_npu.profiler.profiler import analyse; analyse(sys.argv[1], max_process_number=1)' \
-  '<native-directory-ending-in-ascend_pt>'
+python -m afd_plugin.profiling.analyze ./cam-profiles/<session_id> \
+  --native --output ./pipeline.json.gz
 ```
+
+The analyzer safely extracts worker archives into temporary directories, invokes
+the native parser offline and imports only phase-transition timestamps. The
+compact gzip Chrome trace contains separate Attention/FFN stream tracks, without
+per-event identity arguments or duplicate relationship tables. An output path
+without `.gz` writes compact JSON instead. Previously exported native data and
+old Event/layer JSONL captures remain readable.
 
 Native operations stay on the model thread. The control thread requests lifecycle
 changes and enforces deadlines; it never owns the native profiler. Idle Attention
 advances pending startup and stop during status RPCs. FFN advances them while
 querying its preallocated control-copy completion Event. Runtime sessions own
-FULL independently of the runner's static `prof` object.
+their native profiler independently of the runner's static `prof` object.
 
-FFN records a timing Event immediately before dispatch receive. That Event also
+FFN records an untimed completion Event immediately before dispatch receive. That Event also
 fences all preceding compute and combine-send work. Once it completes, runtime
-FULL may stop while the next receive is still waiting. The runtime FFN instance
+profiling may stop while the next receive is still waiting. The runtime FFN instance
 uses the pinned TorchNPU `stop_trace` implementation without its full-device
 synchronize; all native stop, GC/Event cleanup, finalize and trace-handler steps
 remain. Attention and static profiling retain their existing synchronization.
 No receive cancellation or extra CAM control messages are required.
 
-LIGHTWEIGHT admits FFN work after receive completes, before compute. The waiter
-owns a fixed begin/end Event pair independently of sessions; the model thread
-reads the completed pair before reuse. An idle receive therefore holds no session
-resources. Profiling-enabled workers record this pair even between sessions so
-the first request after an idle start has a measured receive interval. Workers
-with runtime profiling disabled allocate no such resources.
-
-A receive may begin before the capture window; its full duration includes that
-idle wait and `crosses_capture_start=true` identifies this boundary case. Device
-duration is measured; cross-worker alignment remains an empirical clock mapping,
-including extrapolation for an earlier receive start. Do not treat that duration
-as time spent entirely inside the capture window. Admitted work retains its
-compute/combine ownership through stop. Missing source relationships across
-session boundaries continue to produce PARTIAL data.
-
-Without a wire identity, the offline analyzer associates FFN work with source
-candidates using the source TP ranks, layer and the aligned interval between
-Attention dispatch-send and combine-recv. Clock uncertainty expands those bounds.
-`source_relation=temporal_source_candidate` denotes an inferred relationship,
-including when only one candidate remains; it is not a kernel-confirmed identity.
-Missing or multiple candidates produce PARTIAL data. All plausible candidates are
-retained, and FFN compute duration is still counted once per worker, rather than
-once for each candidate request.
-
-Missing the start window fails the coordinated
-session; a start/stop watchdog expiry or an exception disables further profiling
-until worker restart. Late completion does not restore reuse. Profiling never
-destroys the CAM communicator to force completion. Native calls holding the GIL
-can still stall Python control, as with the original profiler.
-
-`COMPLETED` confirms lifecycle completion; check the native files separately
-before claiming parsing success. Generic NPU component checks do not establish
-blocked CAM receive behavior, multi-rank numerical correctness, or profiling
-overhead on the `ascend910_93` target.
-
-With TorchNPU 2.10.0.post4, CANN 9.1.0 and Python 3.12, component tests pass
-with the default `WITH_STACK=0`. `WITH_STACK=1` crashes in native stop in both
-the existing static factory and runtime mode on the tested stack. The runtime
-path preserves that setting; it does not silently disable stack capture.
+FFN retains two untimed completion fences for the mandatory control copy and
+safe native lifecycle. The pre-receive stop fence is queried only when native
+stop is pending. Stop closes admission, drains admitted work within the deadline
+and reports unresolved work or missing native markers as PARTIAL. Runtime
+profiling disabled at startup allocates no profiling resources.
 
 ## W4A8 layered GMM (experimental, disabled by default)
 

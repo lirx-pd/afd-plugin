@@ -28,7 +28,6 @@ derivation, launch guidance, and the full limitations.
 from __future__ import annotations
 
 import os
-import threading
 import time
 import uuid
 from collections.abc import Mapping
@@ -325,8 +324,6 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         self.profile_enabled = runtime_profiling_enabled()
         self.profile_worker_id = uuid.uuid4().hex
         self.profile_peers: list[str] = []
-        self._profile_sequence = 0
-        self._profile_lock = threading.Lock()
         hf_config = vllm_config.model_config.hf_config
         self.hidden_size = hf_config.hidden_size
         self.activation_dtype = vllm_config.model_config.dtype
@@ -493,24 +490,14 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             raise ValueError("all CAM ranks must use the same profiling enable flag")
         self.profile_peers[:] = [bytes(row[1:]).decode("ascii") for row in values]
 
-    def begin_profile_call(self) -> tuple[int, Execution | None]:
-        if not self.profile_enabled:
-            return 0, None
+    def begin_profile_call(self) -> Execution | None:
         session = self.profile_session
-        if session is None or session.tracer is None:
-            return 0, None
-        capture = session.capture
-        if capture is None or not capture.admits():
-            return 0, None
-        with self._profile_lock:
-            self._profile_sequence += 1
-            sequence = self._profile_sequence
-        execution = session.tracer.execution(
-            f"{self.profile_worker_id}:call:{sequence}"
-        )
+        if not self.profile_enabled or session is None or session.tracer is None:
+            return None
+        execution = session.tracer.execution()
         if execution is not None and not execution.tracer.retain_execution(execution):
-            execution = None
-        return sequence, execution
+            return None
+        return execution
 
     def close(self) -> None:
         """Destroy the HCCL process group and clear pending transfer states."""
@@ -678,8 +665,8 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
                 f"hidden_states shape {hidden_states.shape!r} does not match "
                 f"AFD async metadata token count {metadata.total_tokens}",
             )
-        if self.profile_enabled and context.dispatch_seq == 0:
-            context.dispatch_seq, context.profile = self.begin_profile_call()
+        if self.profile_enabled and context.profile is None:
+            context.profile = self.begin_profile_call()
         states = AFDAsyncTransferState(
             batch_size=metadata.total_tokens,
             hidden_size=self.hidden_size,
@@ -887,44 +874,42 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         waiter = session.device_waiter if session is not None else None
         if waiter is not None:
             waiter.begin_receive()
-        outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(
-            placeholder,
-            self.comm_args,
-            self.comm_id,
-            self.max_num_batched_tokens,
-            states.hidden_size,
-            states.topk,
-            self.ffn_size,
-            self.attn_size,
-            self.expert_per_rank,
-            self.world_rank,
-            self.topology.world_size,
-            self.tp_size,
-            self.dynamic_quant,
-            self.group_name,
-        )
+        tracer = session.tracer if session is not None else None
+        execution = tracer.new_work() if tracer is not None else None
+        with span(execution, "DISPATCH_RECV"):
+            outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(
+                placeholder,
+                self.comm_args,
+                self.comm_id,
+                self.max_num_batched_tokens,
+                states.hidden_size,
+                states.topk,
+                self.ffn_size,
+                self.attn_size,
+                self.expert_per_rank,
+                self.world_rank,
+                self.topology.world_size,
+                self.tp_size,
+                self.dynamic_quant,
+                self.group_name,
+            )
         hidden_states, dynamic_scales, batch_info, expert_token_nums = outputs
         if waiter is not None:
             assert session is not None
-            waiter.end_receive()
             control = torch.stack(
-                (batch_info[0], batch_info[2], expert_token_nums.sum(dtype=torch.int64))
+                (
+                    batch_info[0],
+                    batch_info[2],
+                    expert_token_nums.sum(dtype=torch.int64),
+                )
             )
-            states.host_control = waiter.read_ffn_control(control)
-            tracer = session.tracer
+            host_control = waiter.read_ffn_control(control)
+            states.host_control = host_control[:3]
             if tracer is not None:
-                context.profile = tracer.new_work()
-                if context.profile is not None and not tracer.record_receive(
-                    context.profile,
-                    waiter.begin,
-                    waiter.end,
-                    waiter.stream,
-                    waiter.host_begin_ns,
-                    waiter.host_end_ns,
-                ):
-                    context.profile = None
-        if context.profile is not None:
-            context.profile.tracer.defer_metadata(context.profile, batch_info)
+                # A receive already pending at capture start has no begin marker.
+                execution = execution or tracer.new_work()
+                if execution is not None and tracer.retain_execution(execution):
+                    context.profile = execution
         _log_cam_op_values(
             "async_dispatch_recv",
             "outputs",

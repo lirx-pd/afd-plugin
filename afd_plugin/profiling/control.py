@@ -22,14 +22,16 @@ import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from afd_plugin.profiling import MAX_DURATION_S, MAX_LIGHTWEIGHT_DURATION_S
 
 HTTP_TIMEOUT_S = 10.0
 POLL_INTERVAL_S = 0.1
+RUNNING_POLL_INTERVAL_S = 1.0
 START_TIMEOUT_S = 30.0
 STOP_TIMEOUT_S = 15.0
 LEASE_GRACE_S = 60.0
-MAX_DURATION_S = 3600.0
 NANOSECONDS_PER_SECOND = 1_000_000_000
 TERMINAL_STATES = frozenset(("COMPLETED", "FAILED"))
 
@@ -38,7 +40,15 @@ class StartRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: Literal["LIGHTWEIGHT", "FULL"]
-    duration: float = Field(gt=0, le=MAX_DURATION_S, allow_inf_nan=False, strict=True)
+    duration: float = Field(
+        gt=0, le=MAX_LIGHTWEIGHT_DURATION_S, allow_inf_nan=False, strict=True
+    )
+
+    @model_validator(mode="after")
+    def bounded_full_duration(self) -> StartRequest:
+        if self.mode == "FULL" and self.duration > MAX_DURATION_S:
+            raise ValueError("FULL duration must not exceed one hour")
+        return self
 
 
 class WorkerSnapshot(BaseModel):
@@ -395,7 +405,24 @@ class ProfileCoordinator:
                     )
                 return
             with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(session.stop_requested.wait(), POLL_INTERVAL_S)
+                interval = (
+                    RUNNING_POLL_INTERVAL_S
+                    if session.state == "RUNNING"
+                    and session.request.mode == "LIGHTWEIGHT"
+                    else POLL_INTERVAL_S
+                )
+                await asyncio.wait_for(
+                    session.stop_requested.wait(),
+                    min(
+                        interval,
+                        max(
+                            0,
+                            start_deadline
+                            + session.request.duration
+                            - time.monotonic(),
+                        ),
+                    ),
+                )
 
     async def _stop_workers(self, session: Session) -> None:
         try:

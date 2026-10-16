@@ -7,7 +7,6 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -41,39 +40,3 @@ def test_layout_import_needs_no_device_runtime():
         check=False,
     )
     assert result.returncode == 0, result.stderr
-
-
-@pytest.mark.parametrize("ready", [True, False])
-def test_tracer_host_slots_match_native_metadata(monkeypatch, ready):
-    torch = pytest.importorskip("torch")
-    torch_npu = pytest.importorskip("torch_npu")
-    from afd_plugin.profiling import tracing
-
-    empty = torch.empty
-    monkeypatch.setattr(
-        torch, "empty", lambda *args, pin_memory=False, **kwargs: empty(*args, **kwargs)
-    )
-    monkeypatch.setattr(tracing, "EventTimestampReader", lambda: object())
-    monkeypatch.setattr(
-        torch_npu.npu,
-        "Event",
-        lambda **kwargs: SimpleNamespace(
-            record=lambda *args: None, query=lambda: ready
-        ),
-    )
-    monkeypatch.setattr(torch_npu.npu, "Stream", lambda **kwargs: object())
-
-    def unexpected_sync(*args):
-        pytest.fail("lazy PREPARE must not synchronize the whole device")
-
-    monkeypatch.setattr(torch_npu.npu, "synchronize", unexpected_sync)
-    monkeypatch.setattr(tracing, "RESOURCE_INIT_TIMEOUT_S", 0)
-
-    if not ready:
-        with pytest.raises(TimeoutError, match="event initialization deadline"):
-            tracing.DeviceTracer(torch.device("cpu"), "ffn", ["a0", "a1"], 2, 3)
-        return
-
-    tracer = tracing.DeviceTracer(torch.device("cpu"), "ffn", ["a0", "a1"], 2, 3)
-
-    assert all(slot.batch.shape == (13,) for slot in tracer.metadata_slots)

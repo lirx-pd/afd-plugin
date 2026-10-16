@@ -116,11 +116,10 @@ def test_session_covers_all_dp_workers_and_adjusts_each_host_clock(tmp_path, mod
         for workers in fleet.workers.values():
             for worker in workers:
                 worker["capabilities"] = ["LIGHTWEIGHT", "FULL"]
-                if mode == "FULL":
-                    worker["details"]["full"] = {
-                        "trace_dir": f"cam-profiles/{worker['worker_id']}/full",
-                        "state": "COMPLETED",
-                    }
+                worker["details"]["native_profiler"] = {
+                    "trace_dir": f"cam-profiles/{worker['worker_id']}/{mode.lower()}",
+                    "state": "COMPLETED",
+                }
         fleet.delay_s = 0.002
         coordinator, client = make_coordinator(tmp_path, fleet)
         async with client:
@@ -153,8 +152,9 @@ def test_session_covers_all_dp_workers_and_adjusts_each_host_clock(tmp_path, mod
         manifest = json.loads((session.directory / "manifest.json").read_text())
         assert manifest["state"] == "COMPLETED"
         assert manifest["mode"] == mode
-        if mode == "FULL":
-            assert all(w["details"]["full"]["trace_dir"] for w in manifest["workers"])
+        assert all(
+            w["details"]["native_profiler"]["trace_dir"] for w in manifest["workers"]
+        )
         assert manifest["clock_method"] == "empirical_http_midpoint_per_worker"
         assert not (session.directory / "manifest.json.tmp").exists()
 
@@ -258,7 +258,7 @@ def test_public_routes_require_auth_and_reject_invalid_requests(tmp_path):
         for body in (
             {"mode": "BAD", "duration": 1},
             {"mode": "LIGHTWEIGHT", "duration": 0},
-            {"mode": "LIGHTWEIGHT", "duration": 3601},
+            {"mode": "LIGHTWEIGHT", "duration": 604801},
             {"mode": "LIGHTWEIGHT", "duration": 1, "path": "/tmp/untrusted"},
         ):
             assert (

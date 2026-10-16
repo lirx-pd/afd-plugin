@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from afd_plugin.profiling import runtime_profiling_enabled
-from afd_plugin.profiling.full import RuntimeFullProfiler
+from afd_plugin.profiling.native import RuntimeProfiler
 
 if TYPE_CHECKING:
     import torch
@@ -41,7 +41,7 @@ class CAMProfileWorkerMixin:
     def initialize_cam_profiling(self) -> None:
         if not runtime_profiling_enabled():
             return
-        # Keep TorchNPU and the event pool out of workers with profiling disabled.
+        # Keep TorchNPU profiling resources out of workers with profiling disabled.
         from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
         from afd_plugin.profiling.npu import FFNDeviceWaiter
         from afd_plugin.profiling.session import WorkerSession
@@ -64,8 +64,8 @@ class CAMProfileWorkerMixin:
                 "tp_size": connector.tp_size,
             },
             tracer_factory=partial(self._create_cam_tracer, connector),
-            full_factory=partial(
-                RuntimeFullProfiler,
+            profiler_factory=partial(
+                RuntimeProfiler,
                 "attention" if connector.topology.role == "attention" else "ffn",
             ),
         )
@@ -82,9 +82,6 @@ class CAMProfileWorkerMixin:
         return DeviceTracer(
             self.device,
             connector.profile_worker_id,
-            connector.profile_peers,
-            connector.tp_size,
-            connector.expert_per_rank,
         )
 
     def _require_cam_profile_session(self) -> WorkerSession:
@@ -124,7 +121,7 @@ class CAMProfileWorkerMixin:
         session = self._require_cam_profile_session()
         # Attention RPCs share the model thread; FFN RPCs do not.
         if session.role == "attention":
-            session.advance_full()
+            session.advance_profiler()
         return session.status(command)
 
     # Ascend 8d4409d6 NPUWorker.profile also owns a native profiler. Its large

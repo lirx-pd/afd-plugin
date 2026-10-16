@@ -35,7 +35,6 @@ from afd_plugin.model_executor.models.npu.async_cam_layout import (
 from afd_plugin.profiling.model import (
     begin_profile_call,
     host_span,
-    record_source_call,
     span,
 )
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
@@ -159,7 +158,7 @@ def run_attention_gate_afd_forward(
             )
             continue
 
-        sequence, execution = begin_profile_call(afd_metadata)
+        execution = begin_profile_call(afd_metadata)
         with span(execution, "ATTENTION_GATE"):
             (
                 hidden_states,
@@ -188,12 +187,7 @@ def run_attention_gate_afd_forward(
             stage_idx=stage_idx,
             seq_len=int(dispatch_payload.hidden_states.shape[0]),
         )
-        context = AFDTransferContext(
-            metadata=metadata, dispatch_seq=sequence, profile=execution
-        )
-        record_source_call(
-            execution, afd_metadata, layer.layer_idx, dispatch_payload.layout
-        )
+        context = AFDTransferContext(metadata=metadata, profile=execution)
         pending_profile = execution
         pending_receive = send_async_cam_remote_call(
             afd_connector,
@@ -203,8 +197,9 @@ def run_attention_gate_afd_forward(
             topk_ids=dispatch_payload.topk_ids,
             router_logits=dispatch_payload.router_logits,
         )
-        with span(execution, "SHARED_EXPERT"):
-            pending_shared_output = compute_shared_output(layer, hidden_states)
+        if layer.mlp.shared_experts is not None:
+            with span(execution, "SHARED_EXPERT"):
+                pending_shared_output = compute_shared_output(layer, hidden_states)
         pending_ffn_recv = True
         pending_dispatch_layout = dispatch_payload.layout
         with host_span(execution, "DBO_HOST_WAIT"):

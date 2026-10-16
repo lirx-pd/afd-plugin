@@ -33,24 +33,20 @@ class Tracer:
         self.spans.append((execution.exec_ref, name))
         yield
 
-    def execution(self, exec_ref):
-        return Execution(self, exec_ref) if self.active else None
+    def execution(self):
+        return Execution(self, "pipeline") if self.active else None
 
     def new_work(self):
-        return self.execution("ffn-work")
+        return self.execution()
 
     def retain_execution(self, execution):
-        return True
+        return self.active
 
     def release_execution(self, execution):
         self.released.append(execution)
 
-    def record_receive(self, execution, *timing):
-        self.spans.append((execution.exec_ref, "DISPATCH_RECV"))
-        return True
-
-    def defer_metadata(self, execution, batch_info):
-        self.deferred.append((execution, batch_info))
+    def record_metadata(self, execution, control):
+        self.deferred.append((execution, control))
 
 
 @pytest.fixture
@@ -101,7 +97,7 @@ def profile_session(tracer):
     return SimpleNamespace(
         tracer=tracer,
         capture=SimpleNamespace(admits=lambda: tracer.active),
-        advance_full=Mock(),
+        advance_profiler=Mock(),
         device_waiter=SimpleNamespace(
             read_ffn_control=lambda control: control.tolist(),
             begin_receive=Mock(),
@@ -145,7 +141,6 @@ def test_local_call_identity_skips_idle_and_never_changes_native_comm_id(
     monkeypatch, ops
 ):
     attn = connector(monkeypatch, role="attention")
-    attn._profile_sequence = 1 << 32
     without_session = dispatch(attn)
     first_tracer = Tracer()
     attn.profile_session = profile_session(first_tracer)
@@ -157,8 +152,7 @@ def test_local_call_identity_skips_idle_and_never_changes_native_comm_id(
     second_capture = dispatch(attn)
 
     contexts = [without_session, first_capture, idle, second_capture]
-    expected = [0, (1 << 32) + 1, 0, (1 << 32) + 2]
-    assert [context.dispatch_seq for context in contexts] == expected
+    assert all(not hasattr(context, "dispatch_seq") for context in contexts)
     assert [call.args[3] for call in ops.afd_async_dispatch_send.call_args_list] == (
         [attn.comm_id] * 4
     )
@@ -169,7 +163,6 @@ def test_local_call_identity_skips_idle_and_never_changes_native_comm_id(
 
     attn.recv_ffn_output(torch.empty((2, 16)), ubatch_idx=1, context=first_capture)
 
-    assert first_capture.dispatch_seq == expected[1]
     assert first_tracer.spans == [
         (first_capture.profile.exec_ref, "DISPATCH_SEND"),
         (first_capture.profile.exec_ref, "COMBINE_RECV"),
@@ -178,7 +171,7 @@ def test_local_call_identity_skips_idle_and_never_changes_native_comm_id(
     assert ops.afd_async_combine_recv.call_args.args[4] == 0
 
 
-def test_recv_defers_whole_batch_and_preserves_full_combine_metadata(monkeypatch, ops):
+def test_recv_reuses_control_copy_and_preserves_full_combine_metadata(monkeypatch, ops):
     ffn = connector(monkeypatch, role="ffn")
     tracer = Tracer()
     ffn.profile_session = profile_session(tracer)
@@ -189,10 +182,10 @@ def test_recv_defers_whole_batch_and_preserves_full_combine_metadata(monkeypatch
 
     received = ffn.recv_attn_output(batch_size=2)
     states = received.context.states
-    execution, deferred_batch = tracer.deferred.pop()
-
-    assert execution is received.context.profile
-    assert deferred_batch is batch_info
+    execution = received.context.profile
+    assert execution is not None
+    assert not tracer.deferred
+    assert states.host_control == [0, 2, 4]
     assert states.token_nums_rankid_layeridx is batch_info
 
     ffn.send_ffn_output(received.hidden_states, received.context)
@@ -213,7 +206,7 @@ def test_receive_admits_only_after_device_completion(
     ops.afd_async_dispatch_recv.return_value = actual
 
     def complete(control):
-        assert not tracer.spans and not tracer.deferred and not tracer.released
+        assert not tracer.deferred and not tracer.released
         tracer.active = active_at_completion
         return control.tolist()
 
@@ -223,9 +216,9 @@ def test_receive_admits_only_after_device_completion(
     assert received.context.states.token_nums_rankid_layeridx is actual[2]
     assert ops.afd_async_dispatch_recv.call_count == 1
     assert bool(received.context.profile) == active_at_completion
-    assert len(tracer.deferred) == int(active_at_completion)
+    assert not tracer.deferred
     assert tracer.spans == (
-        [("ffn-work", "DISPATCH_RECV")] if active_at_completion else []
+        [] if active_at_completion else [("pipeline", "DISPATCH_RECV")]
     )
 
 
@@ -243,7 +236,7 @@ def test_no_capture_skips_metadata_views_and_keeps_full_metadata(
     getitem = torch.Tensor.__getitem__
 
     def checked_getitem(tensor, item):
-        assert tensor is not batch_info or item in (0, 2), (
+        assert tensor is not batch_info or item in (0, 1, 2), (
             "inactive profiling must not slice source identities"
         )
         return getitem(tensor, item)
@@ -261,20 +254,5 @@ def test_no_capture_skips_metadata_views_and_keeps_full_metadata(
     if not enabled:
         attn = connector(monkeypatch, role="attention", enabled=False)
         context = dispatch(attn)
-        assert context.dispatch_seq == 0
+        assert not hasattr(context, "dispatch_seq")
         assert ops.afd_async_dispatch_send.call_args.args[3] == 0
-
-
-def test_receive_timing_failure_does_not_abort_native_work(monkeypatch, ops):
-    ffn = connector(monkeypatch, role="ffn")
-    tracer = Tracer()
-    tracer.record_receive = lambda *args: False
-    ffn.profile_session = profile_session(tracer)
-    actual = recv_outputs(ffn)
-    ops.afd_async_dispatch_recv.return_value = actual
-    received = ffn.recv_attn_output(batch_size=2)
-    assert received.context.profile is None
-    assert received.hidden_states is actual[0]
-    ffn.send_ffn_output(received.hidden_states, received.context)
-    assert ops.afd_async_combine_send.call_args.args[2] is actual[2]
-    assert not tracer.deferred

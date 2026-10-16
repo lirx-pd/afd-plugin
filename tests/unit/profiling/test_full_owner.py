@@ -7,12 +7,12 @@ import threading
 
 import pytest
 
-from afd_plugin.profiling import full
-from afd_plugin.profiling.full import RuntimeFullProfiler
+from afd_plugin.profiling import native as full
+from afd_plugin.profiling.native import RuntimeProfiler
 
 
-@pytest.fixture
-def backend(tmp_path, monkeypatch):
+@pytest.fixture(params=["FULL", "LIGHTWEIGHT"])
+def backend(tmp_path, monkeypatch, request):
     calls = []
     stopping = threading.Event()
     release = threading.Event()
@@ -40,7 +40,8 @@ def backend(tmp_path, monkeypatch):
     native = NativeProfiler()
     received = []
 
-    def factory(role, trace_dir):
+    def factory(role, trace_dir, **kwargs):
+        assert kwargs == {"lightweight": request.param == "LIGHTWEIGHT"}
         received.append((role, trace_dir))
         record("factory_start")
         if native.failure == "start":
@@ -51,7 +52,8 @@ def backend(tmp_path, monkeypatch):
         return native
 
     monkeypatch.setattr(full, "create_runtime_npu_profiler", factory)
-    owner = RuntimeFullProfiler("ffn", tmp_path)
+    monkeypatch.setattr(full, "archive_native_trace", lambda path: None)
+    owner = RuntimeProfiler("ffn", tmp_path, request.param)
     yield owner, native, calls, received, stopping, release
     release.set()
     owner.stop()
@@ -79,6 +81,9 @@ def test_native_lifecycle_runs_only_on_original_runner_thread(backend):
     assert [name for name, _ in calls] == ["factory_start", "step", "step", "stop"]
     assert {tid for _, tid in calls} == {runner_tid}
     status = owner.snapshot()
+    if owner.mode == "LIGHTWEIGHT":
+        for key in ("archive_state", "archive_error", "archive_path"):
+            status.pop(key)
     assert status == {
         "state": "COMPLETED",
         "trace_dir": str(owner.trace_dir),
@@ -195,3 +200,22 @@ def test_stop_during_native_start_is_serviced_by_the_same_runner_step(backend):
     assert owner.state == "COMPLETED"
     assert [name for name, _ in calls] == ["factory_start", "stop"]
     assert len({tid for _, tid in calls}) == 1
+
+
+def test_archive_thread_failure_does_not_poison_native_backend(backend, monkeypatch):
+    owner, _, _, _, _, _ = backend
+    owner.start()
+    owner.step()
+
+    def fail_start(self):
+        raise RuntimeError("cannot start archive thread")
+
+    monkeypatch.setattr(full.threading.Thread, "start", fail_start)
+    owner.stop()
+    owner.step()
+    assert owner.state == "COMPLETED" and owner.error is None
+    if owner.mode == "LIGHTWEIGHT":
+        assert owner.archive_state == "FAILED"
+        assert "cannot start archive thread" in owner.archive_error
+    else:
+        assert owner.archive_state is None

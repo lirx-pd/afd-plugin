@@ -80,21 +80,35 @@ def create_afd_npu_profiler(role: AFDNPUProfilerRole) -> AFDNPUProfiler | None:
 
 
 def create_runtime_npu_profiler(
-    role: AFDNPUProfilerRole, trace_dir: str
+    role: AFDNPUProfilerRole, trace_dir: str, *, lightweight: bool = False
 ) -> AFDNPUProfiler:
     config = replace(afd_npu_profiler_config(role), enabled=True, trace_dir=trace_dir)
-    return _create_npu_profiler(role, config, runtime=True)
+    return _create_npu_profiler(role, config, runtime=True, lightweight=lightweight)
 
 
 def _create_npu_profiler(
-    role: AFDNPUProfilerRole, config: AFDNPUProfilerConfig, *, runtime: bool
+    role: AFDNPUProfilerRole,
+    config: AFDNPUProfilerConfig,
+    *,
+    runtime: bool,
+    lightweight: bool = False,
 ) -> AFDNPUProfiler:
 
     import torch_npu
 
     experimental_config = torch_npu.profiler._ExperimentalConfig(
         export_type=torch_npu.profiler.ExportType.Text,
-        profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+        profiler_level=(
+            torch_npu.profiler.ProfilerLevel.Level_none
+            if lightweight
+            else torch_npu.profiler.ProfilerLevel.Level2
+        ),
+        mstx=lightweight,
+        mstx_domain_include=["afd.cam"] if lightweight else [],
+        data_simplification=True,
+        record_op_args=False,
+        op_attr=False,
+        l2_cache=False,
         aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
     )
     logger.info(
@@ -105,7 +119,7 @@ def _create_npu_profiler(
     )
     profiler = torch_npu.profiler.profile(
         activities=[
-            torch_npu.profiler.ProfilerActivity.CPU,
+            *([torch_npu.profiler.ProfilerActivity.CPU] if not lightweight else []),
             torch_npu.profiler.ProfilerActivity.NPU,
         ],
         schedule=None
@@ -117,12 +131,15 @@ def _create_npu_profiler(
             repeat=config.repeat,
             skip_first=config.skip_first,
         ),
-        with_stack=config.with_stack,
-        with_modules=config.with_stack,
-        record_shapes=True,
+        with_stack=config.with_stack and not lightweight,
+        with_modules=config.with_stack and not lightweight,
+        record_shapes=not lightweight,
+        profile_memory=False,
+        with_flops=False,
         experimental_config=experimental_config,
         on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
             config.trace_dir,
+            analyse_flag=not lightweight,
         ),
     )
     if runtime and role == "ffn":

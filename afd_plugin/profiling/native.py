@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Native FULL lifecycle, advanced only by its model-thread owner."""
+"""Native profiling lifecycle, advanced only by its model-thread owner."""
 
 from __future__ import annotations
 
@@ -13,11 +13,15 @@ from afd_plugin.compat.npu.profiler import (
     AFDNPUProfilerRole,
     create_runtime_npu_profiler,
 )
+from afd_plugin.profiling.storage import archive_native_trace
 
 
-class RuntimeFullProfiler:
-    def __init__(self, role: AFDNPUProfilerRole, trace_dir: Path) -> None:
+class RuntimeProfiler:
+    def __init__(
+        self, role: AFDNPUProfilerRole, trace_dir: Path, mode: str = "FULL"
+    ) -> None:
         self.role = role
+        self.mode = mode
         self.trace_dir = trace_dir
         self.state = "PREPARED"
         self.started_at_ns: int | None = None
@@ -25,6 +29,8 @@ class RuntimeFullProfiler:
         self._lock = threading.Lock()
         self._profiler: AFDNPUProfiler | None = None
         self._stepping = False
+        self.archive_state = "PENDING" if mode == "LIGHTWEIGHT" else None
+        self.archive_error: str | None = None
 
     @property
     def finished(self) -> bool:
@@ -50,6 +56,8 @@ class RuntimeFullProfiler:
                 return
             if self._profiler is None and not self._stepping:
                 self.state = "COMPLETED"
+                if self.mode == "LIGHTWEIGHT":
+                    self.archive_state = "SKIPPED"
             else:
                 self.state = "STOPPING"
 
@@ -61,6 +69,17 @@ class RuntimeFullProfiler:
                 "started_at_ns": self.started_at_ns,
                 "error": self.error,
                 "busy": self._busy(),
+                **(
+                    {
+                        "archive_state": self.archive_state,
+                        "archive_error": self.archive_error,
+                        "archive_path": str(
+                            self.trace_dir.with_name(self.trace_dir.name + ".tar.gz")
+                        ),
+                    }
+                    if self.mode == "LIGHTWEIGHT"
+                    else {}
+                ),
             }
 
     def step(self, *, startup_only: bool = False) -> None:
@@ -70,7 +89,11 @@ class RuntimeFullProfiler:
             self._stepping = True
         try:
             if self._profiler is None:
-                profiler = create_runtime_npu_profiler(self.role, str(self.trace_dir))
+                profiler = create_runtime_npu_profiler(
+                    self.role,
+                    str(self.trace_dir),
+                    lightweight=self.mode == "LIGHTWEIGHT",
+                )
                 with self._lock:
                     self._profiler = profiler
                     self.started_at_ns = time.time_ns()
@@ -87,6 +110,15 @@ class RuntimeFullProfiler:
                 profiler.stop()
                 with self._lock:
                     self.state = "COMPLETED"
+                if self.mode == "LIGHTWEIGHT":
+                    try:
+                        threading.Thread(
+                            target=self._archive, name="afd-cam-archive", daemon=True
+                        ).start()
+                    except RuntimeError as error:
+                        with self._lock:
+                            self.archive_state = "FAILED"
+                            self.archive_error = f"{type(error).__name__}: {error}"
             else:
                 profiler.step()
         except Exception as exc:
@@ -96,3 +128,16 @@ class RuntimeFullProfiler:
         finally:
             with self._lock:
                 self._stepping = False
+
+    def _archive(self) -> None:
+        with self._lock:
+            self.archive_state = "WRITING"
+        try:
+            archive_native_trace(self.trace_dir)
+            with self._lock:
+                self.archive_state = "COMPLETED"
+        except Exception as error:
+            # Raw data remains readable if compression or verification fails.
+            with self._lock:
+                self.archive_error = f"{type(error).__name__}: {error}"
+                self.archive_state = "FAILED"

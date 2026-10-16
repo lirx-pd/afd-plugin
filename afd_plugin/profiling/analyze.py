@@ -5,11 +5,15 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import math
 from collections import defaultdict
 from collections.abc import Iterable
 from pathlib import Path
+
+from afd_plugin.profiling.native_trace import read_native_trace
+from afd_plugin.profiling.pipeline import export_pipeline, reconstruct_pipeline
 
 SCHEMA_VERSION = 1
 NS_PER_US = 1000
@@ -83,6 +87,12 @@ def _validate(record: dict) -> None:
         _integer(record, "start_host_ns")
         if "worker_id" in record:
             _text(record, "worker_id")
+        if record.get("native_trace_dir") is not None:
+            _text(record, "native_trace_dir")
+            _integer(record, "generation")
+            _integer(record, "clock_uncertainty_ns")
+            if type(record.get("clock_offset_ns")) is not int:
+                raise ValueError("clock_offset_ns must be an integer")
         return
     if kind == "CLOCK_MAP":
         _text(record, "clock_domain")
@@ -106,6 +116,8 @@ def _validate(record: dict) -> None:
             "dropped_records",
         ):
             _integer(record, field)
+        if "native_spans" in record:
+            _integer(record, "native_spans")
         return
     if kind not in ID_FIELDS:
         raise ValueError(f"unsupported record_type: {kind}")
@@ -164,11 +176,14 @@ def _finite_float(value: str) -> float:
     return number
 
 
-def read_jsonl(paths: Iterable[str | Path]) -> list[dict]:
+def read_jsonl(
+    paths: Iterable[str | Path], *, analyse_native: bool = False
+) -> list[dict]:
     """Parse JSONL with source locations; reconstruct owns record schema validation."""
     records = []
     for path in paths:
         first = True
+        header = None
         with Path(path).open(encoding="utf-8") as source:
             for number, line in enumerate(source, 1):
                 if not line.strip():
@@ -185,7 +200,24 @@ def read_jsonl(paths: Iterable[str | Path]) -> list[dict]:
                 except ValueError as exc:
                     raise ValueError(f"{path}:{number}: {exc}") from exc
                 records.append(record)
+                if first:
+                    header = record
                 first = False
+        if header is not None and header.get("native_trace_dir"):
+            _validate(header)
+            if any(
+                r.get("record_type") == "SUMMARY"
+                and r.get("worker_id") == header["worker_id"]
+                and r.get("native_marks", r.get("native_spans")) == 0
+                for r in records
+            ):
+                continue
+            directory = Path(path).parent / header["native_trace_dir"]
+            if not directory.resolve().is_relative_to(Path(path).parent.resolve()):
+                raise ValueError(f"{path}: native_trace_dir escapes session directory")
+            records.extend(
+                read_native_trace(directory, header, analyse_native=analyse_native)
+            )
     return records
 
 
@@ -253,7 +285,9 @@ def _correlate_work(
         if "worker_id" not in call:
             continue
         bounds = {
-            spans[span_id]["kind"]: spans[span_id]["timing"]
+            spans[span_id].get("stage", spans[span_id]["kind"]): spans[span_id][
+                "timing"
+            ]
             for span_id in execution_spans[call_id]
             if spans[span_id]["complete"] and spans[span_id]["timing"]["aligned"]
         }
@@ -274,7 +308,7 @@ def _correlate_work(
         receives = [
             spans[span_id]["timing"]
             for span_id in execution_spans[work_id]
-            if spans[span_id]["kind"] == "DISPATCH_RECV"
+            if spans[span_id].get("stage", spans[span_id]["kind"]) == "DISPATCH_RECV"
             and spans[span_id]["complete"]
             and spans[span_id]["timing"]["aligned"]
         ]
@@ -301,6 +335,15 @@ def _correlate_work(
 
 
 def reconstruct(records: Iterable[dict]) -> dict:
+    records = list(records)
+    if any(
+        r.get("record_type") == "SESSION" and r.get("view") == "pipeline"
+        for r in records
+    ):
+        for record in records:
+            if record.get("record_type") in {"SESSION", "SUMMARY"}:
+                _validate(record)
+        return reconstruct_pipeline(records)
     tables: dict[str, dict[str, dict]] = {kind: {} for kind in ID_FIELDS}
     headers = {}
     summaries = {}
@@ -357,6 +400,15 @@ def reconstruct(records: Iterable[dict]) -> dict:
             errors.append(f"worker {worker}: dropped or unresolved records")
         if summary is not None and summary.get("error"):
             errors.append(f"worker {worker}: {summary['error']}")
+        if summary is not None and "native_spans" in summary:
+            observed = sum(
+                span["worker_id"] == worker for span in tables["SPAN"].values()
+            )
+            if observed != summary["native_spans"]:
+                errors.append(
+                    f"worker {worker}: expected {summary['native_spans']} native "
+                    f"ranges, found {observed}"
+                )
     for record in records:
         if record.get("session_id", session["session_id"]) != session["session_id"]:
             raise ValueError("records belong to different sessions")
@@ -371,6 +423,8 @@ def reconstruct(records: Iterable[dict]) -> dict:
         raise ValueError("SOURCE_CALL and FFN_WORK ids must be disjoint")
     execution_spans = defaultdict(list)
     compute_intervals = defaultdict(list)
+    layer_intervals = defaultdict(list)
+    layers: dict[tuple[str, str], dict] = {}
     for span_id, span in sorted(spans.items()):
         execution_spans[span["exec_ref"]].append(span_id)
         if span["exec_ref"] not in calls and span["exec_ref"] not in works:
@@ -384,12 +438,37 @@ def reconstruct(records: Iterable[dict]) -> dict:
         )
         if not span["timing"]["aligned"]:
             errors.append(f"SPAN {span_id}: no CLOCK_MAP covers its device interval")
+        if span["kind"] in {"COMPUTE", "COMMUNICATION", "WAIT"}:
+            layer_key = (span["worker_id"], span["exec_ref"])
+            metadata = works.get(span["exec_ref"], calls.get(span["exec_ref"], {}))
+            layers.setdefault(
+                layer_key,
+                {
+                    "worker_id": layer_key[0],
+                    "execution_id": layer_key[1],
+                    "role": "ffn" if span["exec_ref"] in works else "attention",
+                    "layer_idx": metadata.get("layer_idx"),
+                },
+            )
+            timing = span["timing"]
+            if span["complete"] and timing["aligned"]:
+                layer_intervals[(*layer_key, span["kind"])].append(
+                    (
+                        session["start_host_ns"]
+                        + round(timing["relative_begin_us"] * NS_PER_US),
+                        session["start_host_ns"]
+                        + round(timing["relative_end_us"] * NS_PER_US),
+                    )
+                )
         if (
             span["complete"]
             and span["timing"]["duration_ns"] is not None
             and span["device_begin_ns"] is not None
             and span["device_end_ns"] is not None
-            and span["kind"] == "FFN_COMPUTE"
+            and (
+                span["kind"] == "FFN_COMPUTE"
+                or (span["kind"] == "COMPUTE" and span["exec_ref"] in works)
+            )
         ):
             compute_intervals[(span["worker_id"], span["clock_domain"])].append(
                 (span["device_begin_ns"], span["device_end_ns"]),
@@ -489,6 +568,16 @@ def reconstruct(records: Iterable[dict]) -> dict:
         "ffn_works": dict(sorted(works.items())),
         "spans": dict(sorted(spans.items())),
         "pipelines": output_pipelines,
+        "layers": [
+            {
+                **layer,
+                "duration_ns": {
+                    phase.lower(): _union_duration(layer_intervals[(*key, phase)])
+                    for phase in ("COMPUTE", "COMMUNICATION", "WAIT")
+                },
+            }
+            for key, layer in sorted(layers.items())
+        ],
         "ffn_compute_by_worker": [
             {
                 "worker_id": worker,
@@ -502,6 +591,8 @@ def reconstruct(records: Iterable[dict]) -> dict:
 
 def export_chrome_trace(records: Iterable[dict]) -> dict:
     result = reconstruct(records)
+    if result.get("view") == "pipeline":
+        return export_pipeline(result)
     spans = result.pop("spans")
     workers = sorted({span["worker_id"] for span in spans.values()})
     process_ids = {worker: index for index, worker in enumerate(workers, 1)}
@@ -561,17 +652,26 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("session_dir", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--native",
+        action="store_true",
+        help="Parse raw native captures offline before exporting",
+    )
     args = parser.parse_args(argv)
     paths = sorted(args.session_dir.rglob("*.jsonl"))
     if not paths:
         parser.error("session directory contains no JSONL files")
     try:
-        result = export_chrome_trace(read_jsonl(paths))
+        result = export_chrome_trace(read_jsonl(paths, analyse_native=args.native))
     except ValueError as exc:
         parser.error(str(exc))
-    args.output.write_text(
-        json.dumps(result, indent=2, allow_nan=False) + "\n", encoding="utf-8"
-    )
+    with (
+        gzip.open(args.output, "wt", encoding="utf-8")
+        if args.output.suffix == ".gz"
+        else args.output.open("w", encoding="utf-8")
+    ) as output:
+        json.dump(result, output, separators=(",", ":"), allow_nan=False)
+        output.write("\n")
 
 
 if __name__ == "__main__":

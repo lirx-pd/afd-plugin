@@ -207,8 +207,7 @@ def test_runner_preserves_raw_context_and_chunk_capacity():
         send_ffn_output=lambda result, ctx: sent.append((result, ctx)),
     )
 
-    def compute(*args, profile=None):
-        assert profile is None
+    def compute(*args):
         computed.append(args)
         return torch.empty(8, 32, dtype=torch.bfloat16)
 

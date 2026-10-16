@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_world_group
@@ -18,9 +16,6 @@ from afd_plugin.connectors import (
     AFDDPMetadata,
     AFDForwardContextMetadata,
 )
-
-if TYPE_CHECKING:
-    from afd_plugin.profiling.fragments import InputSnapshot
 
 
 class AFDMetadataProviderMixin:
@@ -38,7 +33,6 @@ class AFDMetadataProviderMixin:
     _afd_transaction_counter: int
     _afd_is_profile: bool = False
     _afd_pending_metadata: AFDForwardContextMetadata | None
-    _profile_snapshot: InputSnapshot | None = None
 
     def build_afd_metadata(
         self,
@@ -76,7 +70,6 @@ class AFDMetadataProviderMixin:
             num_stages=num_stages,
             transaction_id=self._next_afd_transaction_id(),
             tokens_unpadded_lens=tokens_unpadded_lens,
-            profile_snapshot=self._profile_snapshot,
         )
 
     def send_dp_metadata(

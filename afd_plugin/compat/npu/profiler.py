@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, replace
+from types import MethodType
 from typing import Final, Literal, Protocol
 
 logger = logging.getLogger(__name__)
@@ -124,8 +125,38 @@ def _create_npu_profiler(
             config.trace_dir,
         ),
     )
+    if runtime and role == "ffn":
+        from torch_npu.profiler._profiler_action_controller import ProfActionController
+
+        profiler.prof_if.stop_trace = MethodType(_stop_ffn_trace, profiler.prof_if)
+        # The controller captures bound methods when constructed.
+        profiler.action_controller = ProfActionController(
+            profiler, profiler.prof_if, profiler.on_trace_ready
+        )
     profiler.start()
     return profiler
+
+
+# TorchNPU 2.10 _ProfInterface.stop_trace waits for the permanently idle CAM recv.
+# Runtime FFN's model thread instead checks the pre-receive fence before stopping.
+# shortcut: pinned private API; remove when TorchNPU supports stream-scoped stop.
+def _stop_ffn_trace(self):
+    from torch_npu.profiler.profiler_interface import (
+        FlopsHookManager,
+        _disable_event_record,
+        _stop_profiler,
+    )
+
+    if not self._is_env_valid:
+        return
+    # ### PATCH START: completed FFN work fence replaces device synchronize
+    # The owner has verified completion of all work preceding the pending recv.
+    # ### PATCH END: completed FFN work fence replaces device synchronize
+    if self.with_flops and self.experimental_config.tx_enabled:
+        FlopsHookManager.uninstall()
+    _stop_profiler()
+    self.stop_gc_detect()
+    _disable_event_record()
 
 
 def step_afd_npu_profiler(profiler: AFDNPUProfiler | None) -> None:

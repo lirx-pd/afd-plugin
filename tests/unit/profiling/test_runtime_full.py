@@ -6,12 +6,13 @@ from __future__ import annotations
 import json
 import sys
 import threading
+from functools import partial
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from afd_plugin.compat.npu.profiler import step_afd_npu_profiler
 from afd_plugin.profiling import full as full_module
+from afd_plugin.profiling import npu as npu_module
 from afd_plugin.profiling import session as session_module
 from afd_plugin.profiling.session import WorkerSession
 from afd_plugin.profiling.worker import CAMProfileWorkerMixin
@@ -31,13 +32,16 @@ class FakeFullOwner:
         self.state = "PREPARED"
         self.started_at_ns = None
         self.error = None
-        self.done = threading.Event()
         self.busy = False
         self.starts = 0
         self.steps = 0
         self.stops = 0
         self.block_stop = False
         self.stop_error = None
+
+    @property
+    def finished(self):
+        return self.state in {"COMPLETED", "FAILED"}
 
     def start(self):
         self.starts += 1
@@ -55,11 +59,10 @@ class FakeFullOwner:
         self.error = error
         self.state = "FAILED"
         self.busy = False
-        self.done.set()
 
     def stop(self):
         self.stops += 1
-        if self.done.is_set():
+        if self.finished:
             return
         if self.stop_error:
             self.fail(self.stop_error)
@@ -68,7 +71,6 @@ class FakeFullOwner:
         else:
             self.state = "COMPLETED"
             self.busy = False
-            self.done.set()
 
     def snapshot(self):
         return {
@@ -137,8 +139,9 @@ def make_worker(session):
 
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])
+@pytest.mark.parametrize("initialized", [False, True])
 def test_enabled_worker_creates_tracer_only_for_lightweight(
-    tmp_path, monkeypatch, role
+    tmp_path, monkeypatch, role, initialized
 ):
     class Connector(SimpleNamespace):
         pass
@@ -150,6 +153,8 @@ def test_enabled_worker_creates_tracer_only_for_lightweight(
         attn_size=1,
         ffn_size=1,
         tp_size=1,
+        comm_args=object() if initialized else None,
+        is_initialized=initialized,
     )
     module = ModuleType("afd_plugin.connectors.npu.async_cam")
     monkeypatch.setattr(module, "CAMAsyncAFDConnector", Connector, raising=False)
@@ -169,7 +174,7 @@ def test_enabled_worker_creates_tracer_only_for_lightweight(
         waiters.append((device, session))
         return waiter
 
-    monkeypatch.setattr(full_module, "FFNDeviceWaiter", create_waiter)
+    monkeypatch.setattr(npu_module, "FFNDeviceWaiter", create_waiter)
     worker = CAMProfileWorkerMixin()
     worker.device = "npu:0"
     worker.model_runner = SimpleNamespace(connector=connector, prof=None)
@@ -206,7 +211,7 @@ def test_enabled_worker_creates_tracer_only_for_lightweight(
             assert session.capture.writer.close(1.0)
 
 
-def test_worker_reuses_existing_runner_profiler_step_and_allows_mode_switches(
+def test_runtime_owner_leaves_static_runner_profiler_separate_across_modes(
     full_session, monkeypatch
 ):
     session, clock, _ = full_session
@@ -221,25 +226,23 @@ def test_worker_reuses_existing_runner_profiler_step_and_allows_mode_switches(
         return native
 
     monkeypatch.setattr(full_module, "create_runtime_npu_profiler", factory)
-    session._full_factory = lambda path: worker._create_cam_full_profiler(
-        "attention", path
-    )
+    session._full_factory = partial(full_module.RuntimeFullProfiler, "attention")
     for mode in ("FULL", "LIGHTWEIGHT", "FULL"):
         status = worker.cam_profile_prepare(prepare_command(mode=mode, duration_s=1))
         assert status["state"] == "PREPARED" and status["error"] is None
         if mode == "FULL":
-            assert worker.model_runner.prof is session.capture.full
+            assert worker.model_runner.prof is None
         worker.cam_profile_commit(commit_command(session, clock))
         clock.advance(0.1)
         session.tick()
-        step_afd_npu_profiler(worker.model_runner.prof)
+        session.advance_full()
         session.tick()
         assert session.state == "RUNNING"
         worker.cam_profile_stop(stop_command(session))
-        step_afd_npu_profiler(worker.model_runner.prof)
+        session.advance_full()
         finish_writer(session)
         assert session.state == "COMPLETED"
-    assert calls == ["start", "step", "stop"] * 2
+    assert calls == ["start", "stop"] * 2
 
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])
@@ -262,19 +265,19 @@ def test_idle_full_start_preserves_runner_ownership_and_stop_boundary(
 
     monkeypatch.setattr(full_module, "create_runtime_npu_profiler", factory)
     monkeypatch.setattr(full_module, "time", clock)
-    session._full_factory = lambda path: worker._create_cam_full_profiler(role, path)
+    session._full_factory = partial(full_module.RuntimeFullProfiler, role)
 
     assert worker.cam_profile_status({})["state"] == "IDLE"
     worker.cam_profile_prepare(prepare_command(mode="FULL", duration_s=1))
-    session.start_pending_full()
+    session.advance_full(allow_stop=False)
     assert worker.cam_profile_status({})["state"] == "PREPARED"
     worker.cam_profile_commit(commit_command(session, clock))
     session.tick()
-    session.start_pending_full()
+    session.advance_full(allow_stop=False)
     worker.cam_profile_status({})
     clock.advance(0.099)
     session.tick()
-    session.start_pending_full()
+    session.advance_full(allow_stop=False)
     worker.cam_profile_status({})
     assert not calls
 
@@ -285,7 +288,7 @@ def test_idle_full_start_preserves_runner_ownership_and_stop_boundary(
     worker.cam_profile_status({})
     if role == "ffn":
         assert not calls
-        session.start_pending_full()
+        session.advance_full(allow_stop=False)
     assert owner.state == "RUNNING"
     assert owner.started_at_ns == clock.time_ns()
     assert calls == [("start", threading.get_ident())]
@@ -294,16 +297,18 @@ def test_idle_full_start_preserves_runner_ownership_and_stop_boundary(
     assert session.state == "RUNNING"
     for _ in range(2):
         worker.cam_profile_status({})
-        session.start_pending_full()
+        session.advance_full(allow_stop=False)
     assert len(calls) == 1
 
     worker.cam_profile_stop(stop_command(session))
     assert owner.state == "STOPPING"
     worker.cam_profile_status({})
-    session.start_pending_full()
-    assert len(calls) == 1
-    assert not owner.done.is_set()
-    step_afd_npu_profiler(worker.model_runner.prof)
+    session.advance_full(allow_stop=False)
+    if role == "ffn":
+        assert len(calls) == 1
+        assert not owner.finished
+        session.advance_full()
+    assert owner.finished
     finish_writer(session)
     assert session.state == "COMPLETED"
     assert calls[-1] == ("stop", threading.get_ident())
@@ -313,7 +318,6 @@ def test_idle_full_start_does_not_hold_session_lock_during_native_start(
     full_session, monkeypatch
 ):
     session, clock, _ = full_session
-    worker = make_worker(session)
     entering_native = threading.Event()
     release_native = threading.Event()
     control_completed = threading.Event()
@@ -332,16 +336,14 @@ def test_idle_full_start_does_not_hold_session_lock_during_native_start(
         return native
 
     monkeypatch.setattr(full_module, "create_runtime_npu_profiler", factory)
-    session._full_factory = lambda path: worker._create_cam_full_profiler(
-        "attention", path
-    )
+    session._full_factory = partial(full_module.RuntimeFullProfiler, "attention")
     start_full(session, clock)
 
     def run_model():
-        session.start_pending_full()
+        session.advance_full(allow_stop=False)
         startup_completed.set()
         assert resume_runner.wait(2.0)
-        step_afd_npu_profiler(worker.model_runner.prof)
+        session.advance_full()
 
     runner = threading.Thread(target=run_model)
 
@@ -361,7 +363,7 @@ def test_idle_full_start_does_not_hold_session_lock_during_native_start(
         release_native.set()
         assert startup_completed.wait(1.0)
         assert session.capture.full.state == "STOPPING"
-        assert not session.capture.full.done.is_set()
+        assert not session.capture.full.finished
     finally:
         release_native.set()
         resume_runner.set()
@@ -370,7 +372,7 @@ def test_idle_full_start_does_not_hold_session_lock_during_native_start(
             controller.join(2.0)
     assert not runner.is_alive()
     assert not controller.is_alive()
-    assert session.capture.full.done.is_set()
+    assert session.capture.full.finished
     assert native_threads == [runner.ident, runner.ident]
     finish_writer(session)
     assert session.state == "COMPLETED"

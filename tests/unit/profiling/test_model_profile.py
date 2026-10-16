@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from afd_plugin.profiling.fragments import InputSnapshot
 from afd_plugin.profiling.model import begin_profile_call, record_source_call
 
@@ -49,6 +51,8 @@ def test_fragment_dictionary_is_emitted_again_for_a_new_capture_generation():
         ),
         stage_idx=0,
         tokens_start_loc=[0],
+        tokens_lens=[4],
+        tokens_unpadded_lens=[4],
         transaction_id="forward-1",
         profile_fragments=None,
         profile_sp_origin=None,
@@ -83,3 +87,74 @@ def test_fragment_dictionary_is_emitted_again_for_a_new_capture_generation():
             if record["record_type"] == "SOURCE_CALL"
         )
         assert set(call["fragment_ids"]) <= fragments
+
+
+@pytest.mark.parametrize("total,split", [(2337, 1170), (3, 2), (8, 4)])
+@pytest.mark.parametrize("cloned", [False, True])
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+@pytest.mark.parametrize("explicit_unpadded", [False, True])
+def test_stage_padding_does_not_claim_tokens_from_the_next_stage(
+    total, split, cloned, sequence_parallel, explicit_unpadded
+):
+    snapshot = InputSnapshot.from_cpu(
+        ["request"], [0, total], [0], [total], [True], total
+    )
+    intervals = []
+    real_lengths = [split, total - split]
+    physical_lengths = (
+        [(length + 3) // 4 * 4 for length in real_lengths]
+        if explicit_unpadded
+        else real_lengths
+    )
+    for stage, (start, stop) in enumerate(((0, split), (split, total))):
+        shard_tokens = (stop - start + 3) // 4
+        for rank in range(4):
+            origin = rank * shard_tokens
+            metadata = SimpleNamespace(
+                profile_snapshot=snapshot,
+                stage_idx=stage,
+                tokens_start_loc=[start] if cloned else [0, split],
+                tokens_lens=[physical_lengths[stage]] if cloned else physical_lengths,
+                tokens_unpadded_lens=(
+                    ([stop - start] if cloned else real_lengths)
+                    if explicit_unpadded
+                    else []
+                ),
+                transaction_id="forward",
+                profile_fragments=None,
+                profile_sp_origin=origin if sequence_parallel else None,
+                connector=SimpleNamespace(attn_size=4),
+            )
+            writer = MemoryWriter()
+            execution = SimpleNamespace(
+                capture=SimpleNamespace(writer=writer, generation=1),
+                tracer=SimpleNamespace(
+                    worker_id=f"attention-{rank}", source_workers=[]
+                ),
+                exec_ref=f"attention-{rank}:call:{stage}",
+            )
+            local_start = 0 if sequence_parallel else origin
+            layout = SimpleNamespace(
+                use_sequence_parallel=sequence_parallel,
+                local_token_slice=slice(local_start, local_start + shard_tokens),
+                local_tokens=shard_tokens,
+            )
+            record_source_call(execution, metadata, 0, layout)
+            fragments = [
+                row for row in writer.records if row["record_type"] == "FRAGMENT"
+            ]
+            intervals.extend(
+                (row["token_start"], row["token_end"]) for row in fragments
+            )
+            assert all(
+                start <= row["token_start"] < row["token_end"] <= stop
+                for row in fragments
+            )
+            call = writer.records[-1]
+            expected_real = max(0, min(shard_tokens, stop - start - origin))
+            assert call["padded_tokens"] == shard_tokens - expected_real
+    position = 0
+    for begin, end in sorted(intervals):
+        assert begin == position
+        position = end
+    assert position == total

@@ -143,8 +143,18 @@ def test_runtime_profiler_reuses_backend_options_and_handler_without_step_schedu
     expected["schedule"] = None
     expected["on_trace_ready"] = ("handler", "/session/worker/full")
     monkeypatch.setenv("AFD_NPU_FFN_PROFILER_ENABLE", "0")
+    controllers = []
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu.profiler._profiler_action_controller",
+        SimpleNamespace(ProfActionController=lambda *args: controllers.append(args)),
+    )
 
     profiler = create_runtime_npu_profiler("ffn", "/session/worker/full")
+    from afd_plugin.compat.npu.profiler import _stop_ffn_trace
+
+    assert profiler.prof_if.stop_trace.__func__ is _stop_ffn_trace
+    assert controllers == [(profiler, profiler.prof_if, profiler.on_trace_ready)]
 
     assert profiler is profiler_module.created_profiler
     assert profiler_module.created_profiler.started is True
@@ -197,4 +207,33 @@ class _FakeTorchNPUProfiler:
 
     def profile(self, **kwargs):
         self.profile_kwargs = kwargs
+        self.created_profiler.prof_if = SimpleNamespace()
+        self.created_profiler.on_trace_ready = kwargs["on_trace_ready"]
         return self.created_profiler
+
+
+@pytest.mark.parametrize("valid,flops", [(False, False), (True, False), (True, True)])
+def test_ffn_stop_preserves_native_cleanup_without_synchronizing(
+    monkeypatch, valid, flops
+):
+    from afd_plugin.compat.npu.profiler import _stop_ffn_trace
+
+    calls = []
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu.profiler.profiler_interface",
+        SimpleNamespace(
+            FlopsHookManager=SimpleNamespace(uninstall=lambda: calls.append("flops")),
+            _stop_profiler=lambda: calls.append("native"),
+            _disable_event_record=lambda: calls.append("events"),
+        ),
+    )
+    interface = SimpleNamespace(
+        _is_env_valid=valid,
+        with_flops=flops,
+        experimental_config=SimpleNamespace(tx_enabled=True),
+        stop_gc_detect=lambda: calls.append("gc"),
+    )
+    _stop_ffn_trace(interface)
+    expected = (["flops"] if flops else []) + ["native", "gc", "events"]
+    assert calls == (expected if valid else [])

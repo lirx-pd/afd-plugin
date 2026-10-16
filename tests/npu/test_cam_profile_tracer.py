@@ -392,19 +392,16 @@ def _probe(case: str, output: Path) -> None:
             device, WORKER_ID, list(SOURCE_WORKERS), 2, 2
         ),
     )
-    try:
-        probes: dict[str, Callable[..., dict]] = {
-            "streams": _probe_streams,
-            "metadata": _probe_metadata,
-            "stop": _probe_stop,
-            "short": _probe_short,
-            "host_stop": _probe_host_stop,
-            "lazy_prepare": _probe_lazy_prepare,
-        }
-        result = probes[case](torch, tracer, session, output)
-        (output / "probe-result.json").write_text(json.dumps(result, indent=2))
-    finally:
-        session._shutdown.set()
+    probes: dict[str, Callable[..., dict]] = {
+        "streams": _probe_streams,
+        "metadata": _probe_metadata,
+        "stop": _probe_stop,
+        "short": _probe_short,
+        "host_stop": _probe_host_stop,
+        "lazy_prepare": _probe_lazy_prepare,
+    }
+    result = probes[case](torch, tracer, session, output)
+    (output / "probe-result.json").write_text(json.dumps(result, indent=2))
 
 
 @pytest.mark.parametrize(

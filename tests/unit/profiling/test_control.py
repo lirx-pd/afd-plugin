@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import time
 import uuid
@@ -318,6 +319,70 @@ def save_previous_session(coordinator, fleet, *, state="RUNNING"):
     )
     coordinator._persist(session)
     return session
+
+
+@pytest.mark.parametrize("operation", ["stop", "close", "recover"])
+def test_manifest_quota_failure_does_not_interrupt_cleanup(
+    tmp_path, monkeypatch, operation
+):
+    async def run():
+        fleet = FakeFleet()
+        coordinator, client = make_coordinator(tmp_path, fleet)
+        async with client:
+            if operation == "recover":
+                session = save_previous_session(coordinator, fleet)
+            else:
+                session = coordinator.start(
+                    control.StartRequest(mode="LIGHTWEIGHT", duration=60)
+                )
+                while session.state == "STARTING":
+                    await asyncio.sleep(0.001)
+                assert session.state == "RUNNING"
+
+            def fail_manifest(_session):
+                raise OSError(errno.EDQUOT, "Disk quota exceeded")
+
+            monkeypatch.setattr(coordinator, "_persist", fail_manifest)
+            if operation == "recover":
+                await coordinator.recover()
+                session = coordinator.get(session.session_id)
+            elif operation == "close":
+                await coordinator.close()
+            else:
+                assert coordinator.stop(session.session_id) is session
+                await asyncio.wait_for(session.task, 1)
+        assert session.state == "FAILED"
+        assert session.data_quality == "PARTIAL"
+        assert any("Manifest write failed" in error for error in session.errors)
+        assert {role for role, action, _ in fleet.calls if action == "stop"} == {
+            "attention",
+            "ffn",
+        }
+        assert all(worker["state"] == "COMPLETED" for worker in session.workers)
+        assert coordinator.active is None
+
+    asyncio.run(run())
+
+
+def test_final_manifest_failure_cannot_report_complete_data(tmp_path, monkeypatch):
+    async def run():
+        fleet = FakeFleet()
+        coordinator, client = make_coordinator(tmp_path, fleet)
+        session = save_previous_session(coordinator, fleet)
+        persist = coordinator._persist
+
+        def fail_final_manifest(current):
+            if current.state == "COMPLETED":
+                raise OSError(errno.EDQUOT, "Disk quota exceeded")
+            persist(current)
+
+        monkeypatch.setattr(coordinator, "_persist", fail_final_manifest)
+        async with client:
+            await coordinator._drain(session)
+        assert session.state == "FAILED"
+        assert session.data_quality == "PARTIAL"
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("stalled_action", ["stop", "status"])

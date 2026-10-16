@@ -13,6 +13,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -64,7 +65,7 @@ def _probe(output: Path) -> None:
                 begin = time.monotonic()
                 runtime.stop()
                 runtime.step()
-                assert runtime.done.is_set(), runtime.snapshot()
+                assert runtime.finished, runtime.snapshot()
                 assert runtime.state == "COMPLETED", runtime.snapshot()
                 assert not runtime.busy, runtime.snapshot()
                 traces = list(runtime.trace_dir.rglob("trace_view.json"))
@@ -118,7 +119,8 @@ def _probe_cooperative(output: Path) -> None:
     import torch
     import torch_npu
 
-    from afd_plugin.profiling.full import FFNDeviceWaiter, RuntimeFullProfiler
+    from afd_plugin.profiling.full import RuntimeFullProfiler
+    from afd_plugin.profiling.npu import FFNDeviceWaiter
     from afd_plugin.profiling.session import WorkerSession
 
     os.environ["AFD_NPU_FFN_PROFILER_ENABLE"] = "0"
@@ -175,14 +177,14 @@ def _probe_cooperative(output: Path) -> None:
         "start_ns": session.capture.start_ns,
         "deadline_ns": session.capture.deadline_ns,
     }
-    start_pending_full = session.start_pending_full
+    advance_full = session.advance_full
     wait_for_stream = waiter.wait_for_stream
 
     def observe_copy() -> None:
         diagnostics["pending_after_copy"] = not pending.query()
         wait_for_stream()
 
-    def observe_start() -> None:
+    def observe_start(**kwargs) -> None:
         nonlocal wait_calls
         wait_calls += 1
         pending_before = not pending.query()
@@ -190,7 +192,7 @@ def _probe_cooperative(output: Path) -> None:
             diagnostics["pending_after_event_record"] = pending_before
             diagnostics["first_full_state"] = runtime.state
             diagnostics["first_session_state"] = session.state
-        start_pending_full()
+        advance_full(**kwargs)
         if runtime.started_at_ns is not None and not observations:
             session.tick()
             observations.append(
@@ -202,8 +204,9 @@ def _probe_cooperative(output: Path) -> None:
                 }
             )
 
-    session.start_pending_full = observe_start
+    session.advance_full = observe_start
     waiter.wait_for_stream = observe_copy
+    waiter.begin_receive()
     queue_begin = time.monotonic()
     for _ in range(BUSY_ITERATIONS):
         torch.mm(matrix, matrix, out=target)
@@ -227,6 +230,7 @@ def _probe_cooperative(output: Path) -> None:
     with torch.profiler.record_function(marker):
         torch.mm(matrix, matrix, out=target)
     session.stop({"session_id": session_id, "command_seq": 3})
+    torch.npu.current_stream().synchronize()
     runtime.step()
     assert runtime.state == "COMPLETED", runtime.snapshot()
     deadline = time.monotonic() + 5
@@ -271,13 +275,129 @@ def _probe_cooperative(output: Path) -> None:
     )
 
 
-@pytest.mark.parametrize("probe", ["--probe", "--cooperative-probe"])
+def _probe_cam_idle(output: Path) -> None:
+    import torch
+    import torch_npu  # noqa: F401
+
+    from afd_plugin.profiling.full import RuntimeFullProfiler
+    from afd_plugin.profiling.npu import EventTimestampReader, FFNDeviceWaiter
+    from tests.npu.async_cam_common import HarnessConfig, NativeHarness
+
+    os.environ["AFD_NPU_FFN_PROFILER_WITH_STACK"] = "0"
+    config = HarnessConfig(
+        attn_ranks=1,
+        moe_ranks=1,
+        tp_size=1,
+        lengths=(8,),
+        capacity=16,
+        max_seq_len=8,
+        timeout_seconds=60,
+    )
+    results = []
+    with NativeHarness(config) as harness:
+        assert harness.comm_args.numel() == 1
+        assert not harness.run_round(0)["failures"]
+        original = harness.operations["dispatch_recv"]
+        if harness.rank == 1:
+            matrix = torch.ones(
+                (MATRIX_SIZE, MATRIX_SIZE), dtype=torch.float16, device=harness.device
+            )
+            target = torch.empty_like(matrix)
+            waiter = FFNDeviceWaiter(
+                harness.device, SimpleNamespace(advance_full=lambda **kwargs: None)
+            )
+            reader = EventTimestampReader()
+        for variant in ("start_before_receive", "start_during_receive"):
+
+            def receive(*args, variant=variant):
+                runtime = RuntimeFullProfiler("ffn", output / variant)
+                if variant == "start_before_receive":
+                    runtime.start()
+                    runtime.step(startup_only=True)
+                    with torch.profiler.record_function(CPU_MARKER):
+                        for _ in range(ITERATIONS):
+                            torch.mm(matrix, matrix, out=target)
+                waiter.begin_receive()
+                values = original(*args)
+                waiter.end_receive()
+                assert not waiter.end.query(), "sender arrived before the idle probe"
+                if variant == "start_during_receive":
+                    runtime.start()
+                    runtime.step(startup_only=True)
+                deadline = time.monotonic() + 10
+                while not waiter.begin.query():
+                    assert time.monotonic() < deadline
+                    time.sleep(0)
+                assert runtime.state == "RUNNING", runtime.snapshot()
+                begin = time.monotonic()
+                runtime.stop()
+                runtime.step()
+                seconds = time.monotonic() - begin
+                assert runtime.state == "COMPLETED", runtime.snapshot()
+                assert seconds < 10 and not waiter.end.query(), (
+                    seconds,
+                    runtime.snapshot(),
+                )
+                events = []
+                for path in runtime.trace_dir.rglob("trace_view.json"):
+                    trace = json.loads(path.read_text())
+                    events.extend(
+                        trace if isinstance(trace, list) else trace["traceEvents"]
+                    )
+                if variant == "start_before_receive":
+                    kernels = sum(
+                        "Task Type" in e.get("args", {})
+                        and "aclnnMm_" in e.get("name", "")
+                        for e in events
+                    )
+                    assert kernels == ITERATIONS, kernels
+                    assert sum(e.get("name") == CPU_MARKER for e in events) == 1
+                results.append(
+                    {
+                        "variant": variant,
+                        "stop_seconds": seconds,
+                        "state": runtime.snapshot(),
+                    }
+                )
+                _, _, batch, counts = values
+                control = torch.stack(
+                    (batch[0], batch[2], counts.sum(dtype=torch.int64))
+                )
+                assert waiter.read_ffn_control(control) == [16, 1, 16]
+                begin = reader.read_raw(waiter.begin)
+                end = reader.read_raw(waiter.end)
+                assert begin is not None and end is not None and end > begin
+                results[-1]["receive_duration_us"] = end - begin
+                return values
+
+            harness.operations["dispatch_recv"] = receive
+
+            def delay_sender(name):
+                if harness.rank == 0 and name == "dispatch_send":
+                    time.sleep(20)
+
+            report = harness.run_round(1, before_op=delay_sender)
+            assert not report["failures"], report
+        if harness.rank == 1:
+            (output / "probe-result.json").write_text(json.dumps(results, indent=2))
+
+
+@pytest.mark.parametrize(
+    "probe", ["--probe", "--cooperative-probe", "--cam-idle-probe"]
+)
 def test_runtime_full_preserves_public_profiler_outputs(tmp_path, probe):
     if os.environ.get("AFD_RUN_ASCEND_OP_RUNTIME") != "1":
         pytest.skip("requires an allocated NPU and runtime opt-in")
     pytest.importorskip("torch_npu")
+    command = [sys.executable]
+    if probe == "--cam-idle-probe":
+        visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "").split(",")
+        if len([item for item in visible if item.strip()]) < 2:
+            pytest.skip("blocked CAM receive probe requires two allocated devices")
+        command += ["-m", "torch.distributed.run", "--standalone", "--nproc-per-node=2"]
+    command += [str(Path(__file__).resolve()), probe, str(tmp_path)]
     with subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), probe, str(tmp_path)],
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -300,10 +420,11 @@ def test_runtime_full_preserves_public_profiler_outputs(tmp_path, probe):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3 or sys.argv[1] not in {"--probe", "--cooperative-probe"}:
-        raise SystemExit(
-            "usage: test_cam_profile_runtime_full.py --[cooperative-]probe OUTPUT"
-        )
-    (_probe_cooperative if sys.argv[1] == "--cooperative-probe" else _probe)(
-        Path(sys.argv[2])
-    )
+    probes = {
+        "--probe": _probe,
+        "--cooperative-probe": _probe_cooperative,
+        "--cam-idle-probe": _probe_cam_idle,
+    }
+    if len(sys.argv) != 3 or sys.argv[1] not in probes:
+        raise SystemExit("usage: test_cam_profile_runtime_full.py PROBE OUTPUT")
+    probes[sys.argv[1]](Path(sys.argv[2]))

@@ -17,7 +17,8 @@ from afd_plugin.profiling.storage import JsonRecordWriter
 if TYPE_CHECKING:
     import torch
 
-    from afd_plugin.profiling.full import FFNDeviceWaiter, RuntimeFullProfiler
+    from afd_plugin.profiling.full import RuntimeFullProfiler
+    from afd_plugin.profiling.npu import FFNDeviceWaiter
     from afd_plugin.profiling.tracing import DeviceTracer
 
 MAX_DURATION_S = 3600
@@ -93,7 +94,6 @@ class WorkerSession:
         self._full_factory = full_factory
         self._tracer_factory = tracer_factory
         self._full_poisoned = False
-        self._shutdown = threading.Event()
 
     def start(self, device: torch.device) -> None:
         threading.Thread(
@@ -104,7 +104,8 @@ class WorkerSession:
         import torch_npu
 
         torch_npu.npu.set_device(device)
-        while not self._shutdown.wait(POLL_INTERVAL_S):
+        while True:
+            time.sleep(POLL_INTERVAL_S)
             try:
                 self.tick()
                 capture = self.capture
@@ -316,20 +317,18 @@ class WorkerSession:
         with self._lock:
             return self._status()
 
-    def start_pending_full(self) -> None:
-        """Run startup on the original model thread, outside the session lock."""
+    def advance_full(self, *, allow_stop: bool = True) -> None:
+        """Advance native lifecycle on its model thread, outside the session lock."""
         with self._lock:
             capture = self.capture
-            if (
-                capture is None
-                or self.state != "STARTING"
-                or capture.full is None
-                or capture.full.state != "STARTING"
-                or time.monotonic_ns() >= capture.deadline_ns
-            ):
+            if capture is None or capture.full is None:
                 return
             full = capture.full
-        full.step(startup_only=True)
+            if full.state not in {"STARTING", "STOPPING"}:
+                return
+            if full.state == "STARTING" and time.monotonic_ns() >= capture.deadline_ns:
+                return
+        full.step(startup_only=not allow_stop or full.state == "STARTING")
 
     def _status(self) -> dict:
         capture = self.capture
@@ -393,7 +392,7 @@ class WorkerSession:
                 elif (
                     capture.full_deadline_ns
                     and now >= capture.full_deadline_ns
-                    and not full.done.is_set()
+                    and not full.finished
                     and (full.started_at_ns is None or capture.stop_requested)
                 ):
                     phase = "stop" if capture.stop_requested else "start"
@@ -408,7 +407,7 @@ class WorkerSession:
                 tracer.collect(capture)
             if not capture.stop_requested:
                 return
-            if full is not None and not full.done.is_set() and not self._full_poisoned:
+            if full is not None and not full.finished and not self._full_poisoned:
                 return
             expired = now >= capture.drain_deadline_ns
             if tracer is not None and tracer.pending_count() and not expired:

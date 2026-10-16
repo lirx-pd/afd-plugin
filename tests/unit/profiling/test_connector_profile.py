@@ -45,6 +45,10 @@ class Tracer:
     def release_execution(self, execution):
         self.released.append(execution)
 
+    def record_receive(self, execution, *timing):
+        self.spans.append((execution.exec_ref, "DISPATCH_RECV"))
+        return True
+
     def defer_metadata(self, execution, source_trace, compact_metadata):
         self.deferred.append((execution, source_trace, compact_metadata))
 
@@ -91,6 +95,23 @@ def connector(monkeypatch, *, role, enabled=True):
     result.comm_args = torch.empty((1,))
     result._placeholder = torch.empty((1,))
     return result
+
+
+def profile_session(tracer):
+    return SimpleNamespace(
+        tracer=tracer,
+        advance_full=Mock(),
+        device_waiter=SimpleNamespace(
+            read_ffn_control=lambda control: control.tolist(),
+            begin_receive=Mock(),
+            end_receive=Mock(),
+            begin=object(),
+            end=object(),
+            stream=object(),
+            host_begin_ns=1,
+            host_end_ns=2,
+        ),
+    )
 
 
 def dispatch(connector, *, stage=0):
@@ -164,7 +185,7 @@ def test_dispatch_sequence_survives_idle_and_new_session_with_original_owner(
 def test_recv_defers_tail_views_and_preserves_full_combine_metadata(monkeypatch, ops):
     ffn = connector(monkeypatch, role="ffn")
     tracer = Tracer()
-    ffn.profile_session = SimpleNamespace(tracer=tracer)
+    ffn.profile_session = profile_session(tracer)
     outputs = recv_outputs(ffn)
     ops.afd_async_dispatch_recv.return_value = outputs
     batch_info = outputs[2]
@@ -192,6 +213,33 @@ def test_recv_defers_tail_views_and_preserves_full_combine_metadata(monkeypatch,
     assert tracer.released == [execution]
 
 
+@pytest.mark.parametrize("active_at_completion", [False, True])
+def test_receive_admits_only_after_device_completion(
+    monkeypatch, ops, active_at_completion
+):
+    ffn = connector(monkeypatch, role="ffn")
+    tracer = Tracer(active=not active_at_completion)
+    ffn.profile_session = profile_session(tracer)
+    actual = recv_outputs(ffn)
+    ops.afd_async_dispatch_recv.return_value = actual
+
+    def complete(control):
+        assert not tracer.spans and not tracer.deferred and not tracer.released
+        tracer.active = active_at_completion
+        return control.tolist()
+
+    ffn.profile_session.device_waiter.read_ffn_control = complete
+    received = ffn.recv_attn_output(batch_size=2)
+
+    assert received.context.states.token_nums_rankid_layeridx is actual[2]
+    assert ops.afd_async_dispatch_recv.call_count == 1
+    assert bool(received.context.profile) == active_at_completion
+    assert len(tracer.deferred) == int(active_at_completion)
+    assert tracer.spans == (
+        [("ffn-work", "DISPATCH_RECV")] if active_at_completion else []
+    )
+
+
 @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "idle"])
 def test_no_capture_skips_metadata_views_and_keeps_full_metadata(
     monkeypatch, ops, enabled
@@ -199,14 +247,16 @@ def test_no_capture_skips_metadata_views_and_keeps_full_metadata(
     ffn = connector(monkeypatch, role="ffn", enabled=enabled)
     tracer = Tracer(active=False)
     if enabled:
-        ffn.profile_session = SimpleNamespace(tracer=tracer)
+        ffn.profile_session = profile_session(tracer)
     outputs = recv_outputs(ffn)
     ops.afd_async_dispatch_recv.return_value = outputs
     batch_info = outputs[2]
     getitem = torch.Tensor.__getitem__
 
     def checked_getitem(tensor, item):
-        assert tensor is not batch_info, "inactive profiling must not slice metadata"
+        assert tensor is not batch_info or item in (0, 2), (
+            "inactive profiling must not slice source identities"
+        )
         return getitem(tensor, item)
 
     monkeypatch.setattr(torch.Tensor, "__getitem__", checked_getitem)
@@ -225,3 +275,18 @@ def test_no_capture_skips_metadata_views_and_keeps_full_metadata(
         context = dispatch(attn)
         assert context.dispatch_seq == 0
         assert ops.afd_async_dispatch_send.call_args.args[3] == 0
+
+
+def test_receive_timing_failure_does_not_abort_native_work(monkeypatch, ops):
+    ffn = connector(monkeypatch, role="ffn")
+    tracer = Tracer()
+    tracer.record_receive = lambda *args: False
+    ffn.profile_session = profile_session(tracer)
+    actual = recv_outputs(ffn)
+    ops.afd_async_dispatch_recv.return_value = actual
+    received = ffn.recv_attn_output(batch_size=2)
+    assert received.context.profile is None
+    assert received.hidden_states is actual[0]
+    ffn.send_ffn_output(received.hidden_states, received.context)
+    assert ops.afd_async_combine_send.call_args.args[2] is actual[2]
+    assert not tracer.deferred

@@ -14,6 +14,35 @@ from afd_plugin.profiling.npu import EventTimestampReader
 
 pytestmark = pytest.mark.npu
 EVENT_TIMEOUT_S = 10
+COLLECTOR_BATCH_READS = 256
+COLLECTOR_BATCH_BUDGET_S = 0.05
+
+
+def test_timestamp_collection_progresses_under_python_thread_contention():
+    torch = runtime()
+    reader = EventTimestampReader()
+    event = torch.npu.Event(enable_timing=True)
+    event.record()
+    wait_complete(event)
+    done = threading.Event()
+
+    def compete():
+        while not done.is_set():
+            sum(range(100))
+
+    producer = threading.Thread(target=compete)
+    producer.start()
+    try:
+        durations = []
+        for _ in range(3):
+            start = time.perf_counter()
+            for _ in range(COLLECTOR_BATCH_READS):
+                assert reader.read_raw(event) is not None
+            durations.append(time.perf_counter() - start)
+        assert sorted(durations)[1] < COLLECTOR_BATCH_BUDGET_S, durations
+    finally:
+        done.set()
+        producer.join(EVENT_TIMEOUT_S)
 
 
 def runtime():

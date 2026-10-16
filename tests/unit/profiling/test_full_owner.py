@@ -72,9 +72,9 @@ def test_native_lifecycle_runs_only_on_original_runner_thread(backend):
     owner.step()
     owner.stop()
     assert owner.state == "STOPPING"
-    assert not owner.done.is_set()
+    assert not owner.finished
     owner.step()
-    assert owner.done.is_set()
+    assert owner.finished
     assert not owner.busy
     assert [name for name, _ in calls] == ["factory_start", "step", "step", "stop"]
     assert {tid for _, tid in calls} == {runner_tid}
@@ -103,7 +103,7 @@ def test_stop_before_any_runner_step_never_touches_native_backend(backend, start
         owner.start()
     owner.stop()
     owner.step()
-    assert owner.done.is_set()
+    assert owner.finished
     assert owner.state == "COMPLETED"
     assert not owner.busy
     assert not calls
@@ -118,7 +118,7 @@ def test_native_failure_is_reported_without_breaking_model_execution(backend, fa
         owner.stop()
     native.failure = failure
     owner.step()
-    assert owner.done.is_set()
+    assert owner.finished
     assert owner.state == "FAILED"
     assert owner.error == f"RuntimeError: {failure} failed"
     assert not owner.busy
@@ -150,12 +150,12 @@ def test_blocked_native_stop_keeps_control_requests_reachable(backend):
         status = owner.snapshot()
         assert status["state"] == "STOPPING"
         assert status["busy"]
-        assert not owner.done.is_set()
+        assert not owner.finished
     finally:
         release.set()
         runner.join(2.0)
     assert not runner.is_alive()
-    assert owner.done.is_set()
+    assert owner.finished
     assert len({tid for _, tid in calls}) == 1
     assert calls[0][1] != threading.get_ident()
 
@@ -186,12 +186,12 @@ def test_stop_during_native_start_is_serviced_by_the_same_runner_step(backend):
         owner.stop()
         assert owner.snapshot()["state"] == "STOPPING"
         assert owner.busy
-        assert not owner.done.is_set()
+        assert not owner.finished
     finally:
         release.set()
         runner.join(2.0)
     assert not runner.is_alive()
-    assert owner.done.is_set()
+    assert owner.finished
     assert owner.state == "COMPLETED"
     assert [name for name, _ in calls] == ["factory_start", "stop"]
     assert len({tid for _, tid in calls}) == 1

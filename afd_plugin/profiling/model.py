@@ -59,9 +59,9 @@ def record_source_call(
         return
     snapshot = metadata.profile_snapshot
     stage = metadata.stage_idx
-    stage_begin = metadata.tokens_start_loc[
-        stage if len(metadata.tokens_start_loc) > 1 else 0
-    ]
+    stage_slot = stage if len(metadata.tokens_start_loc) > 1 else 0
+    stage_begin = metadata.tokens_start_loc[stage_slot]
+    stage_tokens = (metadata.tokens_unpadded_lens or metadata.tokens_lens)[stage_slot]
     if layout.use_sequence_parallel:
         if metadata.profile_sp_origin is None:
             execution.capture.error = "sequence-parallel shard origin was not captured"
@@ -71,7 +71,8 @@ def record_source_call(
     else:
         local_begin = layout.local_token_slice.start
     begin = stage_begin + local_begin
-    end = begin + layout.local_tokens
+    # TP/SP padding belongs to this stage, not to the next stage's real tokens.
+    end = max(begin, min(begin + layout.local_tokens, stage_begin + stage_tokens))
     group = f"{execution.tracer.worker_id}:group:{metadata.transaction_id}"
     if metadata.profile_fragments is None:
         metadata.profile_fragments = {}

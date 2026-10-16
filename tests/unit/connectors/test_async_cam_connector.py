@@ -1013,7 +1013,9 @@ def test_async_select_experts_rejects_mix_placement(router):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_async_receive_anchor_uses_model_dtype(monkeypatch, dtype):
+@pytest.mark.parametrize("profiling", [False, True])
+def test_async_receive_anchor_uses_model_dtype(monkeypatch, dtype, profiling):
+    monkeypatch.setenv("AFD_CAM_PROFILE_ENABLE", "1" if profiling else "0")
     fake_torch = _FakeTorch()
     monkeypatch.setattr(async_cam_module, "torch", fake_torch)
     monkeypatch.setattr(

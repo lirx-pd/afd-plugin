@@ -43,7 +43,7 @@ class CAMProfileWorkerMixin:
             return
         # Keep TorchNPU and the event pool out of workers with profiling disabled.
         from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
-        from afd_plugin.profiling.full import FFNDeviceWaiter
+        from afd_plugin.profiling.npu import FFNDeviceWaiter
         from afd_plugin.profiling.session import WorkerSession
 
         connector = self.model_runner.connector
@@ -66,7 +66,7 @@ class CAMProfileWorkerMixin:
             },
             tracer_factory=partial(self._create_cam_tracer, connector),
             full_factory=partial(
-                self._create_cam_full_profiler,
+                RuntimeFullProfiler,
                 "attention" if connector.topology.role == "attention" else "ffn",
             ),
         )
@@ -87,13 +87,6 @@ class CAMProfileWorkerMixin:
             connector.tp_size,
             connector.expert_per_rank,
         )
-
-    def _create_cam_full_profiler(
-        self, role: Literal["attention", "ffn"], trace_dir: Path
-    ) -> RuntimeFullProfiler:
-        full = RuntimeFullProfiler(role, trace_dir)
-        self.model_runner.prof = full
-        return full
 
     def _require_cam_profile_session(self) -> WorkerSession:
         if self.cam_profile_session is None:
@@ -118,10 +111,7 @@ class CAMProfileWorkerMixin:
                 return session.prepare(
                     command,
                     backend_busy=self._cam_native_profiler_active
-                    or (
-                        self.model_runner.prof is not None
-                        and not isinstance(self.model_runner.prof, RuntimeFullProfiler)
-                    ),
+                    or self.model_runner.prof is not None,
                 )
             if action == "commit":
                 return session.commit(command)
@@ -135,7 +125,7 @@ class CAMProfileWorkerMixin:
         session = self._require_cam_profile_session()
         # Attention RPCs share the model thread; FFN RPCs do not.
         if session.role == "attention":
-            session.start_pending_full()
+            session.advance_full()
         return session.status(command)
 
     # Ascend 8d4409d6 NPUWorker.profile also owns a native profiler. Its large

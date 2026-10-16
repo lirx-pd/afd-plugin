@@ -256,6 +256,7 @@ class AFDAsyncTransferState(AFDTransferState):
     dynamic_scales: Tensor | None = None
     source_trace: Tensor | None = None
     send_completion: Tensor | None = None
+    host_control: list[int] | None = None
 
 
 @dataclass(slots=True)
@@ -399,7 +400,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         backend = self.cam_pg._get_backend(torch.device("npu"))
         self.group_name = str(backend.get_hccl_comm_name(self.world_rank))
         device = f"npu:{self.local_rank}"
-        self.comm_args = torch.empty((1,), dtype=torch.float16, device=device)
+        self.comm_args = torch.zeros((1,), dtype=torch.float16, device=device)
         self._placeholder = torch.empty(
             (1,),
             dtype=self.activation_dtype,
@@ -576,20 +577,22 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         assert expert_token_nums is not None
         # Preserve the full compact metadata for combine-send. Its total is
         # rank-wide, while counts describe only this receive chunk.
-        control = torch.stack(
-            (
-                token_nums_rankid_layeridx[0],
-                token_nums_rankid_layeridx[2],
-                expert_token_nums.sum(dtype=torch.int64),
+        if states.host_control is None:
+            control = torch.stack(
+                (
+                    token_nums_rankid_layeridx[0],
+                    token_nums_rankid_layeridx[2],
+                    expert_token_nums.sum(dtype=torch.int64),
+                )
             )
-        )
-        if self.profile_session is None:
-            total_num_tokens, layer_idx, num_tokens = control.cpu().tolist()
-        else:
-            assert self.profile_session.device_waiter is not None
-            total_num_tokens, layer_idx, num_tokens = (
-                self.profile_session.device_waiter.read_ffn_control(control)
-            )
+            if self.profile_session is None:
+                states.host_control = control.cpu().tolist()
+            else:
+                assert self.profile_session.device_waiter is not None
+                states.host_control = (
+                    self.profile_session.device_waiter.read_ffn_control(control)
+                )
+        total_num_tokens, layer_idx, num_tokens = states.host_control
         if not 0 <= num_tokens <= recv_output.hidden_states.shape[0]:
             raise RuntimeError(
                 "AFD async CAM routed chunk count is outside dispatch-recv capacity"
@@ -879,8 +882,6 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             metadata=metadata,
             states=states,
         )
-        if self.profile_session is not None and self.profile_session.tracer is not None:
-            context.profile = self.profile_session.tracer.new_work()
         placeholder = kwargs.get("placeholder", self._placeholder)
         _log_cam_op_values(
             "async_dispatch_recv",
@@ -901,24 +902,44 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             dynamic_quant=self.dynamic_quant,
             group_name=self.group_name,
         )
-        with span(context.profile, "DISPATCH_RECV"):
-            outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(
-                placeholder,
-                self.comm_args,
-                self.comm_id,
-                self.max_num_batched_tokens,
-                states.hidden_size,
-                states.topk,
-                self.ffn_size,
-                self.attn_size,
-                self.expert_per_rank,
-                self.world_rank,
-                self.topology.world_size,
-                self.tp_size,
-                self.dynamic_quant,
-                self.group_name,
-            )
+        waiter = self.profile_session.device_waiter if self.profile_session else None
+        if waiter is not None:
+            waiter.begin_receive()
+        outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(
+            placeholder,
+            self.comm_args,
+            self.comm_id,
+            self.max_num_batched_tokens,
+            states.hidden_size,
+            states.topk,
+            self.ffn_size,
+            self.attn_size,
+            self.expert_per_rank,
+            self.world_rank,
+            self.topology.world_size,
+            self.tp_size,
+            self.dynamic_quant,
+            self.group_name,
+        )
         hidden_states, dynamic_scales, batch_info, expert_token_nums = outputs
+        if waiter is not None:
+            waiter.end_receive()
+            control = torch.stack(
+                (batch_info[0], batch_info[2], expert_token_nums.sum(dtype=torch.int64))
+            )
+            states.host_control = waiter.read_ffn_control(control)
+            tracer = self.profile_session.tracer
+            if tracer is not None:
+                context.profile = tracer.new_work()
+                if context.profile is not None and not tracer.record_receive(
+                    context.profile,
+                    waiter.begin,
+                    waiter.end,
+                    waiter.stream,
+                    waiter.host_begin_ns,
+                    waiter.host_end_ns,
+                ):
+                    context.profile = None
         if context.profile is not None:
             prefix_size = batch_info_prefix_size(self.tp_size, self.expert_per_rank)
             states.source_trace = batch_info[prefix_size:].view(

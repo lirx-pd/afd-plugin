@@ -171,7 +171,7 @@ class ProfileCoordinator:
                 "Coordinator restarted; previous session was interrupted"
             )
             session.state = "STOPPING"
-            self._persist(session)
+            self._persist_cleanup(session)
             try:
                 await self._exchange(session, "status", {}, discover=True)
             except Exception as error:
@@ -186,7 +186,7 @@ class ProfileCoordinator:
                     session.data_quality = (
                         "PARTIAL" if session.start_at_ns else "INVALID"
                     )
-                    self._persist(session)
+                    self._persist_cleanup(session)
                     continue
             # Targets always come from administrator configuration, never a manifest.
             await self._drain(session)
@@ -222,7 +222,7 @@ class ProfileCoordinator:
         if session.state not in TERMINAL_STATES:
             session.stop_requested.set()
             session.state = "STOPPING"
-            self._persist(session)
+            self._persist_cleanup(session)
         return session
 
     @staticmethod
@@ -233,6 +233,18 @@ class ProfileCoordinator:
             encoding="utf-8",
         )
         temporary.replace(session.directory / "manifest.json")
+
+    def _persist_cleanup(self, session: Session) -> None:
+        # A full capture disk must not prevent stopping the owned backends.
+        try:
+            self._persist(session)
+        except OSError as error:
+            message = f"Manifest write failed: {error}"
+            if message not in session.errors:
+                session.errors.append(message)
+            if session.state in TERMINAL_STATES:
+                session.state = "FAILED"
+                session.data_quality = "PARTIAL" if session.start_at_ns else "INVALID"
 
     async def _request(
         self, target: str, action: str, command: dict[str, Any]
@@ -413,10 +425,7 @@ class ProfileCoordinator:
 
     async def _drain(self, session: Session) -> None:
         session.state = "STOPPING"
-        try:
-            self._persist(session)
-        except OSError as error:
-            session.errors.append(f"Manifest write failed: {error}")
+        self._persist_cleanup(session)
         try:
             await asyncio.wait_for(self._stop_workers(session), STOP_TIMEOUT_S)
         except asyncio.TimeoutError:
@@ -439,11 +448,7 @@ class ProfileCoordinator:
             session.data_quality = "PARTIAL" if incomplete else "COMPLETE"
         else:
             session.data_quality = "PARTIAL" if session.start_at_ns else "INVALID"
-        try:
-            self._persist(session)
-        except OSError as error:
-            session.state = "FAILED"
-            session.errors.append(f"Manifest write failed: {error}")
+        self._persist_cleanup(session)
 
     async def close(self) -> None:
         if self.active is not None:

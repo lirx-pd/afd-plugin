@@ -24,7 +24,7 @@ class TimestampFunction:
 def make_reader(monkeypatch, status=0):
     function = TimestampFunction(status)
     library = SimpleNamespace(aclrtEventGetTimestamp=function)
-    monkeypatch.setattr(ctypes, "CDLL", lambda name: library)
+    monkeypatch.setattr(ctypes, "PyDLL", lambda name: library)
     return EventTimestampReader(), function
 
 

@@ -1295,7 +1295,6 @@ def test_npu_ffn_worker_uses_connector_driven_loop_for_async_connector(
     assert calls == [
         ("bind", worker.device),
         "step",
-        *(["wait"] if profiling else []),
         "sync",
     ]
 

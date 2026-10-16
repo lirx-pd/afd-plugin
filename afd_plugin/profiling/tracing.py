@@ -23,7 +23,8 @@ from afd_plugin.profiling.npu import EventTimestampReader
 if TYPE_CHECKING:
     from afd_plugin.profiling.session import Capture, WorkerSession
 
-SPAN_CAPACITY = 128
+# A queued DSV4 step can hold 2 microbatches * 43 layers * 6 device spans.
+SPAN_CAPACITY = 1024
 METADATA_CAPACITY = 16
 RESOURCE_INIT_TIMEOUT_S = 2
 ANCHOR_INTERVAL_NS = 1_000_000_000
@@ -67,7 +68,7 @@ class Span:
         assert slot.record is not None
         slot.record["host_end_ns"] = time.monotonic_ns()
         with self.tracer.lock:
-            slot.ended = True
+            self.slot.ended = True
 
 
 class HostSpan:
@@ -95,7 +96,7 @@ class Execution:
 
 
 class DeviceTracer:
-    """Only the collector reads timestamps; retired slots cannot be re-recorded."""
+    """The collector owns pooled Events; the model thread owns receive timing."""
 
     def __init__(
         self,
@@ -187,10 +188,68 @@ class DeviceTracer:
             return execution
         return None
 
+    def record_receive(
+        self,
+        execution: Execution,
+        begin_event: torch_npu.npu.Event,
+        end_event: torch_npu.npu.Event,
+        stream: torch_npu.npu.Stream,
+        host_begin_ns: int,
+        host_end_ns: int,
+    ) -> bool:
+        # The model thread owns this completed pair and reads it before reuse.
+        capture = execution.capture
+        try:
+            begin = self.reader.read_raw(begin_event)
+            end = self.reader.read_raw(end_event)
+            if begin is None or end is None:
+                raise RuntimeError("receive timing events are not complete")
+        except (RuntimeError, ValueError) as exc:
+            # Instrumentation failure must not abort the received model work.
+            with self.lock:
+                capture.error = f"{type(exc).__name__}: {exc}"
+                capture.accepting = False
+                self._dropped_spans += 1
+                self._retained.pop(execution.exec_ref, None)
+            return False
+        begin, end = begin * NS_PER_DEVICE_TICK, end * NS_PER_DEVICE_TICK
+        with self.lock:
+            if self.finalized(capture):
+                self._retained.pop(execution.exec_ref, None)
+                return False
+            self._span_seq += 1
+            capture.writer.submit(
+                {
+                    "record_type": "SPAN",
+                    "span_id": f"{self.worker_id}:{self._span_seq}",
+                    "worker_id": self.worker_id,
+                    "exec_ref": execution.exec_ref,
+                    "kind": "DISPATCH_RECV",
+                    "clock_domain": self.clock_domain,
+                    "producer_id": str(threading.get_ident()),
+                    "stream_id": stream.npu_stream,
+                    "host_begin_ns": host_begin_ns,
+                    "host_end_ns": host_end_ns,
+                    "device_begin_ns": begin,
+                    "device_end_ns": end,
+                    "generation": capture.generation,
+                    "complete": True,
+                    "crosses_capture_start": host_begin_ns < capture.start_ns,
+                }
+            )
+            self._range = (
+                (min(self._range[0], begin), max(self._range[1], end))
+                if self._range
+                else (begin, end)
+            )
+        return True
+
     def span(self, execution: Execution, kind: str) -> Span | nullcontext:
         capture = execution.capture
         with self.lock:
-            if not capture.admits() or self.finalized(capture):
+            if self.finalized(capture) or (
+                not capture.admits() and execution.exec_ref not in self._retained
+            ):
                 return nullcontext()
             slot = next((item for item in self.slots if item.capture is None), None)
             if slot is None:
@@ -242,7 +301,9 @@ class DeviceTracer:
     def host_span(self, execution: Execution, kind: str) -> HostSpan | nullcontext:
         capture = execution.capture
         with self.lock:
-            if not capture.admits() or self.finalized(capture):
+            if self.finalized(capture) or (
+                not capture.admits() and execution.exec_ref not in self._retained
+            ):
                 return nullcontext()
             if len(self._host_records) >= SPAN_CAPACITY:
                 self._dropped_spans += 1
@@ -274,7 +335,10 @@ class DeviceTracer:
         self, execution: Execution, trace: torch.Tensor, batch: torch.Tensor
     ) -> None:
         with self.lock:
-            if not execution.capture.admits() or self.finalized(execution.capture):
+            if self.finalized(execution.capture) or (
+                not execution.capture.admits()
+                and execution.exec_ref not in self._retained
+            ):
                 self._dropped_metadata += 1
                 return
             slot = next(
@@ -363,11 +427,12 @@ class DeviceTracer:
                     device_begin_ns=begin, device_end_ns=end, complete=True
                 )
                 slot.capture.writer.submit(slot.record)
-                self._range = (
-                    (min(self._range[0], begin), max(self._range[1], end))
-                    if self._range
-                    else (begin, end)
-                )
+                with self.lock:
+                    self._range = (
+                        (min(self._range[0], begin), max(self._range[1], end))
+                        if self._range
+                        else (begin, end)
+                    )
             with self.lock:
                 slot.capture = None
                 slot.record = None

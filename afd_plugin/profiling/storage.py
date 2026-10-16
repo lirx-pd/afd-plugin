@@ -29,7 +29,6 @@ class JsonRecordWriter:
         self._max_bytes = max_bytes
         self._lock = threading.Lock()
         self._stopping = threading.Event()
-        self._accepting = True
         self._closed = False
         self._written_records = 0
         self._dropped_records = 0
@@ -49,7 +48,7 @@ class JsonRecordWriter:
     def submit(self, record: dict) -> bool:
         """Transfer ownership; the caller must not mutate the submitted record."""
         with self._lock:
-            if not self._accepting:
+            if self._stopping.is_set():
                 self._dropped_records += 1
                 return False
             try:
@@ -63,7 +62,6 @@ class JsonRecordWriter:
     def close(self, timeout_s: float) -> bool:
         """Stop admission and wait at most timeout_s; inspect snapshot for errors."""
         with self._lock:
-            self._accepting = False
             self._stopping.set()
         self._thread.join(timeout=timeout_s)
         return not self._thread.is_alive()
@@ -83,7 +81,6 @@ class JsonRecordWriter:
         with self._lock:
             if self._error is None:
                 self._error = reason
-            self._accepting = False
             self._stopping.set()
 
     def _drop(self, count: int) -> None:

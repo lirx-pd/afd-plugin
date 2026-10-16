@@ -337,7 +337,10 @@ with CPU/NPU activities, Level2, shape recording, configured stack/modules and
 the same TensorBoard trace handler. It does not collect lightweight records or
 create the lightweight Event pool and timestamp backend. Those resources are
 allocated on the first `LIGHTWEIGHT` prepare and reused by later lightweight
-sessions:
+sessions. The fixed pool holds 1,024 device spans per worker, covering a queued
+DSV4 step with two microbatches (516 spans) even before events complete. Pool
+exhaustion is still reported as dropped data; tracing never stalls inference
+to wait for a free slot:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8765/cam/profile/start \
@@ -362,7 +365,10 @@ only common `SESSION`/`SUMMARY` metadata; request pipeline reconstruction uses
 status and coordinator manifest also contain `details.full.trace_dir`, the
 `<session_id>/<worker_id>/full/` output root. Native `*_ascend_pt` directories
 and any parsed output are produced there by the existing handler. Paths belong
-to the worker's filesystem. If daemon-worker restrictions prevent parsing,
+to the worker's filesystem. Use a local filesystem for FULL capture and archive
+the files after completion: CANN stop drains its uploader synchronously, and a
+slow network filesystem can exceed the native stop deadline and block worker
+RPCs. If daemon-worker restrictions prevent parsing,
 keep the raw data and parse the native directory separately:
 
 ```bash
@@ -370,18 +376,36 @@ python -c 'import sys; from torch_npu.profiler.profiler import analyse; analyse(
   '<native-directory-ending-in-ascend_pt>'
 ```
 
-Native operations keep the original model thread ownership. Idle Attention
-handles pending startup during the coordinator's status RPC, on the same
-thread as model execution. FFN handles startup while waiting for its existing
-control-data copy or stream completion: runtime-enabled workers use a
-preallocated pinned control buffer and query a completion Event, yielding the
-host thread between checks. Startup therefore does not require a new request.
-The original FFN full-device synchronization remains after the stream wait;
-workers with runtime profiling disabled keep the original blocking path.
+Native operations stay on the model thread. The control thread requests lifecycle
+changes and enforces deadlines; it never owns the native profiler. Idle Attention
+advances pending startup and stop during status RPCs. FFN advances them while
+querying its preallocated control-copy completion Event. Runtime sessions own
+FULL independently of the runner's static `prof` object.
 
-These waiting points only handle startup. Step and synchronized stop still
-run at the runner's original profiler step point; a FFN receive that never
-completes can still prevent stop. Missing the start window fails the coordinated
+FFN records a timing Event immediately before dispatch receive. That Event also
+fences all preceding compute and combine-send work. Once it completes, runtime
+FULL may stop while the next receive is still waiting. The runtime FFN instance
+uses the pinned TorchNPU `stop_trace` implementation without its full-device
+synchronize; all native stop, GC/Event cleanup, finalize and trace-handler steps
+remain. Attention and static profiling retain their existing synchronization.
+No receive cancellation or extra CAM control messages are required.
+
+LIGHTWEIGHT admits FFN work after receive completes, before compute. The waiter
+owns a fixed begin/end Event pair independently of sessions; the model thread
+reads the completed pair before reuse. An idle receive therefore holds no session
+resources. Profiling-enabled workers record this pair even between sessions so
+the first request after an idle start has a measured receive interval. Workers
+with runtime profiling disabled allocate no such resources.
+
+A receive may begin before the capture window; its full duration includes that
+idle wait and `crosses_capture_start=true` identifies this boundary case. Device
+duration is measured; cross-worker alignment remains an empirical clock mapping,
+including extrapolation for an earlier receive start. Do not treat that duration
+as time spent entirely inside the capture window. Admitted work retains its
+compute/combine ownership through stop. Missing source relationships across
+session boundaries continue to produce PARTIAL data.
+
+Missing the start window fails the coordinated
 session; a start/stop watchdog expiry or an exception disables further profiling
 until worker restart. Late completion does not restore reuse. Profiling never
 destroys the CAM communicator to force completion. Native calls holding the GIL

@@ -123,6 +123,37 @@ def test_missing_export_reports_offline_analysis_command(tmp_path):
         read_native_trace(tmp_path, header())
 
 
+@pytest.mark.parametrize("array", [False, True])
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_multiple_exports_preserve_order_and_both_json_formats(
+    tmp_path, array, pipeline
+):
+    session = header()
+    events = [phase(), phase(sequence=2, ts="1792136972859258.041")]
+    if pipeline:
+        session.update(view="pipeline", role="attention")
+        events[0]["name"] = "afd.cam|COMPUTE"
+        events[1].update(name="afd.cam|END", args={})
+    for index in (1, 0):
+        directory = tmp_path / str(index)
+        directory.mkdir()
+        payload = [events[index]] if array else {"traceEvents": [events[index]]}
+        (directory / "trace_view.json").write_text(json.dumps(payload))
+    records = read_native_trace(tmp_path, session)
+    if pipeline:
+        assert [record["record_type"] for record in records] == [
+            "PIPELINE",
+            "NATIVE_SUMMARY",
+        ]
+        assert records[0]["kind"] == "COMPUTE"
+        assert records[0]["begin_ns"] == 1792136972859237941
+        assert records[-1]["observed_marks"] == 2
+    else:
+        assert [record["span_id"] for record in records[:-1]] == ["a0:3:1", "a0:3:2"]
+        assert records[0]["device_begin_ns"] == 1792136972859238041
+        assert records[-1]["record_type"] == "CLOCK_MAP"
+
+
 @pytest.mark.parametrize(
     "changes",
     [

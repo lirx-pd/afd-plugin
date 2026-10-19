@@ -50,7 +50,7 @@ def _probe(mode: str, output: Path) -> None:
     prepared = threading.Event()
     started = threading.Event()
     submitted = threading.Event()
-    errors = []
+    errors: list[str] = []
     result = {"mode": mode, "torch_npu": torch_npu.__version__}
     completion = []
 

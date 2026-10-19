@@ -184,7 +184,6 @@ def read_jsonl(
     """Parse JSONL with source locations; reconstruct owns record schema validation."""
     records = []
     for path in paths:
-        first = True
         header = None
         with Path(path).open(encoding="utf-8") as source:
             for number, line in enumerate(source, 1):
@@ -194,7 +193,7 @@ def read_jsonl(
                     record = json.loads(
                         line, parse_float=_finite_float, parse_constant=_finite_float
                     )
-                    if first and (
+                    if header is None and (
                         not isinstance(record, dict)
                         or record.get("record_type") != "SESSION"
                     ):
@@ -202,9 +201,8 @@ def read_jsonl(
                 except ValueError as exc:
                     raise ValueError(f"{path}:{number}: {exc}") from exc
                 records.append(record)
-                if first:
+                if header is None:
                     header = record
-                first = False
         if header is not None and header.get("native_trace_dir"):
             _validate(header)
             if any(
@@ -352,7 +350,6 @@ def reconstruct(records: Iterable[dict]) -> dict:
     maps = defaultdict(list)
     session = None
     errors = []
-    records = list(records)
     for record in records:
         _validate(record)
         kind = record["record_type"]
@@ -388,9 +385,11 @@ def reconstruct(records: Iterable[dict]) -> dict:
         raise ValueError("SESSION record is required")
     for worker, header in headers.items():
         summary = summaries.get(worker)
-        if header.get("requires_summary") and summary is None:
-            errors.append(f"worker {worker}: missing SUMMARY")
-        if summary is not None and any(
+        if summary is None:
+            if header.get("requires_summary"):
+                errors.append(f"worker {worker}: missing SUMMARY")
+            continue
+        if any(
             summary[key]
             for key in (
                 "dropped_spans",
@@ -400,9 +399,9 @@ def reconstruct(records: Iterable[dict]) -> dict:
             )
         ):
             errors.append(f"worker {worker}: dropped or unresolved records")
-        if summary is not None and summary.get("error"):
+        if summary.get("error"):
             errors.append(f"worker {worker}: {summary['error']}")
-        if summary is not None and "native_spans" in summary:
+        if "native_spans" in summary:
             observed = sum(
                 span["worker_id"] == worker for span in tables["SPAN"].values()
             )

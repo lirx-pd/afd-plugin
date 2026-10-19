@@ -27,6 +27,8 @@ from tests.unit.profiling.test_session import (
 
 
 class FakeFullOwner:
+    mode: str
+
     def __init__(self, trace_dir):
         self.trace_dir = trace_dir
         self.state = "PREPARED"

@@ -214,11 +214,11 @@ class WorkerSession:
                 "lease_s",
                 duration + LEASE_GRACE_S,
             )
-            if mode == "LIGHTWEIGHT" and self.tracer is None:
-                if self._tracer_factory is None:
-                    raise ValueError("LIGHTWEIGHT backend is not configured")
-                self.tracer = self._tracer_factory()
             if mode == "LIGHTWEIGHT":
+                if self.tracer is None:
+                    if self._tracer_factory is None:
+                        raise ValueError("LIGHTWEIGHT backend is not configured")
+                    self.tracer = self._tracer_factory()
                 assert self.tracer is not None
                 self.tracer.session = self
             session_dir = self.output_dir / command["session_id"]

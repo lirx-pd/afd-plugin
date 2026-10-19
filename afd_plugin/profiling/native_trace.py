@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import tarfile
+from collections.abc import Iterator
 from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
@@ -51,6 +52,14 @@ def native_directory(directory: Path):
         yield root / directory.name
 
 
+def _native_events(paths: list[Path]) -> Iterator[tuple[Path, dict]]:
+    for path in paths:
+        trace = json.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
+        events = trace if isinstance(trace, list) else trace["traceEvents"]
+        for event in events:
+            yield path, event
+
+
 def _read_native_directory(directory: Path, header: dict) -> list[dict]:
     paths = sorted(directory.rglob("trace_view.json"))
     if not paths:
@@ -59,65 +68,54 @@ def _read_native_directory(directory: Path, header: dict) -> list[dict]:
             "torch_npu.profiler.profiler.analyse on the capture directory first"
         )
     if header.get("view") == "pipeline":
-        events = []
-        for path in paths:
-            trace = json.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
-            events.extend(trace if isinstance(trace, list) else trace["traceEvents"])
-        return native_pipeline(events, header)
+        return native_pipeline([event for _, event in _native_events(paths)], header)
     records = []
     worker = header["worker_id"]
     domain = f"{worker}:native"
-    for path in paths:
-        trace = json.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
-        events = trace if isinstance(trace, list) else trace["traceEvents"]
-        for event in events:
-            if event.get("ph") != "X" or not event.get("name", "").startswith(
-                RANGE_PREFIX
-            ):
-                continue
-            _, generation, reference, phase, stage, clock, sequence = event[
-                "name"
-            ].split("|")
-            if int(generation) != header["generation"]:
-                raise ValueError(f"{path}: native range belongs to another generation")
-            if phase not in {"COMPUTE", "COMMUNICATION", "WAIT"} or clock not in {
-                "H",
-                "D",
-            }:
-                raise ValueError(f"{path}: invalid native phase or clock")
-            device = "Physic Stream Id" in event.get("args", {})
-            # Stream annotations also export a host launch range; keep device time.
-            if device != (clock == "D"):
-                continue
-            begin = int(Decimal(str(event["ts"])) * NS_PER_US)
-            duration = int(Decimal(str(event["dur"])) * NS_PER_US)
-            if begin < 0 or duration < 0:
-                raise ValueError(f"{path}: negative native timestamp or duration")
-            end = begin + duration
-            records.append(
-                {
-                    "record_type": "SPAN",
-                    "span_id": f"{worker}:{generation}:{sequence}",
-                    "worker_id": worker,
-                    "exec_ref": reference,
-                    "kind": phase,
-                    "stage": stage,
-                    "clock_domain": domain,
-                    "producer_id": str(event["tid"]),
-                    "stream_id": event["args"]["Physic Stream Id"]
-                    if device
-                    else "host",
-                    "host_begin_ns": begin,
-                    "host_end_ns": end,
-                    "device_begin_ns": begin if device else None,
-                    "device_end_ns": end if device else None,
-                    "generation": int(generation),
-                    "complete": True,
-                    "time_source": "NATIVE" if device else "HOST",
-                    "host_epoch_offset_ns": -header["clock_offset_ns"],
-                    "clock_uncertainty_ns": header["clock_uncertainty_ns"],
-                }
-            )
+    for path, event in _native_events(paths):
+        if event.get("ph") != "X" or not event.get("name", "").startswith(RANGE_PREFIX):
+            continue
+        _, generation, reference, phase, stage, clock, sequence = event["name"].split(
+            "|"
+        )
+        if int(generation) != header["generation"]:
+            raise ValueError(f"{path}: native range belongs to another generation")
+        if phase not in {"COMPUTE", "COMMUNICATION", "WAIT"} or clock not in {
+            "H",
+            "D",
+        }:
+            raise ValueError(f"{path}: invalid native phase or clock")
+        device = "Physic Stream Id" in event.get("args", {})
+        # Stream annotations also export a host launch range; keep device time.
+        if device != (clock == "D"):
+            continue
+        begin = int(Decimal(str(event["ts"])) * NS_PER_US)
+        duration = int(Decimal(str(event["dur"])) * NS_PER_US)
+        if begin < 0 or duration < 0:
+            raise ValueError(f"{path}: negative native timestamp or duration")
+        end = begin + duration
+        records.append(
+            {
+                "record_type": "SPAN",
+                "span_id": f"{worker}:{generation}:{sequence}",
+                "worker_id": worker,
+                "exec_ref": reference,
+                "kind": phase,
+                "stage": stage,
+                "clock_domain": domain,
+                "producer_id": str(event["tid"]),
+                "stream_id": event["args"]["Physic Stream Id"] if device else "host",
+                "host_begin_ns": begin,
+                "host_end_ns": end,
+                "device_begin_ns": begin if device else None,
+                "device_end_ns": end if device else None,
+                "generation": int(generation),
+                "complete": True,
+                "time_source": "NATIVE" if device else "HOST",
+                "host_epoch_offset_ns": -header["clock_offset_ns"],
+                "clock_uncertainty_ns": header["clock_uncertainty_ns"],
+            }
+        )
     device_spans = [r for r in records if r["device_begin_ns"] is not None]
     if device_spans:
         begin = min(r["device_begin_ns"] for r in device_spans)

@@ -267,6 +267,7 @@ def test_lightweight_collects_only_layer_ranges_without_inline_analysis(monkeypa
     )
     assert disabled == [True]
     config = profiler_module.profile_kwargs
+    assert config is not None
     assert config["activities"] == ["npu"]
     for field in (
         "record_shapes",

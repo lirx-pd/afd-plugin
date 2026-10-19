@@ -480,7 +480,7 @@ def test_model_extraction_skips_heterogeneous_semantics(monkeypatch):
 
 
 def test_ffn_failure_returns_pipeline_to_wait():
-    idle = []
+    idle: list[object] = []
     capture = object()
     connector = SimpleNamespace(
         control_plane=None,

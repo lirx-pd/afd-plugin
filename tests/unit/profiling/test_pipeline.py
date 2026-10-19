@@ -55,7 +55,7 @@ def capture(worker, role, offset=0):
 def events(offset=0):
     result = []
     for index, phase in enumerate(("COMPUTE", "COMMUNICATION", "WAIT", "END")):
-        event = {
+        event: dict = {
             "ph": "X",
             "name": f"afd.cam|{phase}",
             "dur": 0,
@@ -167,7 +167,9 @@ def test_native_archive_roundtrip_and_compact_gzip_export(tmp_path):
     archive = archive_native_trace(directory)
     assert archive.exists() and not directory.exists()
     with tarfile.open(archive) as data:
-        assert data.extractfile("lightweight/trace_view.json").read() == original
+        native_file = data.extractfile("lightweight/trace_view.json")
+        assert native_file is not None
+        assert native_file.read() == original
     (tmp_path / "a0.jsonl").write_text("\n".join(map(json.dumps, rows)) + "\n")
     assert (
         export_chrome_trace(read_jsonl([tmp_path / "a0.jsonl"]))["data_quality"]

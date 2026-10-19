@@ -129,11 +129,12 @@ def dispatch(connector, *, stage=0, annotation=""):
 def test_attention_dispatch_uses_its_captured_annotation(monkeypatch, ops):
     attn = connector(monkeypatch, role="attention")
     tracer = Tracer()
-    tracer.transition = Mock()
+    transition = Mock()
+    monkeypatch.setattr(tracer, "transition", transition)
     attn.profile_session = profile_session(tracer)
     first = dispatch(attn, stage=0, annotation="0|7|2|9")
     second = dispatch(attn, stage=1, annotation="1|8|3|5")
-    assert [call.args for call in tracer.transition.call_args_list] == [
+    assert [call.args for call in transition.call_args_list] == [
         (first.profile, "COMMUNICATION", "0|7|2|9"),
         (second.profile, "COMMUNICATION", "1|8|3|5"),
     ]

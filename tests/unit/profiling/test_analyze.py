@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import copy
@@ -469,7 +472,7 @@ def test_reconstruct_rejects_invalid_nested_json_values(records, value):
 
 
 def test_reconstruct_rejects_cycles_but_accepts_shared_finite_values(records):
-    shared = [1, 2.5, None, True]
+    shared: list[object] = [1, 2.5, None, True]
     records[0]["identity"] = {"first": shared, "second": shared}
     assert reconstruct(records)["data_quality"] == "COMPLETE"
     shared.append(shared)

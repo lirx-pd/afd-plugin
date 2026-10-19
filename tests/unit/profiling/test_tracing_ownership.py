@@ -153,26 +153,26 @@ def test_layer_release_does_not_break_adjacent_compute(tracer):
 
 @pytest.mark.parametrize("start_layer", [0, 1])
 def test_compiled_model_entry_retains_and_releases_every_call(tracer, start_layer):
-    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch")
+    from torch import nn
+
     tracer, capture, _ = tracer
     metadata = SimpleNamespace(
         connector=SimpleNamespace(profile_session=SimpleNamespace(tracer=tracer))
     )
 
-    class Layer(torch.nn.Module):
+    class Layer(nn.Module):
         def forward(self):
             execution = begin_profile_call(metadata)
             assert execution is not None
             assert tracer.pending_count() == 1
             tracer.release_execution(execution)
 
-    class CompiledModel(torch.nn.Module):
+    class CompiledModel(nn.Module):
         def __init__(self):
             super().__init__()
             self.start_layer = start_layer
-            self.layers = torch.nn.ModuleList(
-                [torch.nn.Identity()] * start_layer + [Layer()]
-            )
+            self.layers = nn.ModuleList([nn.Identity()] * start_layer + [Layer()])
 
         def forward(self):
             return self.layers[self.start_layer]()

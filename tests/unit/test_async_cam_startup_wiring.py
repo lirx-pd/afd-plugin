@@ -77,6 +77,7 @@ def modules(monkeypatch):
     return group, connector, runtime
 
 
+@pytest.mark.parametrize("profiling", [False, True])
 @pytest.mark.parametrize(
     "invalid,dbo_flag",
     [
@@ -88,7 +89,7 @@ def modules(monkeypatch):
     ],
 )
 def test_static_validation_precedes_hccl_creation(
-    modules, monkeypatch, invalid, dbo_flag
+    modules, monkeypatch, invalid, dbo_flag, profiling
 ):
     group, connector_module, _ = modules
     order = []
@@ -109,6 +110,7 @@ def test_static_validation_precedes_hccl_creation(
     )
     connector.__dict__.update(
         _initialized=False,
+        profile_enabled=profiling,
         afd_config=SimpleNamespace(host="localhost", port=1),
         topology=SimpleNamespace(world_size=2),
         world_rank=0,
@@ -140,6 +142,7 @@ def test_static_validation_precedes_hccl_creation(
         connector.graph_startup.mode = "full"
 
     monkeypatch.setattr(connector.graph_startup, "initialize", negotiate)
+    monkeypatch.setattr(connector, "_gather_profile_workers", lambda: None)
     monkeypatch.setattr(
         connector.graph_startup, "phase", lambda stage: order.append(stage)
     )
@@ -153,6 +156,10 @@ def test_static_validation_precedes_hccl_creation(
     )
     if invalid:
         with pytest.raises(ValueError, match="MRV2"):
+            connector.init_afd_connector()
+        assert order == ["negotiate", "failure"]
+    elif profiling:
+        with pytest.raises(ValueError, match="requires eager FFN"):
             connector.init_afd_connector()
         assert order == ["negotiate", "failure"]
     else:

@@ -440,13 +440,20 @@ class AFDAttentionModelRunnerV2(AFDMetadataProviderMixin, GPUModelRunnerV2):
     def install_afd_metadata_on_forward_context(
         self,
         forward_context: ForwardContext,
+        *,
+        profile_num_requests: int | None = None,
+        profile_num_tokens: int = 0,
     ) -> None:
         if (
             forward_context.batch_descriptor is None
             and forward_context.attn_metadata is None
         ):
             return
-        super().install_afd_metadata_on_forward_context(forward_context)
+        super().install_afd_metadata_on_forward_context(
+            forward_context,
+            profile_num_requests=profile_num_requests,
+            profile_num_tokens=profile_num_tokens,
+        )
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:

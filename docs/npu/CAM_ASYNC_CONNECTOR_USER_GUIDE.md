@@ -321,6 +321,10 @@ point on every server and include `afd_profile` in `VLLM_PLUGINS`, preserving
 the existing `ascend,afd` entries. Keep static AFD profiling and upstream
 profiling stopped while a runtime session is active.
 
+Runtime profiling requires eager FFN execution (`--enforce-eager`). This applies
+to both `LIGHTWEIGHT` and `FULL` profiling; FFN FULL graph execution cannot be
+combined with runtime profiling.
+
 Start one coordinator, listing each server API URL once, including FFN:
 
 ```bash

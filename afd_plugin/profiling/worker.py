@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
     from afd_plugin.profiling.session import WorkerSession
     from afd_plugin.profiling.tracing import DeviceTracer
+    from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
     from afd_plugin.v1.worker.npu.attention_model_runner import (
         AFDNPUAttentionModelRunner,
     )
@@ -32,7 +33,10 @@ if TYPE_CHECKING:
 class CAMProfileWorkerMixin:
     device: torch.device
     model_runner: (
-        AFDNPUAttentionModelRunner | AFDNPUAttentionModelRunnerV2 | AFDNPUFFNModelRunner
+        AFDNPUAttentionModelRunner
+        | AFDNPUAttentionModelRunnerV2
+        | AFDNPUFFNModelRunner
+        | AsyncNPUFFNModelRunner
     )
     profiler: TorchNPUProfilerWrapper | None
     cam_profile_session: WorkerSession | None = None

@@ -419,6 +419,11 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             try:
                 if not self.vllm_config.use_v2_model_runner:
                     raise ValueError("Async FFN FULL requires MRV2 on every rank")
+                if self.profile_enabled:
+                    raise ValueError(
+                        "runtime CAM profiling requires eager FFN execution; "
+                        "FFN FULL graph is unsupported"
+                    )
                 validate_graph_capacity(
                     self.max_num_batched_tokens, self.tp_size, cam_receive_capacity()
                 )

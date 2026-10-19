@@ -321,9 +321,9 @@ point on every server and include `afd_profile` in `VLLM_PLUGINS`, preserving
 the existing `ascend,afd` entries. Keep static AFD profiling and upstream
 profiling stopped while a runtime session is active.
 
-Runtime profiling requires eager FFN execution (`--enforce-eager`). This applies
-to both `LIGHTWEIGHT` and `FULL` profiling; FFN FULL graph execution cannot be
-combined with runtime profiling.
+Runtime profiling supports eager FFN execution and MRV2 FFN FULL graph replay.
+Graph capture remains a startup operation; profiling starts and stops the native
+TorchNPU backend around replay, as in the upstream worker profiler.
 
 Start one coordinator, listing each server API URL once, including FFN:
 
@@ -335,9 +335,24 @@ python -m afd_plugin.profiling.control --host 127.0.0.1 --port 8765
 ```
 
 Both modes use the TorchNPU profiling backend used by vLLM-Ascend.
+
+For FFN FULL graphs, `LIGHTWEIGHT` collects NPU-only `Level0` kernel timestamps
+without CPU operator callbacks, shapes or stacks. It reconstructs `WAIT` from
+dispatch-receive, `COMPUTE` between receive and combine-send, and
+`COMMUNICATION` during combine-send. Captured graphs do not rerun Python/MSTX
+phase hooks. This graph mode produces more raw data than eager lightweight
+mark-only capture; its pipeline covers the observed device kernel boundaries.
+Missing, overlapping or unpaired DR/CS kernels make the export `PARTIAL`.
+
+FFN graph profiling stops after the current replay batch completes. An idle DR
+cannot be cancelled; if a batch remains blocked, the existing profiler operation
+deadline reports failure. Continue the workload through stop rather than leaving
+an incomplete graph batch pending. Profiling does not change graph resource
+ownership or make graph shutdown cancellable.
+
 `LIGHTWEIGHT` records a continuous **COMPUTE**, **COMMUNICATION**, **WAIT** pipeline
 on Attention and FFN streams, with optional Attention dispatch annotations.
-It uses NPU-only `Level_none` and the `afd.cam` MSTX domain. A native device mark
+Eager execution uses NPU-only `Level_none` and the `afd.cam` MSTX domain. A native device mark
 is submitted only when a stream changes phase; adjacent compute regions across
 layers share one state. Stream tracks and the three phase messages are reused;
 model/DBO entry caches the track instead of hooking every Attention layer.

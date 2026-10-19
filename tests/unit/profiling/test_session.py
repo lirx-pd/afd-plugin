@@ -69,6 +69,7 @@ class ImmediateProfiler:
 
 class FakeTracer:
     def __init__(self):
+        self.session: WorkerSession | None = None
         self.pending = 0
         self.collections = 0
         self.finalized_generations = set()

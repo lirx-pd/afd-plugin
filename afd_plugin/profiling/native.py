@@ -18,10 +18,16 @@ from afd_plugin.profiling.storage import archive_native_trace
 
 class RuntimeProfiler:
     def __init__(
-        self, role: AFDNPUProfilerRole, trace_dir: Path, mode: str = "FULL"
+        self,
+        role: AFDNPUProfilerRole,
+        trace_dir: Path,
+        mode: str = "FULL",
+        *,
+        graph: bool = False,
     ) -> None:
         self.role = role
         self.mode = mode
+        self.graph = graph
         self.trace_dir = trace_dir
         self.state = "PREPARED"
         self.started_at_ns: int | None = None
@@ -93,6 +99,7 @@ class RuntimeProfiler:
                     self.role,
                     str(self.trace_dir),
                     lightweight=self.mode == "LIGHTWEIGHT",
+                    graph=self.graph,
                 )
                 with self._lock:
                     self._profiler = profiler

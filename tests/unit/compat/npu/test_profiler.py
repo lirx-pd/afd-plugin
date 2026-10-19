@@ -178,6 +178,7 @@ class _FakeTorchNPUProfiler:
         Text = "text"
 
     class ProfilerLevel:
+        Level0 = "level0"
         Level2 = "level2"
         Level_none = "level_none"
 
@@ -284,3 +285,33 @@ def test_lightweight_collects_only_layer_ranges_without_inline_analysis(monkeypa
     assert profiler_module.handler_kwargs == {"analyse_flag": False}
     assert experimental["mstx"] is True
     assert experimental["mstx_domain_include"] == ["afd.cam"]
+
+
+@pytest.mark.parametrize("lightweight", [False, True])
+def test_graph_profiling_uses_native_kernel_collection(monkeypatch, lightweight):
+    profiler_module = _FakeTorchNPUProfiler()
+    monkeypatch.setitem(
+        sys.modules, "torch_npu", SimpleNamespace(profiler=profiler_module)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu.profiler._profiler_action_controller",
+        SimpleNamespace(ProfActionController=lambda *args: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu.profiler.profiler_interface",
+        SimpleNamespace(_disable_event_record=lambda: None),
+    )
+    create_runtime_npu_profiler(
+        "ffn", "/session/worker/graph", lightweight=lightweight, graph=True
+    )
+    config = profiler_module.profile_kwargs
+    assert config is not None
+    assert config["schedule"] is None
+    assert config["activities"] == (["npu"] if lightweight else ["cpu", "npu"])
+    assert config["record_shapes"] is not lightweight
+    experimental = config["experimental_config"]
+    assert experimental["profiler_level"] == ("level0" if lightweight else "level2")
+    assert experimental["mstx"] is False
+    assert experimental["mstx_domain_include"] == []

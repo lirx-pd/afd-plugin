@@ -12,6 +12,60 @@ NS_PER_US = 1000
 ATTENTION_FIELDS = ("microbatch_id", "layer_idx", "num_requests", "num_tokens")
 
 
+def native_graph_pipeline(events: list[dict], header: dict) -> list[dict]:
+    """Use native DR/CS device times; replay does not execute Python phase hooks."""
+    boundaries = []
+    streams = defaultdict(list)
+    receives = sends = 0
+    end = Decimal(0)
+    for event in events:
+        if event.get("ph") != "X" or "Physic Stream Id" not in event.get("args", {}):
+            continue
+        name = event.get("name", "").replace("_", "").lower()
+        if "afdasyncdispatchrecv" in name:
+            phases = ("WAIT", "COMPUTE")
+            receives += 1
+        elif "afdasynccombinesend" in name:
+            phases = ("COMMUNICATION", "WAIT")
+            sends += 1
+        else:
+            continue
+        begin = Decimal(str(event["ts"]))
+        duration = Decimal(str(event["dur"]))
+        if (
+            not begin.is_finite()
+            or not duration.is_finite()
+            or min(begin, duration) < 0
+        ):
+            raise ValueError("invalid graph kernel timestamp or duration")
+        finish = begin + duration
+        end = max(end, finish)
+        streams[str(event["args"]["Physic Stream Id"])].append(
+            (begin, finish, phases[0] == "WAIT")
+        )
+        for timestamp, phase in zip((begin, finish), phases, strict=True):
+            boundaries.append(
+                {
+                    "name": f"afd.cam|{phase}",
+                    "ts": timestamp,
+                    "args": event["args"],
+                }
+            )
+    boundaries.append({"name": "afd.cam|END", "ts": end})
+    records = native_pipeline(boundaries, header)
+    incomplete = not receives
+    for kernels in streams.values():
+        previous_end = Decimal(0)
+        for index, (begin, finish, receive) in enumerate(sorted(kernels)):
+            incomplete |= receive != (index % 2 == 0) or begin < previous_end
+            previous_end = finish
+        incomplete |= len(kernels) % 2 != 0
+    records[-1].update(
+        graph_receives=receives, graph_sends=sends, graph_incomplete=incomplete
+    )
+    return records
+
+
 def native_pipeline(events: list[dict], header: dict) -> list[dict]:
     tracks = defaultdict(list)
     ends = []
@@ -153,6 +207,14 @@ def reconstruct_pipeline(records: list[dict]) -> dict:
             errors.append(f"worker {worker}: dropped, unresolved or failed capture")
         expected = summary.get("native_marks", 0)
         observed = native.get(worker, {})
+        if headers[worker].get("identity", {}).get("ffn_execution_mode") == "full" and (
+            not observed.get("graph_receives")
+            or observed.get("graph_receives") != observed.get("graph_sends")
+            or observed.get("graph_incomplete", True)
+        ):
+            errors.append(
+                f"worker {worker}: missing or incomplete native graph kernels"
+            )
         if expected and (
             observed.get("observed_marks") != expected
             or observed.get("end_markers") != 1

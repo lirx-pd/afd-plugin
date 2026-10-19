@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Import only layer phase ranges from native MSTX exports, without operator data."""
+"""Read native phase markers or graph kernel boundaries for pipeline exports."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from afd_plugin.profiling.pipeline import native_pipeline
+from afd_plugin.profiling.pipeline import native_graph_pipeline, native_pipeline
 
 RANGE_PREFIX = "afd.cam|"
 NS_PER_US = 1000
@@ -68,7 +68,10 @@ def _read_native_directory(directory: Path, header: dict) -> list[dict]:
             "torch_npu.profiler.profiler.analyse on the capture directory first"
         )
     if header.get("view") == "pipeline":
-        return native_pipeline([event for _, event in _native_events(paths)], header)
+        events = [event for _, event in _native_events(paths)]
+        if header.get("identity", {}).get("ffn_execution_mode") == "full":
+            return native_graph_pipeline(events, header)
+        return native_pipeline(events, header)
     records = []
     worker = header["worker_id"]
     domain = f"{worker}:native"

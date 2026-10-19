@@ -77,6 +77,78 @@ def native(root, worker, data):
     return directory
 
 
+def graph_events(offset=0):
+    events = []
+    for name, begin, duration in (
+        ("AfdAsyncDispatchRecv", 0, 5),
+        ("GroupedMatmul", 5, 3),
+        ("AfdAsyncCombineSend", 8, 2),
+        ("AfdAsyncDispatchRecv", 15, 5),
+        ("GroupedMatmul", 20, 3),
+        ("AfdAsyncCombineSend", 23, 2),
+    ):
+        events.append(
+            {
+                "ph": "X",
+                "name": f"aclnn{name}_{name}",
+                "ts": str((EPOCH_NS + offset) // 1000 + begin),
+                "dur": duration,
+                "args": {"Physic Stream Id": 13},
+            }
+        )
+    return events
+
+
+@pytest.mark.parametrize("archive", [False, True])
+def test_graph_pipeline_reads_native_kernels_without_python_marks(tmp_path, archive):
+    rows = capture("f0", "ffn", offset=50000)
+    rows[0]["identity"] = {"ffn_execution_mode": "full"}
+    rows[1]["native_marks"] = 0
+    directory = native(tmp_path, "f0", list(reversed(graph_events(offset=50000))))
+    if archive:
+        archive_native_trace(directory)
+    path = tmp_path / "f0.jsonl"
+    path.write_text("\n".join(map(json.dumps, rows)) + "\n")
+    result = reconstruct(read_jsonl([path]))
+    assert result["data_quality"] == "COMPLETE", result["errors"]
+    assert result["pipelines"][0]["intervals"] == [
+        (EPOCH_NS, EPOCH_NS + 5000, "WAIT"),
+        (EPOCH_NS + 5000, EPOCH_NS + 8000, "COMPUTE"),
+        (EPOCH_NS + 8000, EPOCH_NS + 10000, "COMMUNICATION"),
+        (EPOCH_NS + 10000, EPOCH_NS + 20000, "WAIT"),
+        (EPOCH_NS + 20000, EPOCH_NS + 23000, "COMPUTE"),
+        (EPOCH_NS + 23000, EPOCH_NS + 25000, "COMMUNICATION"),
+    ]
+
+
+@pytest.mark.parametrize("missing", ["receive", "send", "both", "prefix"])
+def test_graph_pipeline_reports_missing_or_unpaired_native_kernels(tmp_path, missing):
+    rows = capture("f0", "ffn")
+    rows[0]["identity"] = {"ffn_execution_mode": "full"}
+    rows[1]["native_marks"] = 0
+    events = graph_events()
+    if missing == "prefix":
+        events = events[2:4]
+    else:
+        removed = {"receive": "DispatchRecv", "send": "CombineSend", "both": "AfdAsync"}
+        events = [event for event in events if removed[missing] not in event["name"]]
+    directory = native(tmp_path, "f0", events)
+    result = reconstruct(rows + read_native_trace(directory, rows[0]))
+    assert result["data_quality"] == "PARTIAL"
+    assert "incomplete native graph kernels" in result["errors"][0]
+
+
+@pytest.mark.parametrize("duration", [-1, "NaN", "Infinity"])
+def test_graph_pipeline_rejects_invalid_kernel_duration(tmp_path, duration):
+    rows = capture("f0", "ffn")
+    rows[0]["identity"] = {"ffn_execution_mode": "full"}
+    events = graph_events()
+    events[0]["dur"] = duration
+    directory = native(tmp_path, "f0", events)
+    with pytest.raises(ValueError, match="invalid graph kernel"):
+        read_native_trace(directory, rows[0])
+
+
 def test_attention_and_ffn_pipeline_align_without_layers_or_request_ids(tmp_path):
     records = []
     for worker, role, offset in (("a0", "attention", 0), ("f0", "ffn", 50000)):

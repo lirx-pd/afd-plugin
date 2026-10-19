@@ -80,10 +80,16 @@ def create_afd_npu_profiler(role: AFDNPUProfilerRole) -> AFDNPUProfiler | None:
 
 
 def create_runtime_npu_profiler(
-    role: AFDNPUProfilerRole, trace_dir: str, *, lightweight: bool = False
+    role: AFDNPUProfilerRole,
+    trace_dir: str,
+    *,
+    lightweight: bool = False,
+    graph: bool = False,
 ) -> AFDNPUProfiler:
     config = replace(afd_npu_profiler_config(role), enabled=True, trace_dir=trace_dir)
-    return _create_npu_profiler(role, config, runtime=True, lightweight=lightweight)
+    return _create_npu_profiler(
+        role, config, runtime=True, lightweight=lightweight, graph=graph
+    )
 
 
 def _create_npu_profiler(
@@ -92,19 +98,23 @@ def _create_npu_profiler(
     *,
     runtime: bool,
     lightweight: bool = False,
+    graph: bool = False,
 ) -> AFDNPUProfiler:
 
     import torch_npu
 
+    profiler_level = torch_npu.profiler.ProfilerLevel.Level2
+    if lightweight:
+        profiler_level = (
+            torch_npu.profiler.ProfilerLevel.Level0
+            if graph
+            else torch_npu.profiler.ProfilerLevel.Level_none
+        )
     experimental_config = torch_npu.profiler._ExperimentalConfig(
         export_type=torch_npu.profiler.ExportType.Text,
-        profiler_level=(
-            torch_npu.profiler.ProfilerLevel.Level_none
-            if lightweight
-            else torch_npu.profiler.ProfilerLevel.Level2
-        ),
-        mstx=lightweight,
-        mstx_domain_include=["afd.cam"] if lightweight else [],
+        profiler_level=profiler_level,
+        mstx=lightweight and not graph,
+        mstx_domain_include=["afd.cam"] if lightweight and not graph else [],
         data_simplification=True,
         record_op_args=False,
         op_attr=False,

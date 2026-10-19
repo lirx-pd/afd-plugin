@@ -419,11 +419,6 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             try:
                 if not self.vllm_config.use_v2_model_runner:
                     raise ValueError("Async FFN FULL requires MRV2 on every rank")
-                if self.profile_enabled:
-                    raise ValueError(
-                        "runtime CAM profiling requires eager FFN execution; "
-                        "FFN FULL graph is unsupported"
-                    )
                 validate_graph_capacity(
                     self.max_num_batched_tokens, self.tp_size, cam_receive_capacity()
                 )
@@ -875,7 +870,8 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             dynamic_quant=self.dynamic_quant,
             group_name=self.group_name,
         )
-        session = self.profile_session
+        # Captured DR must not execute the eager host wait or copy device metadata.
+        session = self.profile_session if self.graph_startup.mode != "full" else None
         waiter = session.device_waiter if session is not None else None
         if waiter is not None:
             waiter.begin_receive()

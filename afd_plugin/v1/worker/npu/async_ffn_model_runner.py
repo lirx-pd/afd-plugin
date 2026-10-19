@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from typing import TYPE_CHECKING, Protocol, cast
 
@@ -172,6 +173,10 @@ class AsyncNPUFFNModelRunner:
         try:
             self.connector.init_afd_connector()
             self.effective_mode = self.connector.graph_startup.mode
+            if self.connector.profile_session is not None:
+                self.connector.profile_session.identity["ffn_execution_mode"] = (
+                    self.effective_mode
+                )
             if self.effective_mode == "full":
                 assert executor is not None
                 chunks = self.connector.graph_startup_chunks() * (
@@ -261,6 +266,9 @@ class AsyncNPUFFNModelRunner:
             or count < 1
         ):
             raise RuntimeError("Async FFN graph is not ready for replay")
+        session = self.connector.profile_session
+        if session is not None:
+            session.advance_profiler()
         self._graph_pending = True  # A failed launch may already have queued work.
         try:
             with torch.npu.stream(self._graph_stream):
@@ -278,11 +286,21 @@ class AsyncNPUFFNModelRunner:
         try:
             # One fence per bounded batch. The original DR cannot be cancelled;
             # a blocked batch retains its graph, model and communication buffers.
+            session = self.connector.profile_session
+            if session is not None:
+                done = torch.npu.Event()
+                done.record(self._graph_stream)
+                while not done.query():
+                    # Start may observe an in-flight replay; stop must drain it.
+                    session.advance_profiler(allow_stop=False)
+                    os.sched_yield()
             torch.npu.synchronize()
         except Exception as exc:
             self._graph_failure = exc
             raise
         self._graph_pending = False
+        if session is not None:
+            session.advance_profiler()
         return True
 
     def _close_graph(self) -> None:

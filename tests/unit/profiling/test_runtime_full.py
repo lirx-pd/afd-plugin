@@ -145,8 +145,9 @@ def make_worker(session):
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])
 @pytest.mark.parametrize("initialized", [False, True])
+@pytest.mark.parametrize("graph", [False, True])
 def test_enabled_worker_creates_tracer_only_for_lightweight(
-    tmp_path, monkeypatch, role, initialized
+    tmp_path, monkeypatch, role, initialized, graph
 ):
     class Connector(SimpleNamespace):
         pass
@@ -154,6 +155,7 @@ def test_enabled_worker_creates_tracer_only_for_lightweight(
     connector = Connector(
         profile_worker_id=f"{role}-dp0",
         topology=SimpleNamespace(role=role),
+        graph_startup=SimpleNamespace(mode="eager"),
         world_rank=0,
         attn_size=1,
         ffn_size=1,
@@ -197,9 +199,11 @@ def test_enabled_worker_creates_tracer_only_for_lightweight(
     assert session.device_waiter is (waiter if role == "ffn" else None)
     assert session.tracer is None
     assert not tracer_calls
+    connector.graph_startup.mode = "full" if graph else "eager"
 
     try:
         assert worker.cam_profile_prepare(prepare_command(mode="FULL"))["error"] is None
+        assert session.capture.profiler.graph is (graph and role == "ffn")
         assert session.tracer is None
         assert not tracer_calls
         worker.cam_profile_stop(stop_command(session))
@@ -208,9 +212,9 @@ def test_enabled_worker_creates_tracer_only_for_lightweight(
         assert worker.cam_profile_prepare(command)["error"] is None
         assert worker.cam_profile_prepare(dict(command))["error"] is None
         assert tracer_calls == [connector]
-        assert session.tracer is tracer
         assert tracer.session is session
         assert tracer.beginnings == 1
+        assert session.tracer is tracer
     finally:
         if session.capture is not None:
             assert session.capture.writer.close(1.0)

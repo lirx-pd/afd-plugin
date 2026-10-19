@@ -68,9 +68,12 @@ class CAMProfileWorkerMixin:
                 "tp_size": connector.tp_size,
             },
             tracer_factory=partial(self._create_cam_tracer, connector),
-            profiler_factory=partial(
-                RuntimeProfiler,
+            profiler_factory=lambda trace_dir, mode: RuntimeProfiler(
                 "attention" if connector.topology.role == "attention" else "ffn",
+                trace_dir,
+                mode,
+                graph=connector.topology.role == "ffn"
+                and connector.graph_startup.mode == "full",
             ),
         )
         if connector.topology.role == "ffn":

@@ -205,7 +205,7 @@ def read_jsonl(
                     header = record
         if header is not None and header.get("native_trace_dir"):
             _validate(header)
-            if any(
+            if header.get("identity", {}).get("ffn_execution_mode") != "full" and any(
                 r.get("record_type") == "SUMMARY"
                 and r.get("worker_id") == header["worker_id"]
                 and r.get("native_marks", r.get("native_spans")) == 0

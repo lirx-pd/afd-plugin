@@ -207,6 +207,28 @@ def test_recv_reuses_control_copy_and_preserves_full_combine_metadata(monkeypatc
     assert tracer.transitions == ["WAIT", "COMMUNICATION", "WAIT"]
 
 
+@pytest.mark.parametrize("mode", ["FULL", "LIGHTWEIGHT"])
+def test_graph_capture_skips_eager_host_waits_and_metadata_reads(
+    monkeypatch, ops, mode
+):
+    ffn = connector(monkeypatch, role="ffn")
+    ffn.graph_startup.mode = "full"
+    tracer = Tracer()
+    ffn.profile_session = profile_session(tracer)
+    ffn.profile_session.capture.mode = mode
+    outputs = recv_outputs(ffn)
+    ops.afd_async_dispatch_recv.return_value = outputs
+    received = ffn.recv_attn_output()
+    ffn.send_ffn_output(received.hidden_states, received.context)
+    assert received.context.profile is None
+    assert received.context.states.host_control is None
+    assert received.context.states.token_nums_rankid_layeridx is outputs[2]
+    ffn.profile_session.device_waiter.begin_receive.assert_not_called()
+    ffn.profile_session.device_waiter.wait_for_stream.assert_not_called()
+    ffn.profile_session.advance_profiler.assert_not_called()
+    assert not tracer.transitions
+
+
 @pytest.mark.parametrize("active_at_completion", [False, True])
 def test_receive_admits_only_after_device_completion(
     monkeypatch, ops, active_at_completion

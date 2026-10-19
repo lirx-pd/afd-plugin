@@ -11,8 +11,16 @@ from afd_plugin.profiling import native as full
 from afd_plugin.profiling.native import RuntimeProfiler
 
 
-@pytest.fixture(params=["FULL", "LIGHTWEIGHT"])
+@pytest.fixture(
+    params=[
+        ("FULL", False),
+        ("LIGHTWEIGHT", False),
+        ("FULL", True),
+        ("LIGHTWEIGHT", True),
+    ]
+)
 def backend(tmp_path, monkeypatch, request):
+    mode, graph = request.param
     calls = []
     stopping = threading.Event()
     release = threading.Event()
@@ -41,7 +49,7 @@ def backend(tmp_path, monkeypatch, request):
     received = []
 
     def factory(role, trace_dir, **kwargs):
-        assert kwargs == {"lightweight": request.param == "LIGHTWEIGHT"}
+        assert kwargs == {"lightweight": mode == "LIGHTWEIGHT", "graph": graph}
         received.append((role, trace_dir))
         record("factory_start")
         if native.failure == "start":
@@ -53,7 +61,7 @@ def backend(tmp_path, monkeypatch, request):
 
     monkeypatch.setattr(full, "create_runtime_npu_profiler", factory)
     monkeypatch.setattr(full, "archive_native_trace", lambda path: None)
-    owner = RuntimeProfiler("ffn", tmp_path, request.param)
+    owner = RuntimeProfiler("ffn", tmp_path, mode, graph=graph)
     yield owner, native, calls, received, stopping, release
     release.set()
     owner.stop()

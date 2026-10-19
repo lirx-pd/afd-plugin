@@ -332,10 +332,10 @@ python -m afd_plugin.profiling.control --host 127.0.0.1 --port 8765
 
 Both modes use the TorchNPU profiling backend used by vLLM-Ascend.
 `LIGHTWEIGHT` records a continuous **COMPUTE**, **COMMUNICATION**, **WAIT** pipeline
-on Attention and FFN streams, without layer, request, token or causal identities.
+on Attention and FFN streams, with optional Attention dispatch annotations.
 It uses NPU-only `Level_none` and the `afd.cam` MSTX domain. A native device mark
 is submitted only when a stream changes phase; adjacent compute regions across
-layers share one state. Stream tracks and three short messages are reused;
+layers share one state. Stream tracks and the three phase messages are reused;
 model/DBO entry caches the track instead of hooking every Attention layer.
 CPU operator callbacks, kernel/task profiling, shapes, stacks/modules,
 memory, FLOPs and hardware counters are off. There are no timing Event pools,
@@ -351,6 +351,17 @@ coordinator's clock offset/uncertainty align Attention and FFN tracks; no layer 
 request pairing is inferred. The initial interval before a stream's first marker
 is unobserved. A native host END marker clips queued work at the capture boundary
 and closes a stream waiting indefinitely for its peer.
+
+Attention COMMUNICATION markers additionally carry `microbatch_id`, `layer_idx`,
+`num_requests` and `num_tokens`; offline export keeps these in the interval's
+Chrome trace `args`. Counts come from native CPU scheduler/batch metadata, exclude
+padding, and describe the whole Attention microbatch before TP sharding.
+`microbatch_id` is the stage slot within a step (zero for an unsplit batch),
+not a globally unique batch ID. A request spanning two slices counts in both.
+The layer is the remote MoE dispatch layer; merged COMPUTE intervals do not
+represent complete individual layer timings. Unknown batches remain unannotated.
+These fields extend existing marks without new device marks, Events, D2H copies,
+barriers or per-layer JSONL records. FFN carries no added identity metadata.
 
 Clock alignment groups workers by Linux boot ID, rather than hostname. Workers
 on the coordinator's host use zero offset; workers sharing another host receive

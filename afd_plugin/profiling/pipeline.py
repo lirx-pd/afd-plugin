@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Aligned pipeline tracks without layers, requests or causal reconstruction."""
+"""Aligned pipeline tracks with optional Attention dispatch annotations."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from decimal import Decimal
 
 PHASES = frozenset({"COMPUTE", "COMMUNICATION", "WAIT"})
 NS_PER_US = 1000
+ATTENTION_FIELDS = ("microbatch_id", "layer_idx", "num_requests", "num_tokens")
 
 
 def native_pipeline(events: list[dict], header: dict) -> list[dict]:
@@ -19,12 +20,22 @@ def native_pipeline(events: list[dict], header: dict) -> list[dict]:
         name = event.get("name", "")
         if not name.startswith("afd.cam|"):
             continue
-        phase = name.removeprefix("afd.cam|")
+        phase, *labels = name.removeprefix("afd.cam|").split("|")
         device = "Physic Stream Id" in event.get("args", {})
         if (phase == "END" and device) or (phase != "END" and not device):
             continue
         if phase != "END" and phase not in PHASES:
             raise ValueError("invalid pipeline phase")
+        annotation = {}
+        if labels:
+            if (
+                header["role"] != "attention"
+                or phase != "COMMUNICATION"
+                or len(labels) != len(ATTENTION_FIELDS)
+                or any(not value.isascii() or not value.isdecimal() for value in labels)
+            ):
+                raise ValueError("invalid Attention pipeline annotation")
+            annotation = dict(zip(ATTENTION_FIELDS, map(int, labels), strict=True))
         timestamp = int(Decimal(str(event["ts"])) * NS_PER_US)
         if timestamp < 0:
             raise ValueError("negative pipeline timestamp")
@@ -32,12 +43,14 @@ def native_pipeline(events: list[dict], header: dict) -> list[dict]:
         if phase == "END":
             ends.append(timestamp)
         else:
-            tracks[str(event["args"]["Physic Stream Id"])].append((timestamp, phase))
+            tracks[str(event["args"]["Physic Stream Id"])].append(
+                (timestamp, phase, annotation)
+            )
     records = []
     end = ends[0] if len(ends) == 1 else None
     for stream, points in sorted(tracks.items()):
         points.sort(key=lambda point: point[0])
-        for index, (begin, phase) in enumerate(points):
+        for index, (begin, phase, annotation) in enumerate(points):
             finish = points[index + 1][0] if index + 1 < len(points) else end
             if finish is None:
                 continue
@@ -53,6 +66,7 @@ def native_pipeline(events: list[dict], header: dict) -> list[dict]:
                     "kind": phase,
                     "begin_ns": begin - header["clock_offset_ns"],
                     "end_ns": finish - header["clock_offset_ns"],
+                    **({"annotation": annotation} if annotation else {}),
                 }
             )
     records.append(
@@ -106,6 +120,16 @@ def reconstruct_pipeline(records: list[dict]) -> dict:
                 or record["end_ns"] < record["begin_ns"]
             ):
                 raise ValueError("invalid pipeline interval")
+            if "annotation" in record and (
+                record["kind"] != "COMMUNICATION"
+                or not isinstance(record["annotation"], dict)
+                or set(record["annotation"]) != set(ATTENTION_FIELDS)
+                or any(
+                    type(value) is not int or value < 0
+                    for value in record["annotation"].values()
+                )
+            ):
+                raise ValueError("invalid Attention pipeline annotation")
             intervals[(worker, str(record["stream_id"]))].append(record)
         else:
             raise ValueError("pipeline capture contains detailed records")
@@ -137,11 +161,21 @@ def reconstruct_pipeline(records: list[dict]) -> dict:
     tracks = []
     for (worker, stream), values in sorted(intervals.items()):
         merged: list[tuple[int, int, str]] = []
+        annotations = []
         for value in sorted(values, key=lambda value: value["begin_ns"]):
             if merged and value["begin_ns"] < merged[-1][1]:
                 raise ValueError("overlapping states in one pipeline stream")
             begin, end = value["begin_ns"], value["end_ns"]
-            if merged and merged[-1][1] == begin and merged[-1][2] == value["kind"]:
+            if "annotation" in value:
+                if headers[worker]["role"] != "attention":
+                    raise ValueError("FFN pipeline cannot carry Attention annotations")
+                annotations.append({"begin_ns": begin, **value["annotation"]})
+            if (
+                merged
+                and merged[-1][1] == begin
+                and merged[-1][2] == value["kind"]
+                and "annotation" not in value
+            ):
                 merged[-1] = (merged[-1][0], end, value["kind"])
             else:
                 merged.append((begin, end, value["kind"]))
@@ -151,6 +185,7 @@ def reconstruct_pipeline(records: list[dict]) -> dict:
                 "role": headers[worker]["role"],
                 "stream_id": stream,
                 "intervals": merged,
+                **({"annotations": annotations} if annotations else {}),
             }
         )
     return {
@@ -191,6 +226,10 @@ def export_pipeline(result: dict) -> dict:
                 "args": {"name": f"stream {track['stream_id']}"},
             }
         )
+        annotations = {
+            entry["begin_ns"]: {key: entry[key] for key in ATTENTION_FIELDS}
+            for entry in track.get("annotations", [])
+        }
         for begin, end, phase in track["intervals"]:
             events.append(
                 {
@@ -201,6 +240,7 @@ def export_pipeline(result: dict) -> dict:
                     "tid": index,
                     "ts": (begin - start) / NS_PER_US,
                     "dur": (end - begin) / NS_PER_US,
+                    **({"args": annotations[begin]} if begin in annotations else {}),
                 }
             )
     return {**result, "traceEvents": events, "displayTimeUnit": "ms"}

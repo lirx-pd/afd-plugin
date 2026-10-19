@@ -9,6 +9,7 @@ import inspect
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -223,6 +224,46 @@ def test_mla_replay_updates_captured_stage_records_and_restores_context(
     assert calls == [("wait", current_stream), "replay", "update"]
     assert context.attn_metadata is None
     assert context.additional_kwargs is original_kwargs
+
+
+def test_lightweight_single_batch_annotates_real_counts_before_dp_padding(monkeypatch):
+    runner = _runner(async_dp=True)
+    runner._afd_pending_metadata = None
+    runner._afd_transaction_counter = 0
+    runner.connector.control_plane = None
+    runner.vllm_config.parallel_config.data_parallel_rank = 0
+    context = SimpleNamespace(
+        additional_kwargs={},
+        ubatch_slices=None,
+        dp_metadata=None,
+        batch_descriptor=SimpleNamespace(num_tokens=12),
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+    )
+    pipeline = SimpleNamespace(tracer=SimpleNamespace(idle=Mock()), capture=object())
+    monkeypatch.setattr(npu_v2, "runtime_profiling_enabled", lambda: True)
+    monkeypatch.setattr(npu_v2, "begin_profile_step", lambda _: pipeline)
+    monkeypatch.setattr(npu_v2, "step_afd_npu_profiler", lambda _: None)
+    monkeypatch.setattr(
+        afd_context.forward_context_module, "create_forward_context", lambda: context
+    )
+
+    def native_execute(self, *args, **kwargs):
+        created = afd_context.forward_context_module.create_forward_context()
+        metadata = created.additional_kwargs["afd_metadata"]
+        assert metadata.tokens_lens == [12]
+        assert metadata.profile_batch == [(0, 2, 9)]
+        return "native-result"
+
+    monkeypatch.setattr(NPUModelRunner, "execute_model", native_execute)
+    assert (
+        runner.execute_model(
+            SimpleNamespace(
+                total_num_scheduled_tokens=9, num_scheduled_tokens={"a": 3, "b": 6}
+            )
+        )
+        == "native-result"
+    )
+    pipeline.tracer.idle.assert_called_once_with(pipeline.capture)
 
 
 @pytest.mark.parametrize("async_dp", [False, True])

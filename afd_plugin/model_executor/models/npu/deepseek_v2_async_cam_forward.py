@@ -34,6 +34,7 @@ from afd_plugin.model_executor.models.npu.async_cam_layout import (
 )
 from afd_plugin.profiling import runtime_profiling_enabled
 from afd_plugin.profiling.model import (
+    attention_profile_annotation,
     begin_profile_call,
     begin_profile_step,
     transition,
@@ -190,7 +191,15 @@ def run_attention_gate_afd_forward(
             stage_idx=stage_idx,
             seq_len=int(dispatch_payload.hidden_states.shape[0]),
         )
-        context = AFDTransferContext(metadata=metadata, profile=execution)
+        context = AFDTransferContext(
+            metadata=metadata,
+            profile=execution,
+            profile_annotation=attention_profile_annotation(
+                afd_metadata, layer.layer_idx
+            )
+            if execution is not None
+            else "",
+        )
         pending_profile = execution
         pending_receive = send_async_cam_remote_call(
             afd_connector,

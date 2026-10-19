@@ -69,12 +69,18 @@ class DeviceTracer:
     def new_work(self) -> Execution | None:
         return self.execution()
 
-    def transition(self, execution: Execution, phase: str) -> None:
+    def transition(
+        self, execution: Execution, phase: str, annotation: str = ""
+    ) -> None:
         if execution.phase == phase or self._ended or self.finalized(execution.capture):
             return
         try:
             torch_npu._C._mstx._mark(
-                PHASE_MESSAGES[phase], *execution.stream, RANGE_PREFIX
+                f"{PHASE_MESSAGES[phase]}|{annotation}"
+                if annotation
+                else PHASE_MESSAGES[phase],
+                *execution.stream,
+                RANGE_PREFIX,
             )
             execution.phase = phase
             self._recorded_marks += 1

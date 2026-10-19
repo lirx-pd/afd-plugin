@@ -45,6 +45,7 @@ from afd_plugin.model_executor.models.npu.deepseek_v4_shared_experts import (
 )
 from afd_plugin.profiling import runtime_profiling_enabled
 from afd_plugin.profiling.model import (
+    attention_profile_annotation,
     begin_profile_call,
     install_pipeline_hook,
     transition,
@@ -290,6 +291,11 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
                 seq_len=int(dispatch_payload.hidden_states.shape[0]),
             ),
             profile=execution,
+            profile_annotation=attention_profile_annotation(
+                afd_metadata, self.layer_idx
+            )
+            if execution is not None
+            else "",
         )
         receive = send_async_cam_remote_call(
             afd_metadata.connector,

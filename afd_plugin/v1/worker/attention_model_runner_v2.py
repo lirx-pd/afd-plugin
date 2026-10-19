@@ -40,6 +40,7 @@ from afd_plugin.connectors import (
     AFDForwardContextMetadata,
 )
 from afd_plugin.model_executor.models.forward_context import use_afd_metadata_provider
+from afd_plugin.profiling import runtime_profiling_enabled
 from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
     _resolve_world_ranks,
@@ -151,7 +152,12 @@ def _use_afd_ubatch_preparation(
         else:
             runner._afd_is_graph_replaying = cg_mode == CUDAGraphMode.FULL
         runner.install_mrv2_ubatch_metadata(
-            prepared.slices, prepared.forward_contexts, input_batch.num_tokens
+            prepared.slices,
+            prepared.forward_contexts,
+            input_batch.num_tokens,
+            profile_num_requests=input_batch.num_reqs
+            if runtime_profiling_enabled() and not for_capture
+            else None,
         )
         if runner.connector.control_plane is not None:
             runner.send_dp_metadata(None, prepared.slices)

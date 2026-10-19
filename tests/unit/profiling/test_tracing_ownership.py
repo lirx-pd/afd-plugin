@@ -84,6 +84,22 @@ def test_three_pipeline_states_without_stage_names_or_identity(tracer):
     assert tracer.pending_count() == 0
 
 
+def test_attention_annotation_adds_no_marks_or_writer_submissions(tracer):
+    tracer, capture, native = tracer
+    execution = tracer.execution()
+    for layer in range(3):
+        tracer.transition(execution, "COMPUTE")
+        tracer.transition(execution, "COMPUTE")
+        tracer.transition(execution, "COMMUNICATION", f"1|{layer}|3|9")
+        tracer.transition(execution, "WAIT")
+    assert native._mark.call_count == 9
+    assert [c.args[0] for c in native._mark.call_args_list][1::3] == [
+        f"afd.cam|COMMUNICATION|1|{layer}|3|9" for layer in range(3)
+    ]
+    assert tracer.snapshot()["native_marks"] == 9
+    capture.writer.submit.assert_not_called()
+
+
 def test_streams_and_generations_keep_independent_states(tracer):
     tracer, capture, native = tracer
     first = tracer.execution()

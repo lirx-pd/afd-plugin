@@ -4,7 +4,45 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from afd_plugin.profiling.model import begin_profile_call, install_pipeline_hook
+import pytest
+
+from afd_plugin.profiling.model import (
+    attention_profile_annotation,
+    begin_profile_call,
+    install_pipeline_hook,
+    set_attention_profile_batch,
+)
+
+
+@pytest.mark.parametrize(
+    "num_requests,num_tokens,expected", [(3, 9, (0, 3, 9)), (0, 0, (0, 0, 0))]
+)
+def test_attention_single_batch_uses_cpu_counts(num_requests, num_tokens, expected):
+    metadata = SimpleNamespace(profile_batch=[], stage_idx=0)
+    set_attention_profile_batch(metadata, num_requests, num_tokens, None)
+    assert metadata.profile_batch == [expected]
+    assert attention_profile_annotation(metadata, 7) == (
+        f"0|7|{expected[1]}|{expected[2]}"
+    )
+
+
+def test_attention_microbatch_counts_clip_padding_and_keep_split_request():
+    # The first request spans the split; the final stage contains only padding.
+    slices = [
+        SimpleNamespace(request_slice=slice(0, 1), token_slice=slice(0, 4)),
+        SimpleNamespace(request_slice=slice(0, 4), token_slice=slice(4, 10)),
+        SimpleNamespace(request_slice=slice(4, 6), token_slice=slice(10, 12)),
+    ]
+    metadata = SimpleNamespace(profile_batch=[], stage_idx=1)
+    set_attention_profile_batch(metadata, 3, 9, slices)
+    assert metadata.profile_batch == [(0, 1, 4), (1, 3, 5), (2, 0, 0)]
+    assert attention_profile_annotation(metadata, 7) == "1|7|3|5"
+    child = SimpleNamespace(profile_batch=[metadata.profile_batch[1]], stage_idx=1)
+    assert attention_profile_annotation(child, 8) == "1|8|3|5"
+
+
+def test_unknown_batch_is_unannotated():
+    assert attention_profile_annotation(SimpleNamespace(profile_batch=[]), 7) == ""
 
 
 def test_idle_pipeline_has_no_layer_lookup():

@@ -9,15 +9,53 @@ from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from torch.nn import Module
+    from vllm.v1.worker.ubatch_utils import UBatchSlices
 
     from afd_plugin.connectors import AFDConnectorBase, AFDForwardContextMetadata
     from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
     from afd_plugin.profiling.tracing import Execution
 
 
-def transition(execution: Execution | None, phase: str) -> None:
+def transition(execution: Execution | None, phase: str, annotation: str = "") -> None:
     if execution is not None:
-        execution.tracer.transition(execution, phase)
+        if annotation:
+            execution.tracer.transition(execution, phase, annotation)
+        else:
+            execution.tracer.transition(execution, phase)
+
+
+def set_attention_profile_batch(
+    metadata: AFDForwardContextMetadata,
+    num_requests: int,
+    num_tokens: int,
+    ubatch_slices: UBatchSlices | None,
+) -> None:
+    """Copy only CPU scalar counts, excluding native request/token padding."""
+    if ubatch_slices and len(ubatch_slices) > 1:
+        metadata.profile_batch = [
+            (
+                index,
+                max(
+                    0, min(ub.request_slice.stop, num_requests) - ub.request_slice.start
+                )
+                if ub.token_slice.start < num_tokens
+                else 0,
+                max(0, min(ub.token_slice.stop, num_tokens) - ub.token_slice.start),
+            )
+            for index, ub in enumerate(ubatch_slices)
+        ]
+    else:
+        metadata.profile_batch = [(0, num_requests if num_tokens else 0, num_tokens)]
+
+
+def attention_profile_annotation(
+    metadata: AFDForwardContextMetadata, layer_idx: int
+) -> str:
+    if not metadata.profile_batch:
+        return ""
+    index = metadata.stage_idx if len(metadata.profile_batch) > 1 else 0
+    microbatch, requests, tokens = metadata.profile_batch[index]
+    return f"{microbatch}|{layer_idx}|{requests}|{tokens}"
 
 
 def begin_profile_call(metadata: AFDForwardContextMetadata) -> Execution | None:

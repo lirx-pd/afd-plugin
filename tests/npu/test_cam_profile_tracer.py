@@ -81,7 +81,11 @@ def _probe(output: Path) -> None:
                     execution = tracer.execution()
                     assert execution is not None and tracer.retain_execution(execution)
                     for phase in ("COMPUTE", "COMPUTE", "COMMUNICATION", "WAIT"):
-                        transition(execution, phase)
+                        transition(
+                            execution,
+                            phase,
+                            f"{index}|7|3|9" if phase == "COMMUNICATION" else "",
+                        )
                         torch.mm(x, x, out=targets[index])
                     tracer.release_execution(execution)
                 else:
@@ -124,6 +128,16 @@ def _probe(output: Path) -> None:
                     "WAIT",
                 }
                 assert all(r["end_ns"] > r["begin_ns"] for r in phases)
+                annotations = [r["annotation"] for r in phases if "annotation" in r]
+                assert sorted(annotations, key=lambda r: r["microbatch_id"]) == [
+                    {
+                        "microbatch_id": i,
+                        "layer_idx": 7,
+                        "num_requests": 3,
+                        "num_tokens": 9,
+                    }
+                    for i in range(2)
+                ]
                 events = []
                 for path in root.rglob("trace_view.json"):
                     raw = json.loads(path.read_text())
@@ -197,7 +211,11 @@ def _probe_cam_pipeline(output: Path) -> None:
         def wrapped(name):
             def invoke(*args):
                 phase = "COMMUNICATION" if name.endswith("send") else "WAIT"
-                tracer.transition(execution, phase)
+                tracer.transition(
+                    execution,
+                    phase,
+                    f"0|{layer}|1|8" if name == "dispatch_send" else "",
+                )
                 result = originals[name](*args)
                 if name == "dispatch_recv":
                     tracer.transition(execution, "COMPUTE")
@@ -233,6 +251,10 @@ def _probe_cam_pipeline(output: Path) -> None:
             phases = [e for e in trace["traceEvents"] if e["ph"] == "X"]
             assert {e["name"] for e in phases} == {"COMPUTE", "COMMUNICATION", "WAIT"}
             assert len({e["pid"] for e in phases}) == 2
+            annotations = [e for e in phases if "args" in e]
+            assert len(annotations) == 2
+            assert [e["args"]["layer_idx"] for e in annotations] == [1, 2]
+            assert all(e["pid"] == annotations[0]["pid"] for e in annotations)
             (output / "pipeline.json").write_text(
                 json.dumps(trace, separators=(",", ":"))
             )

@@ -110,11 +110,12 @@ def profile_session(tracer):
     )
 
 
-def dispatch(connector, *, stage=0):
+def dispatch(connector, *, stage=0, annotation=""):
     context = AFDTransferContext(
         metadata=AFDTransferMetadata.create_attention_metadata(
             layer_idx=3, stage_idx=stage, seq_len=2
-        )
+        ),
+        profile_annotation=annotation,
     )
     connector.send_attn_output(
         torch.empty((2, 16)),
@@ -123,6 +124,19 @@ def dispatch(connector, *, stage=0):
         topk_weights=torch.ones((2, 2)),
     )
     return context
+
+
+def test_attention_dispatch_uses_its_captured_annotation(monkeypatch, ops):
+    attn = connector(monkeypatch, role="attention")
+    tracer = Tracer()
+    tracer.transition = Mock()
+    attn.profile_session = profile_session(tracer)
+    first = dispatch(attn, stage=0, annotation="0|7|2|9")
+    second = dispatch(attn, stage=1, annotation="1|8|3|5")
+    assert [call.args for call in tracer.transition.call_args_list] == [
+        (first.profile, "COMMUNICATION", "0|7|2|9"),
+        (second.profile, "COMMUNICATION", "1|8|3|5"),
+    ]
 
 
 def recv_outputs(connector):

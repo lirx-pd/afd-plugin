@@ -4,9 +4,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
+from functools import partial
 from types import MethodType
 from typing import TYPE_CHECKING
 
@@ -450,6 +451,15 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             if use_fullgraph_replay_hook
             else nullcontext()
         )
+        metadata_installer: Callable[[ForwardContext], None] = (
+            self.install_afd_metadata_on_forward_context
+        )
+        if pipeline is not None and not dummy_run and not is_profile:
+            metadata_installer = partial(
+                self.install_afd_metadata_on_forward_context,
+                profile_num_requests=len(scheduler_output.num_scheduled_tokens),
+                profile_num_tokens=scheduler_output.total_num_scheduled_tokens,
+            )
         try:
             with (
                 skip_dp_coordination() if self.afd_config.async_dp else nullcontext(),
@@ -464,9 +474,7 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                 if self.afd_config.async_dp and self.ubatch_runner is not None
                 else nullcontext(),
                 _use_afd_ubatch_preparation(self),
-                use_afd_metadata_provider(
-                    self.install_afd_metadata_on_forward_context,
-                ),
+                use_afd_metadata_provider(metadata_installer),
             ):
                 return super().execute_model(
                     scheduler_output,

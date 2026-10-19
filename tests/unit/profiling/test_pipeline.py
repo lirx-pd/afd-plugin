@@ -115,6 +115,45 @@ def test_native_end_clips_queued_work_at_capture_boundary(tmp_path):
     assert phases[-1]["end_ns"] == EPOCH_NS + 30000
 
 
+def test_attention_dispatch_annotation_survives_alignment_and_export(tmp_path):
+    offset = 50000
+    rows = capture("a0", "attention", offset)
+    data = events(offset)
+    for event in data:
+        if event["name"] == "afd.cam|COMMUNICATION":
+            event["name"] += "|1|7|3|9"
+    records = rows + read_native_trace(native(tmp_path, "a0", data), rows[0])
+    expected = {"microbatch_id": 1, "layer_idx": 7, "num_requests": 3, "num_tokens": 9}
+    track = reconstruct(records)["pipelines"][0]
+    assert track["annotations"] == [{"begin_ns": EPOCH_NS + 10000, **expected}]
+    trace = export_chrome_trace(records)
+    phases = [e for e in trace["traceEvents"] if e["ph"] == "X"]
+    assert len(phases) == 3
+    assert phases[1]["args"] == expected
+    assert phases[1]["ts"] == 10
+    assert all("args" not in e for e in (phases[0], phases[2]))
+
+
+@pytest.mark.parametrize(
+    "role,phase,suffix",
+    [
+        ("ffn", "COMMUNICATION", "|0|1|2|3"),
+        ("attention", "COMPUTE", "|0|1|2|3"),
+        ("attention", "COMMUNICATION", "|0|1|2"),
+        ("attention", "COMMUNICATION", "|0|1|-2|3"),
+        ("attention", "COMMUNICATION", "|0|1|True|3"),
+    ],
+)
+def test_invalid_attention_annotation_rejected(tmp_path, role, phase, suffix):
+    rows = capture("a0", role)
+    data = events()
+    for event in data:
+        if event["name"] == f"afd.cam|{phase}":
+            event["name"] += suffix
+    with pytest.raises(ValueError, match="annotation"):
+        read_native_trace(native(tmp_path, "a0", data), rows[0])
+
+
 def test_missing_native_marker_is_partial(tmp_path):
     rows = capture("a0", "attention")
     records = rows + read_native_trace(native(tmp_path, "a0", events()[:-1]), rows[0])

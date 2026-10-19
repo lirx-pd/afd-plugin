@@ -761,7 +761,9 @@ def test_mrv2_stage_sidecars_preserve_native_slices_and_isolate_mutation(
         )
         for stage_idx in range(len(slices))
     ]
-    runner.install_mrv2_ubatch_metadata(slices, contexts, real_tokens)
+    runner.install_mrv2_ubatch_metadata(
+        slices, contexts, real_tokens, profile_num_requests=2
+    )
     stages = [c.additional_kwargs["afd_metadata"] for c in contexts]
     assert [m.stage_idx for m in stages] == [0, 1]
     assert [m.tokens_start_loc for m in stages] == [[0], [4]]
@@ -778,6 +780,10 @@ def test_mrv2_stage_sidecars_preserve_native_slices_and_isolate_mutation(
     stages[0].tokens_lens[0] = 99
     assert stages[1].tokens_lens == [4]
     assert runner._afd_pending_metadata.tokens_lens == [4, 4]
+    assert stages[0].profile_batch == [(0, 2, expected[0])]
+    assert stages[1].profile_batch == [(1, 1 if expected[1] else 0, expected[1])]
+    stages[0].profile_batch.clear()
+    assert runner._afd_pending_metadata.profile_batch[0] == (0, 2, expected[0])
 
 
 @pytest.mark.parametrize("graph", [False, True])

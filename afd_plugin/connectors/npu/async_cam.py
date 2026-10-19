@@ -715,7 +715,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             dynamic_quant=self.dynamic_quant,
             group_name=self.group_name,
         )
-        transition(context.profile, "COMMUNICATION")
+        transition(context.profile, "COMMUNICATION", context.profile_annotation)
         torch.ops.afd_ascend.afd_async_dispatch_send(
             hidden_states,
             topk_ids,

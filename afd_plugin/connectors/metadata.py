@@ -258,6 +258,7 @@ class AFDTransferContext:
     metadata: AFDTransferMetadata
     states: AFDTransferState | None = None
     profile: Execution | None = None
+    profile_annotation: str = ""
 
 
 @dataclass(slots=True)
@@ -305,6 +306,7 @@ class AFDForwardContextMetadata:
     transaction_id: str | None = None
     tokens_unpadded_lens: list[int] = field(default_factory=list)
     profile_pipeline: Execution | None = None
+    profile_batch: list[tuple[int, int, int]] = field(default_factory=list)
 
     def clone(self) -> AFDForwardContextMetadata:
         cloned = copy.copy(self)
@@ -313,6 +315,7 @@ class AFDForwardContextMetadata:
         cloned.requests_start_loc = list(self.requests_start_loc)
         cloned.tokens_lens = list(self.tokens_lens)
         cloned.tokens_unpadded_lens = list(self.tokens_unpadded_lens)
+        cloned.profile_batch = list(self.profile_batch)
         return cloned
 
 

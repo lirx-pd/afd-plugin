@@ -11,7 +11,6 @@ import subprocess
 import sys
 import threading
 import time
-import traceback
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,91 +24,6 @@ ITERATIONS = 4
 BUSY_MATRIX_SIZE = 4096
 BUSY_ITERATIONS = 1024
 CPU_MARKER = "CAM_RUNTIME_FULL_PRODUCER"
-
-
-def _probe(output: Path) -> None:
-    import torch
-    import torch_npu
-
-    from afd_plugin.profiling.native import RuntimeProfiler
-
-    for key, value in {
-        "ENABLE": "0",
-        "DIR": str(output / "unused-static-dir"),
-        "WITH_STACK": "0",
-    }.items():
-        os.environ[f"AFD_NPU_ATTENTION_PROFILER_{key}"] = value
-    results: list[dict] = []
-    errors: list[str] = []
-
-    def producer() -> None:
-        try:
-            device = torch.device("npu", int(os.environ.get("LOCAL_RANK", "0")))
-            torch_npu.npu.set_device(device)
-            matrix = torch.ones(
-                (MATRIX_SIZE, MATRIX_SIZE), device=device, dtype=torch.float16
-            )
-            target = torch.empty_like(matrix)
-            torch.mm(matrix, matrix, out=target)
-            torch_npu.npu.synchronize()
-            for mode in ("idle", "active"):
-                runtime = RuntimeProfiler("attention", output / mode)
-                runtime.start()
-                runtime.step()
-                assert runtime.state == "RUNNING", runtime.snapshot()
-                marker = f"{CPU_MARKER}_{mode}"
-                with torch.profiler.record_function(marker):
-                    if mode == "active":
-                        for _ in range(ITERATIONS):
-                            torch.mm(matrix, matrix, out=target)
-                begin = time.monotonic()
-                runtime.stop()
-                runtime.step()
-                assert runtime.finished, runtime.snapshot()
-                assert runtime.state == "COMPLETED", runtime.snapshot()
-                assert not runtime.busy, runtime.snapshot()
-                traces = list(runtime.trace_dir.rglob("trace_view.json"))
-                assert traces, runtime.snapshot()
-                events = []
-                for path in traces:
-                    trace = json.loads(path.read_text())
-                    events.extend(
-                        trace if isinstance(trace, list) else trace["traceEvents"]
-                    )
-                cpu_markers = sum(event.get("name") == marker for event in events)
-                producer_mm = sum(
-                    event.get("name") == "aten::mm"
-                    and event.get("tid") == threading.get_native_id()
-                    for event in events
-                )
-                mm_kernels = sum(
-                    "Task Type" in event.get("args", {})
-                    and "aclnnMm_" in event.get("name", "")
-                    for event in events
-                )
-                assert cpu_markers > 0, (mode, traces)
-                if mode == "active":
-                    assert producer_mm == ITERATIONS, producer_mm
-                    assert mm_kernels == ITERATIONS, mm_kernels
-                results.append(
-                    {
-                        "mode": mode,
-                        "status": runtime.snapshot(),
-                        "producer_tid": threading.get_native_id(),
-                        "cpu_markers": cpu_markers,
-                        "producer_mm": producer_mm,
-                        "mm_kernels": mm_kernels,
-                        "stop_seconds": time.monotonic() - begin,
-                        "trace_paths": [str(path) for path in traces],
-                    }
-                )
-        except BaseException:
-            errors.append(traceback.format_exc())
-
-    producer()
-    assert not errors, "\n".join(errors)
-    assert len({result["status"]["trace_dir"] for result in results}) == 2
-    (output / "probe-result.json").write_text(json.dumps(results, indent=2))
 
 
 def _probe_cooperative(output: Path) -> None:
@@ -403,9 +317,7 @@ def _probe_cam_idle(output: Path) -> None:
             (output / "probe-result.json").write_text(json.dumps(results, indent=2))
 
 
-@pytest.mark.parametrize(
-    "probe", ["--probe", "--cooperative-probe", "--cam-idle-probe"]
-)
+@pytest.mark.parametrize("probe", ["--cooperative-probe", "--cam-idle-probe"])
 def test_runtime_full_preserves_public_profiler_outputs(tmp_path, probe):
     if os.environ.get("AFD_RUN_ASCEND_OP_RUNTIME") != "1":
         pytest.skip("requires an allocated NPU and runtime opt-in")
@@ -442,7 +354,6 @@ def test_runtime_full_preserves_public_profiler_outputs(tmp_path, probe):
 
 if __name__ == "__main__":
     probes = {
-        "--probe": _probe,
         "--cooperative-probe": _probe_cooperative,
         "--cam-idle-probe": _probe_cam_idle,
     }

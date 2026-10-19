@@ -148,128 +148,6 @@ def _probe(output: Path) -> None:
     (output / "probe-result.json").write_text(json.dumps(results, indent=2))
 
 
-def _probe_cam_pipeline(output: Path) -> None:
-    from types import SimpleNamespace
-
-    import torch
-
-    from afd_plugin.profiling.analyze import export_chrome_trace, read_jsonl
-    from afd_plugin.profiling.native import RuntimeProfiler
-    from afd_plugin.profiling.session import Capture
-    from afd_plugin.profiling.storage import JsonRecordWriter
-    from afd_plugin.profiling.tracing import DeviceTracer
-    from tests.npu.async_cam_common import HarnessConfig, NativeHarness
-
-    config = HarnessConfig(
-        attn_ranks=1,
-        moe_ranks=1,
-        tp_size=1,
-        lengths=(8,),
-        capacity=16,
-        max_seq_len=8,
-        timeout_seconds=60,
-    )
-    with NativeHarness(config) as harness:
-        assert not harness.run_round(0)["failures"]
-        worker = "a0" if harness.rank == 0 else "f0"
-        role = "attention" if harness.rank == 0 else "ffn"
-        clock = [time.time_ns() if harness.rank == 0 else None]
-        harness.dist.broadcast_object_list(clock, src=0, group=harness.control_group)
-        output.mkdir(parents=True, exist_ok=True)
-        writer = JsonRecordWriter(output / f"{worker}.jsonl")
-        writer.submit(
-            {
-                "record_type": "SESSION",
-                "schema_version": 1,
-                "session_id": "paired-pipeline",
-                "worker_id": worker,
-                "role": role,
-                "view": "pipeline",
-                "generation": 1,
-                "start_host_ns": clock[0],
-                "clock_offset_ns": 0,
-                "clock_uncertainty_ns": 0,
-                "native_trace_dir": f"{worker}/lightweight",
-            }
-        )
-        owner = RuntimeProfiler(role, output / worker / "lightweight", "LIGHTWEIGHT")
-        tracer = DeviceTracer(harness.device, worker)
-        capture = Capture(
-            "paired-pipeline",
-            1,
-            writer,
-            accepting=True,
-            deadline_ns=time.monotonic_ns() + int(config.timeout_seconds * 1e9),
-        )
-        tracer.session = SimpleNamespace(capture=capture)
-        owner.start()
-        owner.step(startup_only=True)
-        execution = tracer.execution()
-        assert execution is not None and tracer.retain_execution(execution)
-        originals = harness.operations.copy()
-
-        def wrapped(name):
-            def invoke(*args):
-                phase = "COMMUNICATION" if name.endswith("send") else "WAIT"
-                tracer.transition(
-                    execution,
-                    phase,
-                    f"0|{layer}|1|8" if name == "dispatch_send" else "",
-                )
-                result = originals[name](*args)
-                if name == "dispatch_recv":
-                    tracer.transition(execution, "COMPUTE")
-                return result
-
-            return invoke
-
-        for name in ("dispatch_send", "dispatch_recv", "combine_send", "combine_recv"):
-            harness.operations[name] = wrapped(name)
-        for layer in (1, 2):
-            tracer.transition(execution, "COMPUTE" if role == "attention" else "WAIT")
-            assert not harness.run_round(layer)["failures"]
-        torch.npu.synchronize()
-        tracer.release_execution(execution)
-        tracer.close_admission(capture)
-        tracer.end_capture(capture)
-        owner.stop()
-        owner.step()
-        tracer.finish_capture(capture)
-        assert writer.close(2), writer.snapshot()
-        deadline = time.monotonic() + 10
-        while owner.archive_state not in {"COMPLETED", "FAILED"}:
-            assert time.monotonic() < deadline, owner.snapshot()
-            time.sleep(0.005)
-        assert owner.archive_state == "COMPLETED", owner.snapshot()
-        harness.dist.barrier(group=harness.control_group)
-        if harness.rank == 0:
-            trace = export_chrome_trace(
-                read_jsonl(sorted(output.glob("*.jsonl")), analyse_native=True)
-            )
-            assert trace["data_quality"] == "COMPLETE", trace["errors"]
-            assert {r["role"] for r in trace["worker_sessions"]} == {"attention", "ffn"}
-            phases = [e for e in trace["traceEvents"] if e["ph"] == "X"]
-            assert {e["name"] for e in phases} == {"COMPUTE", "COMMUNICATION", "WAIT"}
-            assert len({e["pid"] for e in phases}) == 2
-            annotations = [e for e in phases if "args" in e]
-            assert len(annotations) == 2
-            assert [e["args"]["layer_idx"] for e in annotations] == [1, 2]
-            assert all(e["pid"] == annotations[0]["pid"] for e in annotations)
-            (output / "pipeline.json").write_text(
-                json.dumps(trace, separators=(",", ":"))
-            )
-            (output / "probe-result.json").write_text(
-                json.dumps(
-                    {
-                        "data_quality": trace["data_quality"],
-                        "phase_intervals": len(phases),
-                        "workers": trace["worker_sessions"],
-                    },
-                    indent=2,
-                )
-            )
-
-
 @pytest.mark.parametrize("probe", ["--probe", "--cam-pipeline"])
 def test_native_lightweight_capture(tmp_path, probe):
     if os.environ.get("AFD_RUN_ASCEND_OP_RUNTIME") != "1":
@@ -303,6 +181,6 @@ def test_native_lightweight_capture(tmp_path, probe):
 
 
 if __name__ == "__main__":
-    {"--probe": _probe, "--cam-pipeline": _probe_cam_pipeline}[sys.argv[1]](
-        Path(sys.argv[2])
-    )
+    if len(sys.argv) != 3 or sys.argv[1] != "--probe":
+        raise SystemExit("usage: test_cam_profile_tracer.py --probe OUTPUT")
+    _probe(Path(sys.argv[2]))

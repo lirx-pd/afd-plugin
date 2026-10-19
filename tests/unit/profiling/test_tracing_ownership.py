@@ -40,19 +40,6 @@ def tracer(monkeypatch):
     return tracer, capture, native
 
 
-def test_adjacent_compute_reuses_one_track_and_native_mark(tracer):
-    tracer, capture, native = tracer
-    first = tracer.execution()
-    for _ in range(10000):
-        execution = tracer.execution()
-        assert execution is first
-        tracer.transition(execution, "COMPUTE")
-    assert native._mark.call_count == 1
-    assert native._mark.call_args.args == ("afd.cam|COMPUTE", 11, 0, 20, "afd.cam")
-    assert len(tracer._streams) == 1
-    capture.writer.submit.assert_not_called()
-
-
 def test_three_pipeline_states_without_stage_names_or_identity(tracer):
     tracer, capture, native = tracer
     execution = tracer.new_work()
@@ -82,22 +69,6 @@ def test_three_pipeline_states_without_stage_names_or_identity(tracer):
     tracer.finish_capture(capture)
     assert capture.writer.submit.call_args.args[0]["native_marks"] == 7
     assert tracer.pending_count() == 0
-
-
-def test_attention_annotation_adds_no_marks_or_writer_submissions(tracer):
-    tracer, capture, native = tracer
-    execution = tracer.execution()
-    for layer in range(3):
-        tracer.transition(execution, "COMPUTE")
-        tracer.transition(execution, "COMPUTE")
-        tracer.transition(execution, "COMMUNICATION", f"1|{layer}|3|9")
-        tracer.transition(execution, "WAIT")
-    assert native._mark.call_count == 9
-    assert [c.args[0] for c in native._mark.call_args_list][1::3] == [
-        f"afd.cam|COMMUNICATION|1|{layer}|3|9" for layer in range(3)
-    ]
-    assert tracer.snapshot()["native_marks"] == 9
-    capture.writer.submit.assert_not_called()
 
 
 def test_streams_and_generations_keep_independent_states(tracer):

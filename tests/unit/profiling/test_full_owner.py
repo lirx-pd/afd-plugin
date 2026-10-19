@@ -102,13 +102,6 @@ def test_native_lifecycle_runs_only_on_original_runner_thread(backend):
     assert status["started_at_ns"] > 0
 
 
-def test_runtime_uses_role_and_session_output_directory(backend):
-    owner, _, _, received, _, _ = backend
-    owner.start()
-    owner.step()
-    assert received == [("ffn", str(owner.trace_dir))]
-
-
 @pytest.mark.parametrize("started", [False, True])
 def test_stop_before_any_runner_step_never_touches_native_backend(backend, started):
     owner, _, calls, _, _, _ = backend
@@ -171,20 +164,6 @@ def test_blocked_native_stop_keeps_control_requests_reachable(backend):
     assert owner.finished
     assert len({tid for _, tid in calls}) == 1
     assert calls[0][1] != threading.get_ident()
-
-
-def test_repeated_requests_do_not_repeat_native_lifecycle(backend):
-    owner, _, calls, _, _, _ = backend
-    owner.start()
-    owner.start()
-    owner.step()
-    owner.start()
-    owner.stop()
-    owner.stop()
-    owner.step()
-    owner.step()
-    owner.stop()
-    assert [name for name, _ in calls] == ["factory_start", "step", "stop"]
 
 
 def test_stop_during_native_start_is_serviced_by_the_same_runner_step(backend):

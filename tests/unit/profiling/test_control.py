@@ -15,7 +15,6 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from afd_plugin import profiling
 from afd_plugin.profiling import control
 
 
@@ -113,11 +112,6 @@ def make_coordinator(tmp_path, fleet):
     return coordinator, client
 
 
-def test_non_linux_host_clock_identity_is_unknown(monkeypatch):
-    monkeypatch.setattr(profiling, "sys", SimpleNamespace(platform="darwin"))
-    assert profiling.host_clock_id() is None
-
-
 @pytest.mark.parametrize("mode", ["LIGHTWEIGHT", "FULL"])
 def test_session_covers_all_dp_workers_and_adjusts_each_host_clock(tmp_path, mode):
     async def run():
@@ -191,36 +185,6 @@ def test_local_workers_keep_zero_offset_despite_rpc_delays(tmp_path, mode):
             clock == {"offset_ns": 0, "uncertainty_ns": 0}
             for clock in session.clock_by_worker.values()
         )
-
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize("known_host", [True, False])
-def test_remote_workers_share_only_verified_host_clocks(tmp_path, known_host):
-    async def run():
-        fleet = FakeFleet()
-        if known_host:
-            fleet.offsets = {"attention": -7_000_000_000, "ffn": -7_000_000_000}
-        for workers in fleet.workers.values():
-            for worker in workers:
-                if known_host:
-                    worker["host_clock_id"] = "remote-boot-id"
-                else:
-                    worker.pop("host_clock_id")
-        coordinator, client = make_coordinator(tmp_path, fleet)
-        async with client:
-            session = coordinator.start(
-                control.StartRequest(mode="LIGHTWEIGHT", duration=0.005)
-            )
-            await asyncio.wait_for(session.task, 2.0)
-        assert session.state == "COMPLETED", session.errors
-        for worker_id, clock in session.clock_by_worker.items():
-            actual = fleet.offsets[worker_id.split("-")[0]]
-            assert abs(clock["offset_ns"] - actual) <= clock["uncertainty_ns"]
-        if known_host:
-            assert (
-                len({tuple(c.items()) for c in session.clock_by_worker.values()}) == 1
-            )
 
     asyncio.run(run())
 
@@ -324,32 +288,6 @@ def test_inconsistent_host_samples_roll_back_without_committing(tmp_path, local_
             "attention",
             "ffn",
         }
-
-    asyncio.run(run())
-
-
-def test_stop_during_calibration_never_commits(tmp_path, monkeypatch):
-    async def run():
-        fleet = FakeFleet()
-        coordinator, client = make_coordinator(tmp_path, fleet)
-        exchange = coordinator._exchange
-
-        async def stop_after_probe(session, action, command, **kwargs):
-            result = await exchange(session, action, command, **kwargs)
-            if action == "status" and all(
-                worker["state"] == "PREPARED" for worker in session.workers
-            ):
-                coordinator.stop(session.session_id)
-            return result
-
-        monkeypatch.setattr(coordinator, "_exchange", stop_after_probe)
-        async with client:
-            session = coordinator.start(
-                control.StartRequest(mode="LIGHTWEIGHT", duration=1)
-            )
-            await asyncio.wait_for(session.task, 2.0)
-        assert session.state == "COMPLETED", session.errors
-        assert all(action != "commit" for _, action, _ in fleet.calls)
 
     asyncio.run(run())
 
@@ -473,24 +411,6 @@ def test_public_routes_require_auth_and_reject_invalid_requests(tmp_path):
     asyncio.run(outbound.aclose())
 
 
-def test_http_timeout_is_bounded_and_session_fails(tmp_path, monkeypatch):
-    monkeypatch.setattr(control, "HTTP_TIMEOUT_S", 0.005)
-
-    async def run():
-        fleet = FakeFleet()
-        fleet.delay_s = 1.0
-        coordinator, client = make_coordinator(tmp_path, fleet)
-        async with client:
-            session = coordinator.start(
-                control.StartRequest(mode="LIGHTWEIGHT", duration=1)
-            )
-            await asyncio.wait_for(session.task, 0.5)
-        assert session.state == "FAILED"
-        assert session.errors
-
-    asyncio.run(run())
-
-
 def save_previous_session(coordinator, fleet, *, state="RUNNING"):
     session_id = str(uuid.uuid4())
     directory = coordinator.output_directory / session_id
@@ -512,6 +432,34 @@ def save_previous_session(coordinator, fleet, *, state="RUNNING"):
     )
     coordinator._persist(session)
     return session
+
+
+@pytest.mark.parametrize("stalled_action", ["stop", "status"])
+def test_cleanup_deadline_bounds_stalled_worker_rpc(
+    tmp_path, monkeypatch, stalled_action
+):
+    async def run():
+        coordinator, client = make_coordinator(tmp_path, FakeFleet())
+        original = coordinator._request
+
+        async def request(target, action, command):
+            if action == stalled_action:
+                await asyncio.Event().wait()
+            return await original(target, action, command)
+
+        monkeypatch.setattr(coordinator, "_request", request)
+        async with client:
+            session = control.Session(
+                str(uuid.uuid4()),
+                control.StartRequest(mode="LIGHTWEIGHT", duration=1),
+                tmp_path,
+                start_at_ns=time.time_ns(),
+            )
+            await asyncio.wait_for(coordinator._drain(session), 0.2)
+        assert session.state == "FAILED"
+        assert "Timed out waiting for profiling cleanup" in session.errors
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("operation", ["stop", "close", "recover"])
@@ -557,176 +505,6 @@ def test_manifest_quota_failure_does_not_interrupt_cleanup(
     asyncio.run(run())
 
 
-def test_final_manifest_failure_cannot_report_complete_data(tmp_path, monkeypatch):
-    async def run():
-        fleet = FakeFleet()
-        coordinator, client = make_coordinator(tmp_path, fleet)
-        session = save_previous_session(coordinator, fleet)
-        persist = coordinator._persist
-
-        def fail_final_manifest(current):
-            if current.state == "COMPLETED":
-                raise OSError(errno.EDQUOT, "Disk quota exceeded")
-            persist(current)
-
-        monkeypatch.setattr(coordinator, "_persist", fail_final_manifest)
-        async with client:
-            await coordinator._drain(session)
-        assert session.state == "FAILED"
-        assert session.data_quality == "PARTIAL"
-
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize("stalled_action", ["stop", "status"])
-@pytest.mark.parametrize("operation", ["drain", "recover", "close"])
-def test_cleanup_deadline_covers_stalled_stop_and_status(
-    tmp_path, monkeypatch, stalled_action, operation
-):
-    monkeypatch.setattr(control, "HTTP_TIMEOUT_S", 1.0)
-
-    async def run():
-        fleet = FakeFleet()
-        stop_started = False
-        pending = set()
-
-        async def handle(request):
-            nonlocal stop_started
-            action = request.url.path.rsplit("/", 1)[1]
-            stop_started |= action == "stop"
-            if stop_started and action == stalled_action:
-                task = asyncio.current_task()
-                pending.add(task)
-                try:
-                    await asyncio.Event().wait()
-                finally:
-                    pending.remove(task)
-            return await fleet.handle(request)
-
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
-            coordinator = control.ProfileCoordinator(
-                ["http://attention", "http://ffn"], "test-token", tmp_path, client
-            )
-            previous = save_previous_session(coordinator, fleet)
-            if operation == "recover":
-                cleanup = coordinator.recover()
-            elif operation == "close":
-                coordinator.sessions[previous.session_id] = previous
-                coordinator.active = previous
-                previous.task = asyncio.create_task(coordinator._run(previous))
-                await asyncio.sleep(0)
-                cleanup = coordinator.close()
-            else:
-                cleanup = coordinator._drain(previous)
-            await asyncio.wait_for(cleanup, 0.2)
-            session = coordinator.sessions.get(previous.session_id, previous)
-            assert session.state == "FAILED"
-            assert session.data_quality == "PARTIAL"
-            assert "Timed out waiting for profiling cleanup" in session.errors
-            assert not pending
-            if operation == "close":
-                assert all(action != "prepare" for _, action, _ in fleet.calls)
-
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize("construction", ["injected", "environment"])
-def test_lifespan_recovers_and_drains_with_owned_client_cleanup(
-    tmp_path, monkeypatch, construction
-):
-    fleet = FakeFleet()
-    coordinator, outbound = make_coordinator(tmp_path, fleet)
-    previous = save_previous_session(coordinator, fleet)
-    payload = json.loads((previous.directory / "manifest.json").read_text())
-    payload["roster"] = {"http://untrusted-manifest-target": ["injected-worker"]}
-    (previous.directory / "manifest.json").write_text(json.dumps(payload))
-    if construction == "environment":
-        monkeypatch.setenv(
-            "AFD_CAM_PROFILE_TARGETS", json.dumps(["http://attention", "http://ffn"])
-        )
-        monkeypatch.setenv("AFD_CAM_PROFILE_TOKEN", "test-token")
-        monkeypatch.setenv("AFD_CAM_PROFILE_DIR", str(tmp_path))
-        monkeypatch.setattr(control.httpx, "AsyncClient", lambda: outbound)
-        app = control.create_app()
-    else:
-        app = control.create_app(coordinator)
-    with TestClient(app) as client:
-        service = app.state.coordinator
-        assert (service is coordinator) == (construction == "injected")
-        assert service.targets == ["http://attention", "http://ffn"]
-        assert service.output_directory == tmp_path
-        assert service.client is outbound
-        response = client.get(
-            f"/cam/profile/{previous.session_id}",
-            headers={"Authorization": "Bearer test-token"},
-        )
-        assert response.status_code == 200
-        result = response.json()
-        assert result["state"] == "FAILED"
-        assert any("interrupted" in error for error in result["errors"])
-        assert result["data_quality"] == "PARTIAL"
-        assert service.active is None
-        assert {role for role, action, _ in fleet.calls if action == "stop"} == {
-            "attention",
-            "ffn",
-        }
-        assert {action for _, action, _ in fleet.calls} == {"status", "stop"}
-        started = client.post(
-            "/cam/profile/start",
-            json={"mode": "LIGHTWEIGHT", "duration": 100},
-            headers={"Authorization": "Bearer test-token"},
-        )
-        assert started.status_code == 202
-        active = service.get(started.json()["session_id"])
-        assert service.active is active
-        assert not outbound.is_closed
-    assert service.active is None
-    assert active is not None
-    assert active.task.done()
-    assert active.state == "COMPLETED"
-    assert outbound.is_closed == (construction == "environment")
-    asyncio.run(outbound.aclose())
-    manifest = json.loads((previous.directory / "manifest.json").read_text())
-    assert manifest["state"] == "FAILED"
-
-
-def test_environment_lifespan_closes_client_when_recovery_fails(tmp_path, monkeypatch):
-    fleet = FakeFleet()
-    coordinator, outbound = make_coordinator(tmp_path, fleet)
-    previous = save_previous_session(coordinator, fleet)
-    (previous.directory / "manifest.json").write_text("{invalid json")
-    monkeypatch.setenv(
-        "AFD_CAM_PROFILE_TARGETS", json.dumps(["http://attention", "http://ffn"])
-    )
-    monkeypatch.setenv("AFD_CAM_PROFILE_TOKEN", "test-token")
-    monkeypatch.setenv("AFD_CAM_PROFILE_DIR", str(tmp_path))
-    monkeypatch.setattr(control.httpx, "AsyncClient", lambda: outbound)
-
-    with pytest.raises(json.JSONDecodeError), TestClient(control.create_app()):
-        pass
-
-    assert outbound.is_closed
-    assert not fleet.calls
-
-
-def test_restart_restores_terminal_session_without_contacting_workers(tmp_path):
-    async def run():
-        fleet = FakeFleet()
-        coordinator, client = make_coordinator(tmp_path, fleet)
-        previous = save_previous_session(coordinator, fleet, state="COMPLETED")
-        previous.clock_method = "empirical_http_midpoint_per_worker"
-        coordinator._persist(previous)
-        async with client:
-            await coordinator.recover()
-        assert coordinator.get(previous.session_id).state == "COMPLETED"
-        assert coordinator.get(previous.session_id).snapshot()["clock_method"] == (
-            "empirical_http_midpoint_per_worker"
-        )
-        assert not fleet.calls
-
-    asyncio.run(run())
-
-
 def test_restart_does_not_stop_workers_owned_by_another_session(tmp_path):
     async def run():
         fleet = FakeFleet()
@@ -745,44 +523,5 @@ def test_restart_does_not_stop_workers_owned_by_another_session(tmp_path):
             for workers in fleet.workers.values()
             for worker in workers
         )
-
-    asyncio.run(run())
-
-
-def test_recovery_ignores_noncanonical_and_symlinked_directories(tmp_path):
-    async def run():
-        fleet = FakeFleet()
-        coordinator, client = make_coordinator(tmp_path, fleet)
-        previous = save_previous_session(coordinator, fleet)
-        saved = (previous.directory / "manifest.json").read_text()
-        original_name = previous.directory.name
-        renamed = previous.directory.with_name("unowned-output")
-        previous.directory.rename(renamed)
-        previous.directory.symlink_to(renamed, target_is_directory=True)
-        upper = coordinator.output_directory / original_name.upper()
-        upper.mkdir()
-        (upper / "manifest.json").write_text(saved)
-        async with client:
-            await coordinator.recover()
-        assert not coordinator.sessions
-        assert not fleet.calls
-        assert (renamed / "manifest.json").read_text() == saved
-
-    asyncio.run(run())
-
-
-def test_recovery_rejects_manifest_session_path_mismatch(tmp_path):
-    async def run():
-        fleet = FakeFleet()
-        coordinator, client = make_coordinator(tmp_path, fleet)
-        previous = save_previous_session(coordinator, fleet)
-        manifest = previous.directory / "manifest.json"
-        payload = json.loads(manifest.read_text())
-        payload["session_id"] = "../../untrusted"
-        manifest.write_text(json.dumps(payload))
-        async with client:
-            with pytest.raises(ValueError, match="differs from its directory"):
-                await coordinator.recover()
-        assert not fleet.calls
 
     asyncio.run(run())

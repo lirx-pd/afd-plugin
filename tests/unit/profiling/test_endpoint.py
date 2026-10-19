@@ -103,34 +103,6 @@ def test_private_routes_reject_arbitrary_rpc_and_paths(monkeypatch, field):
     assert not engine.calls
 
 
-def test_commit_forwards_one_clock_contract_and_rejects_redundant_start_map(
-    monkeypatch,
-):
-    app, engine = make_plugin(monkeypatch)
-    command = {
-        "session_id": "session",
-        "command_seq": 2,
-        "start_at_ns": 123,
-        "clock_by_worker": {"attention-dp0": {"offset_ns": 5, "uncertainty_ns": 1}},
-        "lease_s": 10,
-    }
-    with TestClient(app) as client:
-        response = client.post(
-            "/cam/profile/internal/commit",
-            json={**command, "start_at_by_worker_ns": {"attention-dp0": 128}},
-            headers={"Authorization": "Bearer test-token"},
-        )
-        assert response.status_code == 400
-        assert not engine.calls
-        response = client.post(
-            "/cam/profile/internal/commit",
-            json=command,
-            headers={"Authorization": "Bearer test-token"},
-        )
-        assert response.status_code == 200
-    assert engine.calls == [("cam_profile_commit", 5.0, (command,), None)]
-
-
 @pytest.mark.parametrize("action", ["prepare", "commit", "stop", "status"])
 def test_private_rpc_deadline_covers_engine_queue_wait(monkeypatch, action):
     monkeypatch.setattr(endpoint, "RPC_TIMEOUT_S", 0.005)

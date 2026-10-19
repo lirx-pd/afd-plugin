@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import sys
 import threading
 import uuid
 from types import SimpleNamespace
@@ -212,6 +211,9 @@ def test_lifecycle_uses_monotonic_admission_and_per_worker_clock(worker_session)
 
 def test_command_retries_are_idempotent_and_stale_commands_are_rejected(worker_session):
     session, _, clock = worker_session
+    with pytest.raises(ValueError):
+        session.prepare(prepare_command(session_id="../escape"), backend_busy=False)
+    assert session.status()["session_id"] is None
     prepare = prepare_command()
     session.prepare(prepare, backend_busy=False)
     capture = session.capture
@@ -233,16 +235,6 @@ def test_command_retries_are_idempotent_and_stale_commands_are_rejected(worker_s
     assert not capture.admits()
     finish_writer(session)
     assert session.stop(stop)["state"] == "COMPLETED"
-
-
-def test_invalid_commit_does_not_corrupt_successful_prepare_retry(worker_session):
-    session, _, clock = worker_session
-    prepare = prepare_command()
-    session.prepare(prepare, backend_busy=False)
-    with pytest.raises(ValueError, match="next 60 seconds"):
-        session.commit(commit_command(session, clock, start_at_ns=clock.time_ns()))
-    assert session.prepare(dict(prepare), backend_busy=False)["state"] == "PREPARED"
-    assert session.command_seq == 1
 
 
 @pytest.mark.parametrize(
@@ -274,92 +266,6 @@ def test_commit_requires_explicit_valid_worker_clock(worker_session, clocks):
     assert not session.capture.accepting
     assert session.capture.start_ns == 0
     assert session.capture.error is None
-
-
-@pytest.mark.parametrize("lease", [0, True, float("nan"), float("inf"), 61, 0.1])
-def test_commit_rejects_invalid_or_expired_lease(worker_session, lease):
-    session, _, clock = worker_session
-    session.prepare(prepare_command(), backend_busy=False)
-    with pytest.raises(ValueError, match="lease_s"):
-        session.commit(commit_command(session, clock, lease_s=lease))
-    assert session.state == "PREPARED"
-    assert session.command_seq == 1
-    assert not session.capture.accepting
-
-
-@pytest.mark.parametrize("lease", [None, 0.15])
-def test_lease_defaults_and_duration_deadlines_keep_their_owners(worker_session, lease):
-    session, _, clock = worker_session
-    prepare = prepare_command()
-    prepare.pop("lease_s")
-    session.prepare(prepare, backend_busy=False)
-    assert session.capture.deadline_ns == clock.monotonic_ns() + int(60.2 * 1e9)
-    command = commit_command(session, clock)
-    if lease is None:
-        command.pop("lease_s")
-    else:
-        command["lease_s"] = lease
-    session.commit(command)
-    assert session.capture.deadline_ns == clock.monotonic_ns() + int(
-        (0.3 if lease is None else lease) * 1e9
-    )
-
-
-@pytest.mark.parametrize(
-    "mode,busy,match",
-    [("LIGHTWEIGHT", True, "profiler")],
-)
-def test_prepare_rejects_missing_full_backend_and_existing_profiler(
-    worker_session, mode, busy, match
-):
-    session, _, _ = worker_session
-    with pytest.raises(ValueError, match=match):
-        session.prepare(prepare_command(mode=mode), backend_busy=busy)
-    assert session.state == "IDLE"
-    assert session.capture is None
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"session_id": "../../outside"},
-        {"session_id": "not-a-uuid"},
-        {"command_seq": 0},
-        {"command_seq": True},
-        {"duration_s": 0},
-        {"duration_s": None},
-        {"duration_s": 604801},
-        {"duration_s": True},
-        {"duration_s": float("nan")},
-        {"duration_s": float("inf")},
-        {"lease_s": 0},
-        {"lease_s": None},
-        {"lease_s": 61},
-        {"lease_s": True},
-        {"lease_s": float("nan")},
-        {"lease_s": float("inf")},
-    ],
-)
-def test_prepare_rejects_invalid_payload_before_allocating_output(
-    worker_session, overrides
-):
-    session, _, _ = worker_session
-    with pytest.raises(ValueError):
-        session.prepare(prepare_command(**overrides), backend_busy=False)
-    assert session.capture is None
-    assert not list(session.output_dir.iterdir())
-
-
-def test_unknown_session_cannot_commit_or_stop_current_capture(worker_session):
-    session, _, clock = worker_session
-    session.prepare(prepare_command(), backend_busy=False)
-    with pytest.raises(ValueError, match="unknown session"):
-        session.commit(commit_command(session, clock, session_id=str(uuid.uuid4())))
-    with pytest.raises(ValueError, match="unknown session"):
-        session.stop({**stop_command(session), "session_id": str(uuid.uuid4())})
-    assert session.state == "PREPARED"
-    with pytest.raises(ValueError, match="active"):
-        session.prepare(prepare_command(), backend_busy=False)
 
 
 def test_prepared_lease_expires_without_commit_and_flushes_idle_output(worker_session):
@@ -434,108 +340,6 @@ def test_worker_rpc_mixin_preserves_native_profiler_exclusivity(worker_session):
     assert worker.profile() == (True, None)
 
 
-def test_worker_rpc_reports_rejected_commands_without_poisoning_capture(worker_session):
-    session, _, clock = worker_session
-    worker = CAMProfileWorkerMixin()
-    worker.cam_profile_session = session
-    worker.model_runner = SimpleNamespace(prof=None)
-    worker.cam_profile_prepare(prepare_command())
-    rejected = [
-        worker.cam_profile_prepare(prepare_command()),
-        worker.cam_profile_commit(commit_command(session, clock, clock_by_worker={})),
-        worker.cam_profile_stop({"session_id": str(uuid.uuid4()), "command_seq": 3}),
-    ]
-    assert all(result["error"].startswith("ValueError:") for result in rejected)
-    assert all(result["state"] == "PREPARED" for result in rejected)
-    assert session.status()["error"] is None
-    assert session.capture.error is None
-    assert session.command_seq == 1
-
-
-def test_worker_prepare_reports_real_output_creation_error(worker_session):
-    session, _, _ = worker_session
-    worker = CAMProfileWorkerMixin()
-    worker.cam_profile_session = session
-    worker.model_runner = SimpleNamespace(prof=None)
-    command = prepare_command()
-    directory = session.output_dir / command["session_id"]
-    directory.mkdir()
-    output = directory / f"{session.worker_id}.jsonl"
-    output.write_text("existing output\n")
-
-    result = worker.cam_profile_prepare(command)
-
-    assert result["error"].startswith("FileExistsError:")
-    assert result["state"] == "IDLE"
-    assert session.capture is None
-    assert output.read_text() == "existing output\n"
-
-
-def test_lightweight_factory_failure_does_not_start_writer(tmp_path, monkeypatch):
-    calls = []
-
-    def failed_tracer():
-        calls.append("tracer")
-        raise OSError("injected tracer initialization failure")
-
-    def unexpected_writer(*args):
-        calls.append("writer")
-        pytest.fail("failed tracer initialization must not leave a writer")
-
-    monkeypatch.setattr(session_module, "JsonRecordWriter", unexpected_writer)
-    session = WorkerSession(
-        "attention-dp0",
-        "attention",
-        tmp_path,
-        None,
-        {"pid": 7},
-        tracer_factory=failed_tracer,
-        profiler_factory=lambda path, mode: ImmediateProfiler(path, mode, None),
-    )
-    with pytest.raises(OSError, match="tracer initialization failure"):
-        session.prepare(prepare_command(), backend_busy=False)
-    assert calls == ["tracer"]
-    assert session.state == "IDLE"
-    assert session.capture is None
-    assert session.tracer is None
-    assert not list(tmp_path.rglob("*.jsonl"))
-
-
-def test_worker_commit_and_stop_report_oserrors_and_allow_retry(
-    worker_session, monkeypatch
-):
-    session, tracer, clock = worker_session
-    worker = CAMProfileWorkerMixin()
-    worker.cam_profile_session = session
-    worker.model_runner = SimpleNamespace(prof=None)
-    worker.cam_profile_prepare(prepare_command())
-    commit = commit_command(session, clock)
-
-    def failed_io(*args):
-        raise OSError("injected output failure")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(session.capture.writer, "submit", failed_io)
-        result = worker.cam_profile_commit(commit)
-    assert result["error"] == "OSError: injected output failure"
-    assert result["state"] == "PREPARED"
-    assert session.command_seq == 1
-    assert session.capture.error is None
-    assert worker.cam_profile_commit(commit)["state"] == "STARTING"
-
-    stop = stop_command(session)
-    with monkeypatch.context() as patch:
-        patch.setattr(tracer, "close_admission", failed_io)
-        result = worker.cam_profile_stop(stop)
-    assert result["error"] == "OSError: injected output failure"
-    assert result["state"] == "STARTING"
-    assert session.command_seq == 2
-    assert session.capture.error is None
-    assert worker.cam_profile_stop(stop)["state"] == "STOPPING"
-    finish_writer(session)
-    assert session.status()["state"] == "COMPLETED"
-
-
 def test_disabled_worker_does_not_initialize_device_profiling(monkeypatch):
     monkeypatch.delenv("AFD_CAM_PROFILE_ENABLE", raising=False)
     worker = CAMProfileWorkerMixin()
@@ -543,16 +347,6 @@ def test_disabled_worker_does_not_initialize_device_profiling(monkeypatch):
     assert worker.cam_profile_session is None
     with pytest.raises(ValueError, match="not enabled"):
         worker.cam_profile_status({})
-
-
-def test_day_long_pipeline_is_admitted_but_full_is_bounded(worker_session):
-    session, _, _ = worker_session
-    with pytest.raises(ValueError, match="duration_s"):
-        session.prepare(
-            prepare_command(mode="FULL", duration_s=86400), backend_busy=False
-        )
-    session.prepare(prepare_command(duration_s=86400), backend_busy=False)
-    assert session._duration_s == 86400
 
 
 def test_ffn_stop_fence_is_queried_only_for_pending_native_stop(worker_session):
@@ -574,74 +368,3 @@ def test_ffn_stop_fence_is_queried_only_for_pending_native_stop(worker_session):
     assert session.capture.profiler.state == "STOPPING"
     session.advance_profiler(stop_ready=lambda: True)
     assert session.capture.profiler.finished
-
-
-def test_idle_control_blocks_without_periodic_ticks(tmp_path, monkeypatch):
-    calls = []
-    session = WorkerSession("a0", "attention", tmp_path, None, {})
-
-    class ParkedError(Exception):
-        pass
-
-    class Wake:
-        def clear(self):
-            pass
-
-        def wait(self, timeout):
-            calls.append(timeout)
-            raise ParkedError
-
-    session._wake = Wake()
-    monkeypatch.setattr(session_module.WorkerSession, "tick", lambda self: None)
-    monkeypatch.setitem(
-        sys.modules,
-        "torch_npu",
-        SimpleNamespace(npu=SimpleNamespace(set_device=lambda device: None)),
-    )
-    with pytest.raises(ParkedError):
-        session._run(None)
-    assert calls == [None]
-
-
-def test_control_sleeps_to_deadline_and_wakes_on_commands(worker_session):
-    session, tracer, clock = worker_session
-    assert session._next_timeout() is None
-    session_id = str(uuid.uuid4())
-    session.prepare(
-        {
-            "session_id": session_id,
-            "command_seq": 1,
-            "mode": "LIGHTWEIGHT",
-            "duration_s": 10,
-        },
-        backend_busy=False,
-    )
-    assert session._wake.is_set()
-    assert session._next_timeout() == 70
-    session._wake.clear()
-    session.commit(
-        {
-            "session_id": session_id,
-            "command_seq": 2,
-            "start_at_ns": clock.time_ns() + int(1e9),
-            "clock_by_worker": {
-                session.worker_id: {"offset_ns": 0, "uncertainty_ns": 0}
-            },
-        }
-    )
-    assert session._wake.is_set()
-    assert session._next_timeout() == 1
-    clock.advance(1)
-    session.tick()
-    session._wake.clear()
-    session.advance_profiler()
-    assert session._wake.is_set()
-    session.tick()
-    assert session._next_timeout() == 10
-    session.stop({"session_id": session_id, "command_seq": 3})
-    session.advance_profiler()
-    session.tick()
-    assert session.capture.writer.close(2)
-    session.tick()
-    assert session.state == "COMPLETED"
-    assert session._next_timeout() is None

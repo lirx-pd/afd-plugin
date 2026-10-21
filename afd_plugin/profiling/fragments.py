@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Immutable CPU input identity and request-local execution fragments."""
+"""Build request-local identity fragments from immutable CPU batch snapshots.
+
+InputSnapshot freezes runner metadata; build_fragments intersects token slices
+with real queries, excluding padding. These helpers serve the older format
+read by analyze.py; current LIGHTWEIGHT uses model.py's scalar annotations.
+"""
 
 from __future__ import annotations
 

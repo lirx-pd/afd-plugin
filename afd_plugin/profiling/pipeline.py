@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Aligned pipeline tracks with optional Attention dispatch annotations."""
+"""Reconstruct and export aligned COMPUTE/COMMUNICATION/WAIT stream tracks.
+
+analyze.py uses these helpers to align native marks, FFN graph DR/CS boundaries
+or older spans with session clocks. Export preserves streams and dispatch
+counts, reports incomplete coverage and never infers request/layer pairing.
+"""
 
 from __future__ import annotations
 

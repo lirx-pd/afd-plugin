@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Bounded background JSONL output for CAM profiling records."""
+"""Persist worker records and finalized LIGHTWEIGHT native output off-thread.
+
+WorkerSession's bounded JSONL writer reports drops, errors and flush status.
+RuntimeProfiler's archive thread verifies durable gzip output before deleting
+raw files. analyze.py/native_trace.py consume these artifacts offline.
+"""
 
 from __future__ import annotations
 

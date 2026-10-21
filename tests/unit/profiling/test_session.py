@@ -309,11 +309,39 @@ def test_writer_flush_timeout_fails_and_blocks_reuse_until_closed(
         assert session.capture.writer.close(1.0)
 
 
-def test_worker_rpc_mixin_preserves_native_profiler_exclusivity(worker_session):
+@pytest.mark.parametrize("delayed_start", [False, True])
+@pytest.mark.parametrize("automatic_stop", [False, True])
+def test_worker_rpc_mixin_preserves_native_profiler_exclusivity(
+    worker_session, delayed_start, automatic_stop
+):
     session, _, _ = worker_session
 
+    class NativeProfiler:
+        # Model the pinned WorkerProfiler's delayed start and max-iteration stop.
+        def start(self):
+            self._active = True
+            self.is_running = not delayed_start
+
+        def step(self):
+            if self.is_running:
+                self.stop()
+            elif self._active:
+                self.is_running = True
+
+        def stop(self):
+            self._active = False
+            self.is_running = False
+
     class NativeWorker:
+        profiler: NativeProfiler | None = None
+
         def profile(self, is_start=True, profile_prefix=None):
+            if self.profiler is None:
+                self.profiler = NativeProfiler()
+            if is_start:
+                self.profiler.start()
+            else:
+                self.profiler.stop()
             return is_start, profile_prefix
 
     class Worker(CAMProfileWorkerMixin, NativeWorker):
@@ -321,16 +349,26 @@ def test_worker_rpc_mixin_preserves_native_profiler_exclusivity(worker_session):
 
     worker = Worker()
     worker.cam_profile_session = session
-    worker.profiler = None
     worker.model_runner = SimpleNamespace(prof=None)
     assert worker.cam_profile_status({})["state"] == "IDLE"
     assert worker.profile(True, "native") == (True, "native")
-    worker.profiler = object()
+    assert worker.profiler is not None
+    if delayed_start:
+        assert not worker.profiler.is_running
+        assert "profiler" in worker.cam_profile_prepare(prepare_command())["error"]
+        worker.profiler.step()
+    assert worker.profiler.is_running
     rejected = worker.cam_profile_prepare(prepare_command())
     assert "profiler" in rejected["error"]
     assert session.status()["error"] is None
-    assert worker.profile(False, "native") == (False, "native")
-    assert worker.profiler is not None
+    if automatic_stop:
+        worker.profiler.step()
+    else:
+        assert worker.profile(False, "native") == (False, "native")
+    assert not worker.profiler._active
+    worker.model_runner.prof = object()
+    assert "profiler" in worker.cam_profile_prepare(prepare_command())["error"]
+    worker.model_runner.prof = None
     assert worker.cam_profile_prepare(prepare_command())["state"] == "PREPARED"
     with pytest.raises(ValueError, match="runtime CAM"):
         worker.profile()

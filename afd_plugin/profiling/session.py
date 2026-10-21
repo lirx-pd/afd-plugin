@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Worker-owned profiling commands and admission deadlines."""
+"""Own one worker's capture state, command ordering and admission window.
+
+Worker RPCs prepare/commit/stop leased captures; the control thread enforces
+deadlines and writes summaries through storage.py. The model thread advances
+native.py; tracing.py controls LIGHTWEIGHT admission. Native failures block reuse.
+"""
 
 from __future__ import annotations
 

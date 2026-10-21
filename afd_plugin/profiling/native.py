@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Native profiling lifecycle, advanced only by its model-thread owner."""
+"""Adapt session lifecycle requests to the shared TorchNPU profiling backend.
+
+RuntimeProfiler holds session.py's pending requests and reports backend reuse
+state. Only the model thread advances compat.npu.profiler's backend; a separate
+thread archives finalized LIGHTWEIGHT output through storage.py.
+"""
 
 from __future__ import annotations
 

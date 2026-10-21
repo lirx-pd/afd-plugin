@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Read native phase markers or graph kernel boundaries for pipeline exports."""
+"""Import native TorchNPU artifacts for offline LIGHTWEIGHT reconstruction.
+
+analyze.py safely extracts archives and optionally runs TorchNPU parsing with
+--native. This adapter passes eager MSTX marks or FFN graph DR/CS boundaries
+to pipeline.py; parsing never runs on inference workers.
+"""
 
 from __future__ import annotations
 

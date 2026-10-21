@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Reconstruct CAM execution relationships without inferring missing clocks."""
+"""Validate saved CAM captures and export traces and statistics offline.
+
+The CLI combines manifests, worker JSONL and native_trace.py artifacts through
+pipeline.py, retaining older Event/fragment reconstruction. Missing clocks,
+records and unresolved links remain explicit quality issues.
+"""
 
 from __future__ import annotations
 

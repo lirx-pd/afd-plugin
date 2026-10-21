@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Continuous per-stream pipeline states, timed and buffered by native MSTX."""
+"""Record LIGHTWEIGHT stream phases through native MSTX transition marks.
+
+Model/connector hooks reuse stream tracks and mark COMPUTE/COMMUNICATION/WAIT
+only on transitions. WorkerSession controls admission/drain; this module bounds
+pending work, emits END and reports losses for offline native_trace.py/pipeline.py.
+"""
 
 from __future__ import annotations
 

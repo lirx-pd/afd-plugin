@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Opt-in CAM profiling without importing a device runtime at package import."""
+"""Shared startup gate, capture limits and host identity for CAM profiling.
+
+Workers and the coordinator share these device-independent helpers for startup,
+metadata layout and clock alignment. See docs/npu/CAM_PROFILING.md for the
+control -> endpoint -> worker -> session flow and offline analysis.
+"""
 
 from __future__ import annotations
 

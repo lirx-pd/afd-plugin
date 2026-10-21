@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Opt-in worker RPC ownership; importing this module does not load TorchNPU."""
+"""Bridge profiling RPCs to each Attention or FFN worker's session.
+
+The opt-in mixin wires the connector/session/backend, forwards endpoint.py RPCs
+and enforces native/static profiler exclusivity without eager TorchNPU imports.
+Attention status advances native lifecycle; FFN uses its receive-loop waiter.
+"""
 
 from __future__ import annotations
 
@@ -21,9 +26,6 @@ if TYPE_CHECKING:
     from afd_plugin.profiling.session import WorkerSession
     from afd_plugin.profiling.tracing import DeviceTracer
     from afd_plugin.v1.worker.npu.async_ffn_model_runner import AsyncNPUFFNModelRunner
-    from afd_plugin.v1.worker.npu.attention_model_runner import (
-        AFDNPUAttentionModelRunner,
-    )
     from afd_plugin.v1.worker.npu.attention_model_runner_v2 import (
         AFDNPUAttentionModelRunnerV2,
     )
@@ -33,14 +35,10 @@ if TYPE_CHECKING:
 class CAMProfileWorkerMixin:
     device: torch.device
     model_runner: (
-        AFDNPUAttentionModelRunner
-        | AFDNPUAttentionModelRunnerV2
-        | AFDNPUFFNModelRunner
-        | AsyncNPUFFNModelRunner
+        AFDNPUAttentionModelRunnerV2 | AFDNPUFFNModelRunner | AsyncNPUFFNModelRunner
     )
-    profiler: TorchNPUProfilerWrapper | None
+    profiler: TorchNPUProfilerWrapper | None = None
     cam_profile_session: WorkerSession | None = None
-    _cam_native_profiler_active = False
 
     def initialize_cam_profiling(self) -> None:
         if not runtime_profiling_enabled():
@@ -111,9 +109,11 @@ class CAMProfileWorkerMixin:
         session = self._require_cam_profile_session()
         try:
             if action == "prepare":
+                # _active covers delayed starts and clears on automatic stop.
+                # shortcut: pinned vLLM state; use a public active API when available.
                 return session.prepare(
                     command,
-                    backend_busy=self._cam_native_profiler_active
+                    backend_busy=(self.profiler is not None and self.profiler._active)
                     or self.model_runner.prof is not None,
                 )
             if action == "commit":
@@ -147,14 +147,5 @@ class CAMProfileWorkerMixin:
         ):
             raise ValueError("a runtime CAM profiling session is active")
         # ### PATCH END: CAM session exclusivity
-        if is_start:
-            self._cam_native_profiler_active = True
-        try:
-            # This mixin is composed immediately before the pinned NPUWorker.
-            result = super().profile(is_start, profile_prefix)  # type: ignore[misc]
-        except Exception:
-            if self.profiler is None:
-                self._cam_native_profiler_active = False
-            raise
-        self._cam_native_profiler_active = is_start
-        return result
+        # This mixin is composed immediately before the pinned NPUWorker.
+        return super().profile(is_start, profile_prefix)  # type: ignore[misc]

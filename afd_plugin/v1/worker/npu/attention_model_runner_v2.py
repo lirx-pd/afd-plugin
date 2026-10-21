@@ -22,8 +22,6 @@ from vllm.v1.worker.dp_utils import skip_dp_coordination
 from vllm.v1.worker.gpu import cudagraph_utils as v2_cudagraph_utils
 from vllm.v1.worker.gpu import model_runner as v2_model_runner
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
-from vllm.v1.worker.gpu.input_batch import InputBuffers
-from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
 
 from afd_plugin.compat.npu import fail_if_unsupported_npu_afd_features
@@ -292,7 +290,11 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     # BatchDescriptor. It must not create/publish an A/F transaction; ordinary
     # compute contexts still require their native eager descriptor.
     def install_afd_metadata_on_forward_context(
-        self, forward_context: ForwardContext
+        self,
+        forward_context: ForwardContext,
+        *,
+        profile_num_requests: int | None = None,
+        profile_num_tokens: int = 0,
     ) -> None:
         if (
             forward_context.batch_descriptor is None
@@ -300,7 +302,11 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             and self.vllm_config.kv_transfer_config is not None
         ):
             return
-        super().install_afd_metadata_on_forward_context(forward_context)
+        super().install_afd_metadata_on_forward_context(
+            forward_context,
+            profile_num_requests=profile_num_requests,
+            profile_num_tokens=profile_num_tokens,
+        )
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:

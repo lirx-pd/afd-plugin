@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Two completion fences keep native profiler lifecycle safe around CAM receive."""
+"""Provide FFN model-thread safe points around asynchronous CAM receive.
+
+FFNDeviceWaiter queries two untimed fences: before receive and after control
+copy/submitted work. It advances session.py's native lifecycle only at safe
+points and reads pinned control values after their nonblocking copy completes.
+"""
 
 from __future__ import annotations
 

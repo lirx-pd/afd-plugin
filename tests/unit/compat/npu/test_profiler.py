@@ -280,6 +280,7 @@ def test_lightweight_collects_only_layer_ranges_without_inline_analysis(monkeypa
         assert config[field] is False
     assert config["schedule"] is None
     experimental = config["experimental_config"]
+    assert isinstance(experimental, dict)
     assert experimental["profiler_level"] == "level_none"
     assert experimental["aic_metrics"] == "aicore_none"
     assert profiler_module.handler_kwargs == {"analyse_flag": False}
@@ -312,6 +313,7 @@ def test_graph_profiling_uses_native_kernel_collection(monkeypatch, lightweight)
     assert config["activities"] == (["npu"] if lightweight else ["cpu", "npu"])
     assert config["record_shapes"] is not lightweight
     experimental = config["experimental_config"]
+    assert isinstance(experimental, dict)
     assert experimental["profiler_level"] == ("level0" if lightweight else "level2")
     assert experimental["mstx"] is False
     assert experimental["mstx_domain_include"] == []

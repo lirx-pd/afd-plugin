@@ -83,12 +83,15 @@ def _state(runner):
     )
 
 
-def test_kv_control_context_does_not_publish_afd_metadata():
+@pytest.mark.parametrize(
+    "profile_kwargs", [{}, {"profile_num_requests": 2, "profile_num_tokens": 9}]
+)
+def test_kv_control_context_does_not_publish_afd_metadata(profile_kwargs):
     runner = _runner()
     runner.vllm_config.kv_transfer_config, runner._afd_pending_metadata = object(), None
     context = SimpleNamespace(attn_metadata=None, batch_descriptor=None)
     context.additional_kwargs, context.ubatch_slices = {}, None
-    runner.install_afd_metadata_on_forward_context(context)
+    runner.install_afd_metadata_on_forward_context(context, **profile_kwargs)
     assert context.additional_kwargs == {}
 
 

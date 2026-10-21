@@ -494,11 +494,15 @@ def test_ffn_failure_returns_pipeline_to_wait():
         raise ValueError("FFN compute failed")
 
     runner = SimpleNamespace(
-        connector=connector, prof=None, _ffn_forward_connector_driven=failed
+        connector=connector,
+        prof=None,
+        _graph=None,
+        _ffn_forward_connector_driven=failed,
     )
     method = runner_method(
         "execute_connector_driven_step",
         {
+            "torch": torch,
             "cast": cast,
             "CAMAsyncAFDConnector": SimpleNamespace,
             "runtime_profiling_enabled": lambda: True,

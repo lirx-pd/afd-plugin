@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Single-process coordinator for explicitly registered CAM profiling endpoints."""
+"""Coordinate distributed captures through an authenticated HTTP API.
+
+The standalone service discovers endpoint.py workers, calibrates clocks and
+commits a shared capture window. It polls and drains sessions and persists
+manifests for recovery and analysis; workers own the native backends.
+"""
 
 from __future__ import annotations
 

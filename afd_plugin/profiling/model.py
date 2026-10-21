@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Cache pipeline tracks at model entry and mark only phase boundaries."""
+"""Connect model execution and Attention batch metadata to stream tracing.
+
+Runner/model hooks cache tracing.py tracks for each forward and DBO child.
+CPU counts annotate dispatch without device reads; connector hooks mark phase
+changes and the runner marks WAIT only at step boundaries.
+"""
 
 from __future__ import annotations
 

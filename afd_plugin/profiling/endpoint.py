@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Opt-in vLLM endpoint plugin for the four CAM profiling worker commands."""
+"""Expose the coordinator's internal profiling commands on each vLLM server.
+
+The opt-in plugin authenticates and validates prepare/commit/stop/status, then
+uses collective RPC and the profile_rpc patch to reach every DP worker. It
+returns snapshots to control.py; session.py owns each worker's lifecycle.
+"""
 
 from __future__ import annotations
 

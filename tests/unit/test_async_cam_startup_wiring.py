@@ -53,15 +53,15 @@ def test_two_stream_attention_preflight_rejects_unqualified_modes(
 ):
     _, module, _ = modules
     connector = module.CAMAsyncAFDConnector.__new__(module.CAMAsyncAFDConnector)
-    connector.extra_info = module.AFDAsyncExtraInfo()
     connector.vllm_config = npu_vllm_config(
         enable_dbo=feature == "enable_dbo",
+        num_ubatches=2,
         use_sequence_parallel_moe=feature == "use_sequence_parallel_moe",
     )
     monkeypatch.setenv(
         "VLLM_ASCEND_ENABLE_FLASHCOMM1", "1" if feature == "flashcomm1" else "0"
     )
-    if feature is None:
+    if feature in (None, "enable_dbo"):
         connector._validate_two_stream_attention()
     else:
         with pytest.raises(ValueError, match="two-stream"):

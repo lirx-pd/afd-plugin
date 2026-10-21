@@ -210,8 +210,10 @@ including `async_dp`; enable DBO through the Attention CLI flags below.
 | `ffn_compute_aiv_num` | `int` | `24` | Positive compute Vector limit, at least twice the compute Cube count. |
 | `ffn_combine_aiv_num` | `int` | `24` | Positive send Vector limit; compute plus send Vector must fit available AIV. |
 
-For `ffn_two_stream=true`, disable Attention DBO/ubatching and disable SP and
-FlashComm1 on both roles. See [two-stream execution](ASYNC_FFN_RUNTIME.md#experimental-ffn-two-stream-execution)
+For `ffn_two_stream=true`, disable SP and FlashComm1 on both roles. Attention
+may use native DBO with two ubatches under the constraints below; it remains
+eager, and FFN must keep DBO disabled even when using FULL graph.
+See [two-stream execution](ASYNC_FFN_RUNTIME.md#experimental-ffn-two-stream-execution)
 for graph ownership, shutdown and the remaining hardware qualification gates.
 
 For a DP+SP deployment such as DP3TP2 Attention + DP2TP1/EP2 FFN, set

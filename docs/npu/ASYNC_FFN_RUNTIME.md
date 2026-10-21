@@ -19,7 +19,7 @@ F TP=1 and Attention-side gating. Both roles select
 Attention may enable native DBO or its `async_moe_ubatching` alias under the
 existing two-microbatch constraints. Enable native DBO only on Attention; FFN
 consumes CAM work items without joining Attention's DBO thread schedule.
-The experimental two-stream option below additionally requires Attention DBO off.
+The experimental two-stream option below uses the same Attention DBO contract.
 
 On F, set `AFD_ASYNC_CAM_LAYERED_GMM=1`, omit `--enforce-eager`, and pass
 `--compilation-config '{"cudagraph_mode":"FULL"}'`. To select eager explicitly,
@@ -98,8 +98,14 @@ Attention capabilities fail through pre-HCCL Store negotiation. Configuration
 hashing includes connector extras.
 
 This option requires the layered MRV2 W4A8 prerequisites above. Keep PP/PCP/DCP
-at 1, SP and FlashComm1 off on both roles, speculative decoding off, and
-Attention DBO/ubatching off. Streams are limited before warmup; FULL preserves
+at 1, SP and FlashComm1 off on both roles, and speculative decoding off.
+
+Attention DBO, when enabled, uses exactly two native ubatches and the existing
+receive hook: the preceding raw receive is queued before the next ubatch sends
+into CAM's single physical window. FFN slots remain independent work-item
+buffers; they do not correspond to Attention ubatch IDs. Enable DBO only on
+Attention, which remains eager, including when FFN uses FULL graph.
+Streams are limited before warmup; FULL preserves
 the existing matched warmup receive count. Enablement adds no startup receives.
 
 Eager retains each payload, intermediate and output until send completion is

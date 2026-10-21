@@ -452,12 +452,6 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         config = self.vllm_config
         parallel = config.parallel_config
         if (
-            parallel.enable_dbo
-            or parallel.use_ubatching
-            or self.extra_info.async_moe_ubatching
-        ):
-            raise ValueError("FFN two-stream Attention DBO is not qualified")
-        if (
             not config.use_v2_model_runner
             or not config.model_config.enforce_eager
             or parallel.pipeline_parallel_size != 1

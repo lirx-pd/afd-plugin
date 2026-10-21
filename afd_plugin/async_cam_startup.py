@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -23,26 +24,35 @@ class FFNGraphPlan:
     graph_error: str = ""
     signature: str = ""
     layer_ids: tuple[int, ...] = ()
+    stream_signature: str = ""
+    stream_error: str = ""
 
 
 def resolve_ffn_mode(plans: list[FFNGraphPlan]) -> str:
     if not plans or len({plan.requested for plan in plans}) != 1:
         raise ValueError("All FFN ranks must request the same execution mode")
-    if plans[0].requested == "eager":
+    if len({plan.stream_signature for plan in plans}) != 1:
+        raise ValueError("FFN two-stream execution signatures differ across ranks")
+    errors = [plan.stream_error for plan in plans if plan.stream_error]
+    if errors:
+        raise ValueError("Async FFN two-stream is unsupported: " + "; ".join(errors))
+    mode = plans[0].requested
+    if mode == "eager" and not plans[0].stream_signature:
         return "eager"
-    if plans[0].requested != "full":
+    if mode not in ("eager", "full"):
         raise ValueError("Unknown Async FFN execution mode")
+    execution = "FULL" if mode == "full" else "two-stream"
     errors = [plan.graph_error for plan in plans if plan.graph_error]
     if len({plan.signature for plan in plans if not plan.graph_error}) > 1:
         errors.append("FFN graph signatures differ across ranks")
     if errors:
         reason = "; ".join(dict.fromkeys(errors))
-        raise ValueError(f"Async FFN FULL is unsupported: {reason}")
+        raise ValueError(f"Async FFN {execution} is unsupported: {reason}")
     if not plans[0].signature or not plans[0].layer_ids:
-        raise ValueError("Async FFN FULL requires a loaded executor signature")
+        raise ValueError(f"Async FFN {execution} requires a loaded executor signature")
     if len({plan.layer_ids for plan in plans}) != 1:
         raise ValueError("Async FFN layer tables differ across ranks")
-    return "full"
+    return mode
 
 
 class AsyncCAMGraphStartup:
@@ -57,6 +67,7 @@ class AsyncCAMGraphStartup:
         self.warmup_layer_id: int | None = None
         self._store: Store | None = None
         self._prefix = ""
+        self.validate_attention_streams: Callable[[], None] | None = None
 
     def initialize(self, store: Store, transport_signature: str) -> None:
         self._store = store
@@ -123,13 +134,23 @@ class AsyncCAMGraphStartup:
                 fields["layer_ids"] = tuple(fields["layer_ids"])
                 plans.append(FFNGraphPlan(**fields))
             self.mode = resolve_ffn_mode(plans)
+            ffn_plan = plans[0]
+            two_stream = bool(ffn_plan.stream_signature)
+            validate_transport = self.mode == "full" or two_stream
             if (
-                plans[0].requested == "full"
+                validate_transport
                 and len({entry["transport"] for entry in entries}) != 1
             ):
                 raise ValueError("Async CAM graph transport signatures differ")
+            if two_stream:
+                if (
+                    self.world_rank < self.attn_size
+                    and self.validate_attention_streams is not None
+                ):
+                    self.validate_attention_streams()
+                self.phase("streams-validated")
             if self.mode == "full":
-                self.warmup_layer_id = plans[0].layer_ids[0]
+                self.warmup_layer_id = ffn_plan.layer_ids[0]
         except Exception as exc:
             self.fail(exc)
             raise

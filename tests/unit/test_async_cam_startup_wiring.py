@@ -2,12 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Real startup call sites with host stubs; not device execution coverage."""
 
-import importlib.util
 import sys
-from contextlib import contextmanager
-from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -16,65 +13,59 @@ from afd_plugin.compat.npu.feature_validation import (
     _fail_if_unsupported_npu_afd_async_features,
 )
 from afd_plugin.config import parse_afd_config
-
-
-def load_host_module(monkeypatch, name, path):
-    spec = importlib.util.spec_from_file_location(
-        name, Path(__file__).resolve().parents[2] / path
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, name, module)
-    spec.loader.exec_module(module)
-    return module
+from tests.unit.fakes.async_ffn import (
+    load_async_modules,
+    load_host_module,
+)
+from tests.unit.fakes.vllm_config import npu_vllm_config
 
 
 @pytest.fixture
 def modules(monkeypatch):
-    def stub(name, **attributes):
-        module = ModuleType(name)
-        module.__dict__.update(attributes)
-        module.__dict__["__getattr__"] = lambda attr: MagicMock(name=attr)
-        monkeypatch.setitem(sys.modules, name, module)
-        return module
+    return load_async_modules(monkeypatch)
 
-    stub("torch", inference_mode=lambda: lambda function: function)
-    for name in (
-        "torch.distributed",
-        "torch.distributed.distributed_c10d",
-        "torch.distributed.rendezvous",
-        "vllm.logger",
-        "vllm.distributed",
-        "vllm.utils.torch_utils",
-        "vllm_ascend.utils",
-        "afd_plugin.compat.npu.ops",
-        "afd_plugin.compat.npu.forward_context",
-        "afd_plugin.compat.npu.profiler",
-        "afd_plugin.model_executor.npu.async_cam_w4a8",
-        "afd_plugin.v1.worker.ffn_metadata",
-    ):
-        stub(name)
-    stub(
-        "afd_plugin.connectors.base", AFDConnectorBase=object, ConnectorExtraInfo=object
+
+@pytest.mark.parametrize("value", [True, 0, -1, 1.5])
+def test_two_stream_rejects_invalid_core_settings(modules, value):
+    _, connector, _ = modules
+    with pytest.raises((TypeError, ValueError), match="ffn_compute_aic_num"):
+        connector.AFDAsyncExtraInfo.from_mapping({"ffn_compute_aic_num": value})
+
+
+def test_two_stream_config_round_trip_and_default_off(modules):
+    _, connector, _ = modules
+    default = connector.AFDAsyncExtraInfo.from_mapping({})
+    assert not default.ffn_two_stream
+    assert "ffn_two_stream" not in default.to_mapping()
+    enabled = connector.AFDAsyncExtraInfo.from_mapping({"ffn_two_stream": True})
+    assert enabled.ffn_compute_aic_num == 12
+    assert enabled.ffn_compute_aiv_num == enabled.ffn_combine_aiv_num == 24
+    assert connector.AFDAsyncExtraInfo.from_mapping(enabled.to_mapping()) == enabled
+    disabled = connector.AFDAsyncExtraInfo.from_mapping({"ffn_compute_aic_num": 8})
+    assert connector.AFDAsyncExtraInfo.from_mapping(disabled.to_mapping()) == disabled
+
+
+@pytest.mark.parametrize(
+    "feature", [None, "enable_dbo", "use_sequence_parallel_moe", "flashcomm1"]
+)
+def test_two_stream_attention_preflight_rejects_unqualified_modes(
+    modules, monkeypatch, feature
+):
+    _, module, _ = modules
+    connector = module.CAMAsyncAFDConnector.__new__(module.CAMAsyncAFDConnector)
+    connector.extra_info = module.AFDAsyncExtraInfo()
+    connector.vllm_config = npu_vllm_config(
+        enable_dbo=feature == "enable_dbo",
+        use_sequence_parallel_moe=feature == "use_sequence_parallel_moe",
     )
-    stub("afd_plugin.connectors.metadata", AFDTransferState=object)
-    group = load_host_module(
-        monkeypatch,
-        "host_afd_process_group",
-        "afd_plugin/distributed/afd_process_group.py",
+    monkeypatch.setenv(
+        "VLLM_ASCEND_ENABLE_FLASHCOMM1", "1" if feature == "flashcomm1" else "0"
     )
-    stub("afd_plugin.distributed", init_afd_process_group=group.init_afd_process_group)
-    connector = load_host_module(
-        monkeypatch,
-        "afd_plugin.connectors.npu.async_cam",
-        "afd_plugin/connectors/npu/async_cam.py",
-    )
-    runtime = load_host_module(
-        monkeypatch,
-        "afd_plugin.v1.worker.npu.async_ffn_model_runner",
-        "afd_plugin/v1/worker/npu/async_ffn_model_runner.py",
-    )
-    return group, connector, runtime
+    if feature is None:
+        connector._validate_two_stream_attention()
+    else:
+        with pytest.raises(ValueError, match="two-stream"):
+            connector._validate_two_stream_attention()
 
 
 @pytest.mark.parametrize(
@@ -172,24 +163,13 @@ def test_graph_dbo_keeps_existing_role_and_count_validation(
     modules, role, native_flag, num_ubatches, error
 ):
     _, connector_module, _ = modules
-    config = SimpleNamespace(
-        additional_config={
-            "afd": {
-                "role": role,
-                "connector": "CAMAsyncAFDConnector",
-                "async_dp": True,
-            }
-        },
-        model_config=SimpleNamespace(enforce_eager=role == "attention"),
-        compilation_config=SimpleNamespace(cudagraph_mode=SimpleNamespace(name="FULL")),
-        use_v2_model_runner=True,
-        parallel_config=SimpleNamespace(
-            enable_dbo=False,
-            use_ubatching=False,
-            num_ubatches=num_ubatches,
-            tensor_parallel_size=1,
-        ),
+    config = npu_vllm_config(
+        role=role,
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        num_ubatches=num_ubatches,
     )
+    config.model_config.enforce_eager = role == "attention"
     setattr(config.parallel_config, native_flag, True)
     with pytest.raises(RuntimeError, match=error):
         _fail_if_unsupported_npu_afd_async_features(
@@ -219,8 +199,11 @@ def test_ffn_announces_service_only_on_receiver_execution(modules):
 
 
 @pytest.mark.parametrize("capture_fails", [False, True])
-def test_ffn_warmup_capture_order_and_failure_propagation(modules, capture_fails):
-    _, _, runtime = modules
+@pytest.mark.parametrize("two_stream", [False, True])
+def test_ffn_warmup_capture_order_and_failure_propagation(
+    modules, monkeypatch, capture_fails, two_stream
+):
+    _, connector_module, runtime = modules
     calls: list[str | tuple[str, str | int]] = []
     startup = AsyncCAMGraphStartup(2, 2, 4)
     startup.phase = lambda stage: calls.append(stage)
@@ -230,6 +213,8 @@ def test_ffn_warmup_capture_order_and_failure_propagation(modules, capture_fails
         calls.append("connector")
         assert startup.plan.signature == "weights"
         assert startup.plan.layer_ids == (2, 5)
+        assert not startup.plan.stream_error
+        assert bool(startup.plan.stream_signature) == two_stream
         startup.mode = "full"
 
     def capture():
@@ -248,6 +233,7 @@ def test_ffn_warmup_capture_order_and_failure_propagation(modules, capture_fails
         connector=SimpleNamespace(
             is_initialized=False,
             graph_startup=startup,
+            extra_info=connector_module.AFDAsyncExtraInfo(ffn_two_stream=two_stream),
             init_afd_connector=initialize_connector,
             attn_size=2,
             tp_size=1,
@@ -268,7 +254,7 @@ def test_ffn_warmup_capture_order_and_failure_propagation(modules, capture_fails
         *(["transaction"] * 4),
         "device-done",
         "warmup",
-        "graph-resources",
+        *([] if two_stream else ["graph-resources"]),
         "capture",
         ("failure", "capture failed") if capture_fails else "captured",
     ]
@@ -325,14 +311,44 @@ def ffn_owners(modules, monkeypatch):
             module.__dict__["NPUWorker"] = object
         monkeypatch.setitem(sys.modules, name, module)
     sync_runtime = load_host_module(
-        monkeypatch,
-        "afd_plugin.v1.worker.npu.ffn_model_runner",
-        "afd_plugin/v1/worker/npu/ffn_model_runner.py",
+        monkeypatch, "afd_plugin.v1.worker.npu.ffn_model_runner"
     )
-    worker = load_host_module(
-        monkeypatch, "host_ffn_worker", "afd_plugin/v1/worker/npu/ffn_worker.py"
-    )
+    worker = load_host_module(monkeypatch, "afd_plugin.v1.worker.npu.ffn_worker")
     return sync_runtime, async_runtime, worker
+
+
+@pytest.mark.parametrize("state", ["live", "failed", "drained"])
+@pytest.mark.parametrize("two_stream", [False, True])
+def test_worker_retains_resources_until_clean_exit(ffn_owners, state, two_stream):
+    _, runtime, module = ffn_owners
+    calls = []
+    runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
+    runner.effective_mode = "eager" if two_stream else "full"
+    runner._two_stream = object() if two_stream else None
+    runner.connector = SimpleNamespace(close=lambda: calls.append("connector-close"))
+    runner.shutdown = lambda: calls.append("release")
+    worker = module.AFDNPUFFNWorker.__new__(module.AFDNPUFFNWorker)
+    worker.model_runner = runner
+    worker._ffn_shutdown_event = SimpleNamespace(set=lambda: calls.append("stop"))
+    worker._ffn_thread = SimpleNamespace(
+        join=lambda **kw: calls.append("join"), is_alive=lambda: state == "live"
+    )
+    worker._ffn_loop_error = (
+        RuntimeError("native failure") if state == "failed" else None
+    )
+    if state == "drained":
+        worker.stop_ffn_server_loop()
+        assert calls == ["stop", "join", "release"] and worker._ffn_thread is None
+    else:
+        with pytest.raises(RuntimeError, match="retain resources|loop failed"):
+            worker.stop_ffn_server_loop()
+        assert calls == ["stop", "join"] and worker._ffn_thread is not None
+        if state == "failed":
+            for _ in range(2):
+                with pytest.raises(RuntimeError, match="loop failed"):
+                    worker.raise_ffn_loop_error_if_any()
+            with pytest.raises(RuntimeError):
+                worker.start_ffn_server_loop()
 
 
 @pytest.mark.parametrize("async_connector", [False, True])
@@ -340,52 +356,28 @@ def test_worker_selects_owner_and_passes_device_rank(
     ffn_owners, monkeypatch, async_connector
 ):
     _, _, worker = ffn_owners
-    config, device = object(), SimpleNamespace(type="npu", index=3)
-    connector, selected = object(), object()
-    order = []
-    monkeypatch.setattr(
-        worker,
-        "validate_npu_model_runner_v2_config",
-        lambda *a, **k: order.append("validated"),
+    config, device, calls = object(), SimpleNamespace(type="npu", index=3), MagicMock()
+    parsed = SimpleNamespace(
+        connector="CAMAsyncAFDConnector" if async_connector else "CAMP2pAFDConnector"
     )
-    monkeypatch.setattr(
-        worker,
-        "parse_afd_config",
-        lambda *a, **k: SimpleNamespace(
-            connector="CAMAsyncAFDConnector"
-            if async_connector
-            else "CAMP2pAFDConnector"
-        ),
-    )
+    monkeypatch.setattr(worker, "parse_afd_config", lambda *a, **k: parsed)
     monkeypatch.setattr(worker, "get_world_group", lambda: SimpleNamespace(rank=7))
-
-    def create_connector(rank, local_rank, *args):
-        assert (rank, local_rank) == (7, 3)
-        order.append("connector")
-        return connector
-
-    monkeypatch.setattr(
-        worker.AFDConnectorFactory, "create_connector", create_connector
-    )
-
-    def sync(cfg, dev):
-        assert cfg is config and dev is device and not async_connector
-        order.append("sync")
-        return selected
-
-    def asynchronous(cfg, dev, conn):
-        assert cfg is config and dev is device and conn is connector and async_connector
-        order.append("async")
-        return selected
-
-    monkeypatch.setattr(worker, "AFDNPUFFNModelRunner", sync)
-    monkeypatch.setattr(worker, "AsyncNPUFFNModelRunner", asynchronous)
-    assert worker.create_npu_ffn_model_runner(config, device) is selected
-    assert order == (
-        ["validated", "connector", "async"]
+    monkeypatch.setattr(worker, "validate_npu_model_runner_v2_config", calls.validate)
+    monkeypatch.setattr(worker.AFDConnectorFactory, "create_connector", calls.connector)
+    monkeypatch.setattr(worker, "AFDNPUFFNModelRunner", calls.sync)
+    monkeypatch.setattr(worker, "AsyncNPUFFNModelRunner", calls.asynchronous)
+    selected = calls.asynchronous if async_connector else calls.sync
+    assert worker.create_npu_ffn_model_runner(config, device) is selected.return_value
+    expected = [call.validate(config, expected_role="ffn", device_type="npu")]
+    expected += (
+        [
+            call.connector(7, 3, config, parsed),
+            call.asynchronous(config, device, calls.connector.return_value),
+        ]
         if async_connector
-        else ["validated", "sync"]
+        else [call.sync(config, device)]
     )
+    assert calls.mock_calls == expected
 
 
 def test_worker_rejects_v1_before_constructing_either_owner(ffn_owners, monkeypatch):
@@ -414,46 +406,23 @@ def test_separate_owners_construct_and_load_without_cross_graph_pool(
 ):
     sync_runtime, async_runtime, _ = ffn_owners
     runtime = async_runtime if async_connector else sync_runtime
-    calls: list[str | tuple] = []
-    for name in (
-        "validate_npu_model_runner_v2_config",
-        "fail_if_unsupported_npu_afd_features",
-    ):
-        monkeypatch.setattr(runtime, name, lambda *a, **k: calls.append("validated"))
+    calls = MagicMock()
+    monkeypatch.setattr(runtime, "validate_npu_model_runner_v2_config", calls.validate)
+    monkeypatch.setattr(runtime, "fail_if_unsupported_npu_afd_features", calls.validate)
     monkeypatch.setattr(runtime, "create_afd_npu_profiler", lambda role: None)
-    connector, device, model, pool = (
-        object(),
-        SimpleNamespace(type="npu"),
-        object(),
-        object(),
-    )
-    config = SimpleNamespace(
-        additional_config={
-            "afd": {
-                "role": "ffn",
-                "connector": "CAMAsyncAFDConnector"
-                if async_connector
-                else "CAMP2pAFDConnector",
-            }
-        },
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(num_hidden_layers=43), enforce_eager=False
-        ),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=128, max_num_seqs=6),
-        compilation_config=SimpleNamespace(cudagraph_mode=SimpleNamespace(name="FULL")),
-        load_config=object(),
-        speculative_config=None
-        if speculative_tokens is None
-        else SimpleNamespace(num_speculative_tokens=speculative_tokens),
-    )
-
-    def global_pool():
-        assert not async_connector, "Async must not acquire the synchronous graph pool"
-        calls.append("sync-pool")
-        return pool
-
+    connector, device, model = object(), SimpleNamespace(type="npu"), object()
+    connector_name = "CAMAsyncAFDConnector" if async_connector else "CAMP2pAFDConnector"
+    config = npu_vllm_config(role="ffn", connector=connector_name)
+    config.model_config.enforce_eager = False
+    config.model_config.hf_config = SimpleNamespace(num_hidden_layers=43)
+    config.scheduler_config.max_num_seqs = 6
+    config.load_config = object()
+    if speculative_tokens is not None:
+        config.speculative_config = SimpleNamespace(
+            num_speculative_tokens=speculative_tokens
+        )
     monkeypatch.setattr(
-        sync_runtime.current_platform, "get_global_graph_pool", global_pool
+        sync_runtime.current_platform, "get_global_graph_pool", calls.pool
     )
     owner = (
         runtime.AsyncNPUFFNModelRunner
@@ -461,51 +430,40 @@ def test_separate_owners_construct_and_load_without_cross_graph_pool(
         else runtime.AFDNPUFFNModelRunner
     )
     runner = owner(config, device, connector)
-    assert calls == (
-        ["validated", "validated"]
-        if async_connector
-        else ["validated", "validated", "sync-pool"]
-    )
+    assert calls.validate.call_count == 2
+    assert calls.pool.call_count == (0 if async_connector else 1)
     assert runner.model is None
     if async_connector:
         assert runner._graph is None and runner._graph_capture_count == 0
     else:
-        assert runner._acl_graphs == {} and runner.graph_pool is pool
+        assert runner._acl_graphs == {} and runner.graph_pool is calls.pool.return_value
 
-    @contextmanager
-    def memory_profiler():
-        yield SimpleNamespace(consumed_memory=1234)
+    def get_loader(load_config):
+        assert load_config is config.load_config
+        assert calls.mock_calls[-2:] == [
+            call.capacity(config, 6, 1 + (speculative_tokens or 0)),
+            call.mask(config, device),
+        ]
+        return SimpleNamespace(load_model=calls.load)
 
-    def load_model(**kwargs):
-        assert kwargs == {"vllm_config": config, "model_config": config.model_config}
-        calls.append("load")
-        return model
-
+    calls.load.return_value = model
+    profiler = MagicMock()
+    profiler.__enter__.return_value.consumed_memory = 1234
     for name, attrs in (
-        (
-            "vllm.model_executor.model_loader",
-            {"get_model_loader": lambda cfg: SimpleNamespace(load_model=load_model)},
-        ),
-        ("vllm.utils.mem_utils", {"DeviceMemoryProfiler": memory_profiler}),
+        ("vllm.model_executor.model_loader", {"get_model_loader": get_loader}),
+        ("vllm.utils.mem_utils", {"DeviceMemoryProfiler": lambda: profiler}),
         (
             "vllm_ascend.ascend_forward_context",
-            {
-                "set_mc2_tokens_capacity": lambda *args: calls.append(
-                    ("capacity", args)
-                ),
-                "set_mc2_mask": lambda *args: calls.append(("mask", args)),
-            },
+            {"set_mc2_tokens_capacity": calls.capacity, "set_mc2_mask": calls.mask},
         ),
     ):
         module = ModuleType(name)
         module.__dict__.update(attrs)
         monkeypatch.setitem(sys.modules, name, module)
     runner.load_model()
-    assert calls[-3:] == [
-        ("capacity", (config, 6, 1 + (speculative_tokens or 0))),
-        ("mask", (config, device)),
-        "load",
-    ]
+    calls.load.assert_called_once_with(
+        vllm_config=config, model_config=config.model_config
+    )
     assert runner.get_model() is model and runner.model_memory_usage == 1234
     with pytest.raises(RuntimeError, match="already loaded"):
         runner.load_model()

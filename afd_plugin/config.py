@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 from afd_plugin.config_utils import coerce_extra_bool as _coerce_bool
@@ -67,6 +68,9 @@ class AFDConfig:
     # The right value depends on rank count, placement, and model size, so
     # it is left to the caller (deployment tooling) rather than derived here.
     afd_process_group_timeout_s: int = 120
+    connector_extra_config: dict[str, Any] = field(
+        default_factory=dict, repr=False, hash=False
+    )
 
     @property
     def afd_connector(self) -> str:
@@ -102,7 +106,12 @@ class AFDConfig:
             self.num_attention_ranks,
             self.num_ffn_ranks,
         ]
-        return hashlib.sha256(str(factors).encode()).hexdigest()
+        extra = (
+            json.dumps(self.connector_extra_config, sort_keys=True)
+            if self.connector_extra_config
+            else ""
+        )
+        return hashlib.sha256((str(factors) + extra).encode()).hexdigest()
 
     def validate(self, *, expected_role: str | None = None) -> None:
         validate_afd_config(self, expected_role=expected_role)
@@ -177,8 +186,8 @@ def afd_config_from_mapping(
         raise TypeError(
             f"AFD config must be a mapping, got {type(raw).__name__}",
         )
-    normalized, _connector_extra_config = _normalize_mapping(raw)
-    config = AFDConfig(**normalized)
+    normalized, connector_extra_config = _normalize_mapping(raw)
+    config = AFDConfig(**normalized, connector_extra_config=connector_extra_config)
 
     if validate:
         config.validate(expected_role=expected_role)

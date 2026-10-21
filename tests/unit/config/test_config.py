@@ -26,6 +26,21 @@ def test_parse_empty_additional_config_is_inactive():
         parse_afd_config({})
 
 
+def test_connector_extra_fields_participate_in_the_graph_hash():
+    extra = {"ffn_two_stream": True, "ffn_compute_aic_num": 12}
+    raw = {
+        "connector": "CAMAsyncAFDConnector",
+        "role": "ffn",
+        "connector_extra_config": extra,
+    }
+    first = afd_config_from_mapping(raw)
+    extra["ffn_compute_aic_num"] = 10
+    second = afd_config_from_mapping(raw)
+    assert first.compute_hash() != second.compute_hash()
+    raw["connector_extra_config"] = {"ffn_compute_aic_num": 10, "ffn_two_stream": True}
+    assert second.compute_hash() == afd_config_from_mapping(raw).compute_hash()
+
+
 def test_parse_canonical_additional_config_namespace():
     config = parse_afd_config(
         {

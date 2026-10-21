@@ -144,7 +144,7 @@ class AFDNPUFFNWorker(NPUWorker):
             except Exception as exc:
                 shutdown_event = self._ffn_shutdown_event
                 if (
-                    not self._uses_async_full_graph()
+                    not self._requires_async_drain()
                     and shutdown_event is not None
                     and shutdown_event.is_set()
                 ):
@@ -156,7 +156,7 @@ class AFDNPUFFNWorker(NPUWorker):
                 self._ffn_loop_error = exc
                 logger.exception("AFD NPU FFN worker loop failed")
             else:
-                if self._uses_async_full_graph():
+                if self._requires_async_drain():
                     assert isinstance(self.model_runner, AsyncNPUFFNModelRunner)
                     self.model_runner._graph_receiver_exited = True
 
@@ -197,7 +197,10 @@ class AFDNPUFFNWorker(NPUWorker):
             if isinstance(self.model_runner, AsyncNPUFFNModelRunner):
                 if not self.model_runner.execute_connector_driven_step():
                     return
-                if self.model_runner.effective_mode == "eager":
+                if (
+                    self.model_runner.effective_mode == "eager"
+                    and self.model_runner._two_stream is None
+                ):
                     torch.npu.synchronize()
                 continue
             control_plane = self.model_runner.connector.control_plane
@@ -218,22 +221,22 @@ class AFDNPUFFNWorker(NPUWorker):
             )
             torch.npu.synchronize()
 
-    def _uses_async_full_graph(self) -> bool:
-        return (
-            isinstance(self.model_runner, AsyncNPUFFNModelRunner)
-            and self.model_runner.effective_mode == "full"
+    def _requires_async_drain(self) -> bool:
+        return isinstance(self.model_runner, AsyncNPUFFNModelRunner) and (
+            self.model_runner.effective_mode == "full"
+            or self.model_runner._two_stream is not None
         )
 
     def raise_ffn_loop_error_if_any(self) -> None:
         error = self._ffn_loop_error
         if error is not None:
-            if not self._uses_async_full_graph():
+            if not self._requires_async_drain():
                 self._ffn_loop_error = None
             raise RuntimeError("AFD NPU FFN worker loop failed") from error
 
     def stop_ffn_server_loop(self) -> None:
         event = self._ffn_shutdown_event
-        if self._uses_async_full_graph():
+        if self._requires_async_drain():
             if event is not None:
                 event.set()
             thread = self._ffn_thread

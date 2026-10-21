@@ -79,6 +79,15 @@ def test_full_requires_explicit_complete_transaction_mode(mode):
     assert requested_ffn_mode(config) == "full"
 
 
+def negotiate(owners, plans, signatures):
+    with ThreadPoolExecutor(max_workers=len(owners)) as pool:
+        futures = [
+            pool.submit(owner._negotiate, plan, signature)
+            for owner, plan, signature in zip(owners, plans, signatures, strict=True)
+        ]
+        return [future.exception(timeout=3) for future in futures]
+
+
 def test_mixed_requested_modes_are_not_silently_downgraded():
     with pytest.raises(ValueError, match="same execution mode"):
         resolve_ffn_mode([full_plan(), FFNGraphPlan()])
@@ -89,11 +98,16 @@ def test_unsupported_full_rejects_without_automatic_fallback():
         resolve_ffn_mode([full_plan(), full_plan(graph_error="unsupported executor")])
 
 
-def test_layout_mismatch_is_a_static_full_rejection():
-    with pytest.raises(ValueError, match="signatures differ"):
-        resolve_ffn_mode([full_plan(), full_plan(signature="other-capacity")])
-    with pytest.raises(ValueError, match="layer tables"):
-        resolve_ffn_mode([full_plan(), full_plan(layer_ids=(2, 6))])
+@pytest.mark.parametrize(
+    "changes,message",
+    [
+        ({"signature": "other"}, "signatures differ"),
+        ({"layer_ids": (2, 6)}, "layer tables"),
+    ],
+)
+def test_full_rejects_incompatible_layout(changes, message):
+    with pytest.raises(ValueError, match=message):
+        resolve_ffn_mode([full_plan(), full_plan(**changes)])
     assert resolve_ffn_mode([FFNGraphPlan(graph_error="not graph capable")]) == "eager"
 
 
@@ -102,15 +116,51 @@ def test_empty_graph_signature_cannot_advertise_support():
         resolve_ffn_mode([full_plan(signature="")])
 
 
+@pytest.mark.parametrize("mode", ["eager", "full"])
+def test_two_stream_signature_and_failure_are_checked_in_both_modes(mode):
+    plan = full_plan(requested=mode, stream_signature="2/12C/24V/24V")
+    assert resolve_ffn_mode([plan, plan]) == mode
+    with pytest.raises(ValueError, match="two-stream execution signatures"):
+        resolve_ffn_mode([plan, replace(plan, stream_signature="")])
+    with pytest.raises(ValueError, match="core budget"):
+        resolve_ffn_mode([plan, replace(plan, stream_error="core budget")])
+    with pytest.raises(ValueError, match="signatures differ"):
+        resolve_ffn_mode([plan, replace(plan, signature="other-capacity")])
+    with pytest.raises(ValueError, match="layer tables"):
+        resolve_ffn_mode([plan, replace(plan, layer_ids=(2, 6))])
+    with pytest.raises(ValueError, match="loaded executor"):
+        resolve_ffn_mode([replace(plan, signature="")])
+
+
+@pytest.mark.parametrize("peer_failure", [False, True])
+def test_two_stream_waits_for_attention_capability_check(peer_failure):
+    owners = startup_world(1, 1)
+    checked = []
+
+    def validate():
+        checked.append("attention")
+        if peer_failure:
+            raise ValueError("DBO is not qualified")
+
+    owners[0].validate_attention_streams = validate
+    plan = full_plan(requested="eager", stream_signature="2/12C/24V/24V")
+    errors = negotiate(owners, [None, plan], ["wire"] * 2)
+    if peer_failure:
+        assert all(
+            isinstance(error, (ValueError, RuntimeError)) and "DBO" in str(error)
+            for error in errors
+        ), errors
+    else:
+        assert errors == [None, None]
+    assert checked == ["attention"]
+
+
 def test_whole_world_agrees_before_service_readiness():
     owners = startup_world()
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = [
-            pool.submit(owner._negotiate, None if i < 2 else full_plan(), "same-wire")
-            for i, owner in enumerate(owners)
-        ]
-        for future in futures:
-            future.result(timeout=3)
+    assert (
+        negotiate(owners, [None, None, full_plan(), full_plan()], ["same-wire"] * 4)
+        == [None] * 4
+    )
     assert all(owner.mode == "full" and owner.warmup_layer_id == 2 for owner in owners)
     for owner in owners[2:]:
         owner.service_ready()
@@ -118,30 +168,21 @@ def test_whole_world_agrees_before_service_readiness():
         owner.wait_service_ready()
 
 
-def test_transport_mismatch_rejects_before_payload_initialization():
+@pytest.mark.parametrize("two_stream", [False, True])
+@pytest.mark.parametrize("mode", ["eager", "full"])
+def test_transport_check_preserves_single_stream_eager_scope(two_stream, mode):
     owners = startup_world(1, 1)
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [
-            pool.submit(owner._negotiate, None if i == 0 else full_plan(), str(i))
-            for i, owner in enumerate(owners)
-        ]
-        for future in futures:
-            with pytest.raises(
-                (ValueError, RuntimeError), match="transport signatures"
-            ):
-                future.result(timeout=3)
-
-
-def test_explicit_eager_preserves_existing_transport_check_scope():
-    owners = startup_world(1, 1)
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [
-            pool.submit(owner._negotiate, None if i == 0 else FFNGraphPlan(), str(i))
-            for i, owner in enumerate(owners)
-        ]
-        for future in futures:
-            future.result(timeout=3)
-    assert all(owner.mode == "eager" for owner in owners)
+    plan = full_plan(requested=mode, stream_signature="two" if two_stream else "")
+    errors = negotiate(owners, [None, plan], ["a", "b"])
+    if two_stream or mode == "full":
+        assert all(
+            isinstance(error, (ValueError, RuntimeError))
+            and "transport signatures" in str(error)
+            for error in errors
+        ), errors
+    else:
+        assert errors == [None, None]
+        assert all(owner.mode == "eager" for owner in owners)
 
 
 @pytest.mark.parametrize("failure", ["timeout", "publication"])

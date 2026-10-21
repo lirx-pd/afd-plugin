@@ -90,6 +90,10 @@ _AFD_ASYNC_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
         "async_moe_num_ubatches",
         "async_moe_split",
         "hccl_buffer_size",
+        "ffn_two_stream",
+        "ffn_compute_aic_num",
+        "ffn_compute_aiv_num",
+        "ffn_combine_aiv_num",
     },
 )
 
@@ -164,6 +168,10 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
     async_moe_num_ubatches: int = ASYNC_MOE_NUM_STAGES
     async_moe_split: str = ASYNC_MOE_REQUEST_SPLIT
     hccl_buffer_size: int | None = None
+    ffn_two_stream: bool = False
+    ffn_compute_aic_num: int = 12
+    ffn_compute_aiv_num: int = 24
+    ffn_combine_aiv_num: int = 24
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> AFDAsyncExtraInfo:
@@ -214,6 +222,18 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
                 raw.get("hccl_buffer_size"),
                 field_name="hccl_buffer_size",
             ),
+            ffn_two_stream=coerce_extra_bool(
+                raw.get("ffn_two_stream", False), field_name="ffn_two_stream"
+            ),
+            ffn_compute_aic_num=coerce_extra_positive_int(
+                raw.get("ffn_compute_aic_num", 12), field_name="ffn_compute_aic_num"
+            ),
+            ffn_compute_aiv_num=coerce_extra_positive_int(
+                raw.get("ffn_compute_aiv_num", 24), field_name="ffn_compute_aiv_num"
+            ),
+            ffn_combine_aiv_num=coerce_extra_positive_int(
+                raw.get("ffn_combine_aiv_num", 24), field_name="ffn_combine_aiv_num"
+            ),
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -226,6 +246,17 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
         }
         if self.hccl_buffer_size is not None:
             result["hccl_buffer_size"] = self.hccl_buffer_size
+        if self.ffn_two_stream or (
+            self.ffn_compute_aic_num,
+            self.ffn_compute_aiv_num,
+            self.ffn_combine_aiv_num,
+        ) != (12, 24, 24):
+            result.update(
+                ffn_two_stream=self.ffn_two_stream,
+                ffn_compute_aic_num=self.ffn_compute_aic_num,
+                ffn_compute_aiv_num=self.ffn_compute_aiv_num,
+                ffn_combine_aiv_num=self.ffn_combine_aiv_num,
+            )
         return result
 
 
@@ -388,6 +419,9 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             self._run_attention_graph_startup()
 
     def _initialize_graph_startup(self, store: Store) -> None:
+        self.graph_startup.validate_attention_streams = (
+            self._validate_two_stream_attention
+        )
         signature = repr(
             (
                 self.attn_size,
@@ -413,6 +447,29 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             except Exception as exc:
                 self.graph_startup.fail(exc)
                 raise
+
+    def _validate_two_stream_attention(self) -> None:
+        config = self.vllm_config
+        parallel = config.parallel_config
+        if (
+            parallel.enable_dbo
+            or parallel.use_ubatching
+            or self.extra_info.async_moe_ubatching
+        ):
+            raise ValueError("FFN two-stream Attention DBO is not qualified")
+        if (
+            not config.use_v2_model_runner
+            or not config.model_config.enforce_eager
+            or parallel.pipeline_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+            or parallel.decode_context_parallel_size != 1
+            or parallel.use_sequence_parallel_moe
+            or int(os.environ.get("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0"))
+            or config.speculative_config is not None
+        ):
+            raise ValueError(
+                "FFN two-stream requires eager MRV2 Attention without PP/CP/SP"
+            )
 
     def wait_graph_device(self, event: torch.npu.Event) -> None:
         deadline = time.monotonic() + GRAPH_STARTUP_TIMEOUT_SECONDS

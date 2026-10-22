@@ -210,7 +210,11 @@ def test_runner_preserves_raw_context_and_chunk_capacity():
         return torch.empty(8, 32, dtype=torch.bfloat16)
 
     runner = SimpleNamespace(
-        model=object(), connector=connector, _layered_executor=compute, layer_ids=(2, 5)
+        model=object(),
+        connector=connector,
+        _two_stream=None,
+        _layered_executor=compute,
+        layer_ids=(2, 5),
     )
     method = runner_method(
         "_ffn_forward_connector_driven",

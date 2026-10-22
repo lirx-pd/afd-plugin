@@ -16,7 +16,7 @@ The target is the pinned vLLM 0.30 / vLLM-Ascend stack on A3/910C, with
 homogeneous DeepSeek-V4 W4A8 layers, dynamicQuant=1, static expert placement,
 F TP=1 and Attention-side gating. Both roles select
 `VLLM_USE_V2_MODEL_RUNNER=1`. Attention keeps `--enforce-eager`.
-Attention may enable native DBO or its `async_moe_ubatching` alias under the
+Attention may enable native DBO under the
 existing two-microbatch constraints. Enable native DBO only on Attention; FFN
 consumes CAM work items without joining Attention's DBO thread schedule.
 The experimental two-stream option below uses the same Attention DBO contract.

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 set -euo pipefail
 
 : "${MODEL_PATH:?Set MODEL_PATH to the full DeepSeek-V3.2 W8A8 model directory}"
@@ -43,10 +46,7 @@ ADDITIONAL_CONFIG="$(
       \"compute_gate_on_attention\": true,
       \"connector_extra_config\": {
         \"dynamicQuant\": 1,
-        \"attn_ranks_per_dp\": 8,
-        \"async_moe_ubatching\": true,
-        \"async_moe_num_ubatches\": 2,
-        \"async_moe_split\": \"token\"
+        \"attn_ranks_per_dp\": 8
       }
     }
   }"

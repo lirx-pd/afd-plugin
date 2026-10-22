@@ -1486,18 +1486,9 @@ def test_npu_attention_runner_load_model_initializes_connector_after_weights(
     assert connector.is_initialized is True
 
 
-@pytest.mark.parametrize(
-    "native_flag,local_flag,dp_size,expected",
-    [
-        (False, True, 2, True),
-        (True, False, 2, True),
-        (False, False, 2, False),
-        (False, True, 1, True),
-    ],
-)
-def test_async_cam_dbo_configuration_preserves_thresholds(
-    native_flag, local_flag, dp_size, expected
-):
+@pytest.mark.parametrize("dp_size", [1, 2])
+@pytest.mark.parametrize("native_flag", [False, True])
+def test_async_cam_dbo_configuration_preserves_thresholds(native_flag, dp_size):
     from afd_plugin.compat.npu.runtime_config import configure_async_cam_dbo
 
     config = _vllm_config(
@@ -1506,34 +1497,30 @@ def test_async_cam_dbo_configuration_preserves_thresholds(
         data_parallel_size=dp_size,
         use_ubatching=native_flag,
         num_ubatches=2,
-        extra_config={"async_moe_ubatching": local_flag},
         dbo_decode_token_threshold=2,
         dbo_prefill_token_threshold=8,
     )
     configure_async_cam_dbo(config)
-    assert config.parallel_config.enable_dbo is expected
-    config.parallel_config.use_ubatching = expected
+    assert config.parallel_config.enable_dbo is native_flag
+    config.parallel_config.use_ubatching = native_flag
     assert config.parallel_config.dbo_decode_token_threshold == 2
     assert config.parallel_config.dbo_prefill_token_threshold == 8
 
 
 @pytest.mark.parametrize("dp_size", [1, 2])
-def test_async_moe_flag_initializes_two_workspace_lanes_before_runner(
-    monkeypatch, dp_size
-):
+def test_native_dbo_initializes_two_workspace_lanes_before_runner(monkeypatch, dp_size):
     _require_npu_runtime()
     from vllm.config import ParallelConfig
 
     from afd_plugin.v1.worker.npu import attention_worker
 
     parallel = object.__new__(ParallelConfig)
-    parallel.enable_dbo = False
+    parallel.enable_dbo = True
     parallel.ubatch_size = 1
     parallel.data_parallel_size = dp_size
     config = _vllm_config(
         connector="CAMAsyncAFDConnector",
         async_dp=True,
-        extra_config={"async_moe_ubatching": True},
     )
     config.parallel_config = parallel
     worker = SimpleNamespace(vllm_config=config, _init_device=lambda: "device")

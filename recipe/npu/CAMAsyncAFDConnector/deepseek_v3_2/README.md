@@ -61,7 +61,7 @@ same value on the Attention (A) and FFN (F) sides. This recipe uses `140000`
 for both sides.
 
 | Field | Meaning |
-|-------|---------|
+| ------- | --------- |
 | `connector` | Selects the AFD connector implementation. Use `CAMAsyncAFDConnector` for CAM async. |
 | `async` | Enables async-DP execution, which is required by `CAMAsyncAFDConnector`. |
 | `role` | Worker role in the AFD split. Use `attention` for prefill attention workers and `ffn` for expert workers. |
@@ -72,18 +72,15 @@ for both sides.
 
 `connector_extra_config` carries CAM async-specific knobs:
 
-| Field | Meaning |
-|-------|---------|
-| `dynamicQuant` | Enables dynamic quantization metadata for CAM dispatch/combine. |
-| `async_moe_ubatching` | Enables AFD-managed MoE ubatching instead of vLLM native DBO. |
-| `async_moe_num_ubatches` | Number of async MoE stages. The current CAM async setup uses `2`. |
-| `async_moe_split` | Split policy for async MoE ubatches. This recipe uses request-level splitting. |
+| Field               | Meaning                                                                   |
+| ------------------- | ------------------------------------------------------------------------- |
+| `dynamicQuant`      | Enables dynamic quantization metadata for CAM dispatch/combine.           |
 | `attn_ranks_per_dp` | Number of attention ranks per DP replica. With `PCP8`, this value is `8`. |
 
-Do not add `--enable-dbo`, `--dbo-decode-token-threshold`, or
-`--dbo-prefill-token-threshold` to these commands. Those flags enable vLLM
-native DBO, which CAM async rejects. `async_moe_ubatching` is AFD-managed,
-MoE-only request-boundary staging and is not vLLM native DBO.
+These historical PCP commands do not enable microbatching. Current Async CAM
+microbatching uses native `--enable-dbo` on Attention only and does not support
+context parallelism. See the [current guide](../../../../docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md#native-dbo-and-async-cam-ubatching)
+for supported topology and threshold settings.
 
 ## Experiment Configuration
 
@@ -243,6 +240,7 @@ vllm serve /path/to/DeepSeek-V3.2 \
     "enable_force_load_balance": true
   }'
 ```
+
 </details>
 
 ### AFD CAM async
@@ -305,9 +303,6 @@ vllm serve /path/to/DeepSeek-V3.2 \
       "compute_gate_on_attention": true,
       "connector_extra_config": {
         "dynamicQuant": 1,
-        "async_moe_ubatching": true,
-        "async_moe_num_ubatches": 2,
-        "async_moe_split": "request",
         "attn_ranks_per_dp": 8
       }
     }
@@ -370,9 +365,6 @@ vllm serve /path/to/DeepSeek-V3.2 \
       "compute_gate_on_attention": true,
       "connector_extra_config": {
         "dynamicQuant": 1,
-        "async_moe_ubatching": true,
-        "async_moe_num_ubatches": 2,
-        "async_moe_split": "request",
         "attn_ranks_per_dp": 8
       }
     }
@@ -424,9 +416,6 @@ vllm serve /path/to/DeepSeek-V3.2 \
       "compute_gate_on_attention": true,
       "connector_extra_config": {
         "dynamicQuant": 1,
-        "async_moe_ubatching": true,
-        "async_moe_num_ubatches": 2,
-        "async_moe_split": "request",
         "attn_ranks_per_dp": 8
       }
     }

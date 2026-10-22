@@ -161,8 +161,7 @@ export AFD_ASYNC_MOE_LAYOUT_LOG=1
 The log reports token extents, padding, CAM-local slices, and FFN result
 gathering. Disable it after diagnosis to keep normal service logs concise.
 
-`async_moe_split="request"` or `"token"` no longer selects a split policy; the
-legacy field logs a warning and native DBO owns boundaries. Enable DBO only on
+Native DBO owns request/token split boundaries. Enable DBO only on
 Attention, with exactly two ubatches and both token thresholds at least two.
 For DeepSeek-V2/V3, enable chunked prefill to handle requests crossing the
 child boundary. NPU MRV2 DBO requires eager execution; synchronous CAMP2P

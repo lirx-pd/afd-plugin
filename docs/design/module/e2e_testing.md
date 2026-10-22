@@ -152,9 +152,8 @@ should be removed when the runtime supports graceful cancellation.
 
 `afd-dsv4-flash-async-cam-dp2tp4-ep8` is a separate local-only DSV4 Flash
 W4A8 case using 16 Ascend NPUs: Attention DP2/TP4 and FFN DP8/TP1/EP8.
-It uses eager async CAM and MBT=8192. Its checked-in legacy ubatching flag
-enables two native DBO children on Attention; `async_moe_split="token"` is
-accepted but ignored. Native DBO requires target-device validation. It validates
+It uses eager async CAM and MBT=8192. Its Attention-side `--enable-dbo` flag
+enables two native DBO children. Native DBO requires target-device validation. It validates
 ten simultaneous chat requests, records their outputs and overlapping
 request intervals, and checks service liveness and cleanup. Its cancellable
 async HTTP client saves per-request responses/errors even on failure or

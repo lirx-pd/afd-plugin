@@ -76,12 +76,11 @@ def test_dsv4_async_rejects_deferred_features(
         )
 
 
-def test_dsv4_async_accepts_target_baseline_and_async_moe_ubatching() -> None:
+def test_dsv4_async_accepts_target_baseline() -> None:
     _fail_if_unsupported_dsv4_async_features(
         _afd_config(compute_gate_on_attention=True),
         AFDAsyncExtraInfo(
             dynamic_quant=1,
             attn_ranks_per_dp=2,
-            async_moe_ubatching=True,
         ),
     )

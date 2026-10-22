@@ -111,6 +111,7 @@ def async_moe_config(
     tensor_parallel_size=1,
     prefill_context_parallel_size=1,
     decode_context_parallel_size=1,
+    num_ubatches=2,
     **extra_config,
 ):
     return npu_vllm_config(
@@ -124,8 +125,9 @@ def async_moe_config(
         tensor_parallel_size=tensor_parallel_size,
         prefill_context_parallel_size=prefill_context_parallel_size,
         decode_context_parallel_size=decode_context_parallel_size,
+        use_ubatching=role == "attention",
+        num_ubatches=num_ubatches,
         extra_config={
-            "async_moe_ubatching": True,
             "attn_ranks_per_dp": tensor_parallel_size,
             **extra_config,
         },

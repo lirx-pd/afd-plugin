@@ -53,7 +53,6 @@ ASYNC_UBATCH_SCENARIO = "afd-async-ubatch"
 ASYNC_UBATCH_ATTENTION_RANKS = 2
 ASYNC_UBATCH_FFN_RANKS = 1
 ASYNC_UBATCH_ATTENTION_TP_SIZE = 2
-ASYNC_UBATCH_NUM_STAGES = 2
 ASYNC_UBATCH_BATCH_SIZE = 2
 # Graph capture default for the scenarios that do not carry their own launch
 # profile; the DSV4 synchronous profiles override it.
@@ -544,9 +543,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
         # This fixed scenario must exercise the TP/SP token-split path. Replace
         # conflicting caller values instead of silently changing its contract.
         extra_config["attn_ranks_per_dp"] = ASYNC_UBATCH_ATTENTION_TP_SIZE
-        extra_config["async_moe_ubatching"] = True
-        extra_config["async_moe_num_ubatches"] = ASYNC_UBATCH_NUM_STAGES
-        extra_config["async_moe_split"] = "token"
+        args.attention_vllm_arg.append("--enable-dbo")
         args.afd_connector_extra_config = [
             json.dumps(extra_config, separators=(",", ":")),
         ]
@@ -944,7 +941,7 @@ def run_gsm8k_evaluation(args: argparse.Namespace) -> None:
 
 def uses_dbo_execution(args: argparse.Namespace) -> bool:
     # The Lite Async case deliberately supplies enough work for native DBO.
-    # DSV4's legacy alias keeps native thresholds: its ten short requests can
+    # DSV4 keeps native DBO thresholds: its ten short requests can
     # legitimately remain unsplit, so that case retains its original oracle.
     return args.enable_dbo or args.scenario == ASYNC_UBATCH_SCENARIO
 

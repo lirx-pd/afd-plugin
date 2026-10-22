@@ -141,9 +141,6 @@ def _fail_if_unsupported_dsv4_async_features(
         raise RuntimeError(
             "DSV4 Flash-INT8 CAMAsyncAFDConnector requires dynamicQuant=1",
         )
-    # async_moe_ubatching is validated by
-    # _fail_if_unsupported_npu_async_moe_ubatching_features for all async CAM
-    # targets, so DSV4 no longer needs a bespoke rejection here.
 
 
 def _fail_if_unsupported_dsv4_connector(afd_config: AFDConfig) -> None:
@@ -298,14 +295,6 @@ def _fail_if_unsupported_npu_afd_async_features(
                 "AFD NPU ModelRunnerV2 Async CAM does not support finegrained TP "
                 "or shared-expert DP",
             )
-    if extra_info.async_moe_ubatching or parallel_config.use_ubatching:
-        _fail_if_unsupported_npu_async_moe_ubatching_features(
-            vllm_config,
-            afd_config,
-            num_ubatches=extra_info.async_moe_num_ubatches,
-            split=extra_info.async_moe_split,
-            attn_ranks_per_dp=extra_info.attn_ranks_per_dp,
-        )
     if extra_info.dynamic_quant not in (0, 1):
         raise RuntimeError(
             "CAMAsyncAFDConnector currently supports only dynamicQuant 0 or 1",
@@ -343,53 +332,6 @@ def _validate_cam_world_topology(
             "CAMAsyncAFDConnector "
             f"{afd_config.role} DPxTP world size must equal its configured "
             f"role size, got {local_world_size} and {expected_world_size}",
-        )
-
-
-def _fail_if_unsupported_npu_async_moe_ubatching_features(
-    vllm_config: VllmConfig,
-    afd_config: AFDConfig,
-    *,
-    num_ubatches: int,
-    split: str,
-    attn_ranks_per_dp: int,
-) -> None:
-    from afd_plugin.connectors.npu.async_cam import (
-        ASYNC_MOE_NUM_STAGES,
-        ASYNC_MOE_REQUEST_SPLIT,
-        ASYNC_MOE_TOKEN_SPLIT,
-    )
-
-    parallel_config = vllm_config.parallel_config
-    if not afd_config.compute_gate_on_attention:
-        raise RuntimeError(
-            "async_moe_ubatching requires compute_gate_on_attention=true",
-        )
-    if num_ubatches != ASYNC_MOE_NUM_STAGES:
-        raise RuntimeError(
-            "async_moe_ubatching currently supports exactly two stages; "
-            f"got async_moe_num_ubatches={num_ubatches}",
-        )
-    if split not in (ASYNC_MOE_REQUEST_SPLIT, ASYNC_MOE_TOKEN_SPLIT):
-        raise RuntimeError(
-            "async_moe_split must be 'request' or 'token'; "
-            f"got async_moe_split={split!r}",
-        )
-    # Attention owns native DBO execution and SP layout conversion. FFN workers
-    # consume CAM work items and may use an independent TP/EP topology.
-    if afd_config.is_ffn_server:
-        return
-    if (
-        int(parallel_config.prefill_context_parallel_size) > 1
-        or int(parallel_config.decode_context_parallel_size) > 1
-    ):
-        raise RuntimeError(
-            "async_moe_ubatching does not support context parallelism",
-        )
-    if attn_ranks_per_dp != int(parallel_config.tensor_parallel_size):
-        raise RuntimeError(
-            "async_moe_ubatching requires Attention attn_ranks_per_dp to "
-            "equal tensor_parallel_size",
         )
 
 

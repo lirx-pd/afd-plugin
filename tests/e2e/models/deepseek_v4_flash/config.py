@@ -358,15 +358,16 @@ def configure_scenario(args: argparse.Namespace) -> None:
             {
                 "dynamicQuant": 1,
                 "attn_ranks_per_dp": DSV4_ATTENTION_TP_SIZE,
-                "async_moe_ubatching": True,
-                "async_moe_num_ubatches": 2,
-                "async_moe_split": "token",
             }
         )
     ]
     _configure_dsv4_arguments(args, DSV4_ASCEND_QUANTIZATION)
     args.ffn_vllm_arg = ["--all2all-backend", "flashinfer_all2allv"]
-    args.attention_vllm_arg[:0] = ["--all2all-backend", "allgather_reducescatter"]
+    args.attention_vllm_arg[:0] = [
+        "--enable-dbo",
+        "--all2all-backend",
+        "allgather_reducescatter",
+    ]
 
 
 def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:

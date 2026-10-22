@@ -537,7 +537,6 @@ def test_npu_async_v2_constructor_validates_before_native_and_connector_init(
         connector="CAMAsyncAFDConnector",
         async_dp=True,
         compute_gate_on_attention=True,
-        connector_extra_config={"async_moe_ubatching": local_ubatching},
     )
     events = []
 

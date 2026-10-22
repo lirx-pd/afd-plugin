@@ -126,7 +126,6 @@ def test_two_stream_flashcomm1_matches_ascend_boolean_parsing(
         (False, None),
         (False, "enable_dbo"),
         (False, "use_ubatching"),
-        (False, "async_moe_ubatching"),
         (True, None),
     ],
 )
@@ -166,16 +165,13 @@ def test_static_validation_precedes_hccl_creation(
         max_num_batched_tokens=8,
         hccl_buffer_size_mb=256,
         local_rank=0,
-        extra_info=SimpleNamespace(async_moe_ubatching=False),
         vllm_config=SimpleNamespace(
             use_v2_model_runner=not invalid,
             parallel_config=SimpleNamespace(enable_dbo=False, use_ubatching=False),
         ),
         graph_startup=AsyncCAMGraphStartup(0, 1, 2),
     )
-    if dbo_flag == "async_moe_ubatching":
-        connector.extra_info.async_moe_ubatching = True
-    elif dbo_flag is not None:
+    if dbo_flag is not None:
         setattr(connector.vllm_config.parallel_config, dbo_flag, True)
 
     def negotiate(store, signature):

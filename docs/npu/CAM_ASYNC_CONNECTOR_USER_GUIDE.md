@@ -201,9 +201,6 @@ including `async_dp`; enable DBO through the Attention CLI flags below.
 | --- | --- | --- | --- |
 | `dynamicQuant` | `int` | `0` | Enables CAM dispatch/combine dynamic-quant metadata. Only `0` and `1` are accepted. With `1`, FFN receives quantized routed activations plus scale tensors and must return output compatible with combine-send. |
 | `attn_ranks_per_dp` | `int` | `1` | Positive Attention TP rank count per DP replica. It is the CAM Attention grouping width and is independent of the FFN process's local TP size. |
-| `async_moe_ubatching` | `bool` | `false` | Compatibility alias for native DBO on Attention, including DP1. Prefer `--enable-dbo`. |
-| `async_moe_num_ubatches` | `int` | `2` | Legacy compatibility validation; only `2` is accepted. Native DBO owns the microbatch count. |
-| `async_moe_split` | `str` | `"request"` | Deprecated compatibility field: accepts `"request"` or `"token"` but has no effect on splitting and logs a warning when supplied. Native DBO owns request/token boundaries. |
 | `hccl_buffer_size` | `int` | unset | Positive CAM HCCL buffer size in MB. The override applies only to the `afd_async_cam` communication domain. When unset, HCCL uses `HCCL_BUFFSIZE`, then its built-in default. Configure the same value on every Attention and FFN rank in the domain. |
 | `ffn_two_stream` | `bool` | `false` | Experimental FFN-only receive/compute and send streams with two slots. Requires layered MRV2 W4A8; eager and FULL are supported in code, with NPU qualification pending. |
 | `ffn_compute_aic_num` | `int` | `12` | Positive compute Cube limit, bounded by available AIC. |
@@ -227,7 +224,7 @@ consumes expert-routed CAM work items and may independently use TP1.
 ### vLLM native DBO
 
 For eager DeepSeek-V2/V3 MLA or DeepSeek-V4 Attention at any DP size, enable
-native DBO explicitly or retain `async_moe_ubatching=true` as its alias:
+native DBO explicitly:
 
 ```text
 --enable-dbo
@@ -238,8 +235,7 @@ native DBO explicitly or retain `async_moe_ubatching=true` as its alias:
 `--ubatch-size 2` is also normalized to DBO on this Async Attention path.
 Do not enable native DBO on FFN. FFN consumes independent CAM work items and
 never joins Attention's DBO thread schedule. Native thresholds select eligible
-prefill/decode batches and must be at least the microbatch count, including when
-using the legacy alias. Native slicing determines token and request ranges,
+prefill/decode batches and must be at least the microbatch count. Native slicing determines token and request ranges,
 including parent padding and requests crossing a microbatch boundary. The model
 owns SP padding and each owner's layout restoration/TP collectives.
 

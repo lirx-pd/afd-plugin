@@ -19,9 +19,9 @@ The supported deployment requires ``async=true``, Ascend CAM
 operator packages, and matching topology/configuration on every rank. Regular
 prefill and autoregressive decode steps use the same connector. Attention
 microbatching uses the native DBO runtime with Ascend adaptations. FFN FULL
-requires MRV2 and accepts Attention-side DBO. Legacy Async microbatching flags are
-configuration aliases, and no independent Async split or model schedule is
-maintained. See ``docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md`` for configuration, rank
+requires MRV2 and accepts Attention-side DBO. Native DBO owns microbatch
+splitting and scheduling. See ``docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md`` for
+configuration, rank
 derivation, launch guidance, and the full limitations.
 """
 
@@ -49,7 +49,6 @@ from afd_plugin.config_utils import (
     coerce_extra_bool,
     coerce_extra_int,
     coerce_extra_positive_int,
-    coerce_extra_str,
     coerce_optional_extra_positive_int,
 )
 from afd_plugin.connectors.base import (
@@ -78,17 +77,11 @@ if TYPE_CHECKING:
 AFD_ASYNC_CAM_GROUP_NAME = "afd_async_cam"
 CAM_COMM_ID = 0
 ATTN_RANKS_PER_DP_CONFIG_KEY = "attn_ranks_per_dp"
-ASYNC_MOE_NUM_STAGES = 2
-ASYNC_MOE_REQUEST_SPLIT = "request"
-ASYNC_MOE_TOKEN_SPLIT = "token"
 
 _AFD_ASYNC_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "dynamicQuant",
         "attn_ranks_per_dp",
-        "async_moe_ubatching",
-        "async_moe_num_ubatches",
-        "async_moe_split",
         "hccl_buffer_size",
         "ffn_two_stream",
         "ffn_compute_aic_num",
@@ -156,17 +149,11 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
     Attributes:
         dynamic_quant: Dynamic quantization mode accepted by CAM operators.
         attn_ranks_per_dp: Number of Attention ranks in each data-parallel group.
-        async_moe_ubatching: Legacy alias for Attention native DBO.
-        async_moe_num_ubatches: Legacy count validation; only two is supported.
-        async_moe_split: Deprecated parsing compatibility; native DBO owns slices.
         hccl_buffer_size: Optional buffer size in MB for the CAM HCCL domain.
     """
 
     dynamic_quant: int = 0
     attn_ranks_per_dp: int = 1
-    async_moe_ubatching: bool = False
-    async_moe_num_ubatches: int = ASYNC_MOE_NUM_STAGES
-    async_moe_split: str = ASYNC_MOE_REQUEST_SPLIT
     hccl_buffer_size: int | None = None
     ffn_two_stream: bool = False
     ffn_compute_aic_num: int = 12
@@ -191,12 +178,6 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
                 + ", ".join(unknown),
             )
 
-        if "async_moe_split" in raw:
-            logger.warning_once(
-                "async_moe_split is deprecated and has no effect; "
-                "Async CAM uses the native DBO split policy"
-            )
-
         return cls(
             dynamic_quant=coerce_extra_int(
                 raw.get("dynamicQuant", 0),
@@ -205,18 +186,6 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
             attn_ranks_per_dp=coerce_extra_positive_int(
                 raw.get("attn_ranks_per_dp", 1),
                 field_name="attn_ranks_per_dp",
-            ),
-            async_moe_ubatching=coerce_extra_bool(
-                raw.get("async_moe_ubatching", False),
-                field_name="async_moe_ubatching",
-            ),
-            async_moe_num_ubatches=coerce_extra_positive_int(
-                raw.get("async_moe_num_ubatches", ASYNC_MOE_NUM_STAGES),
-                field_name="async_moe_num_ubatches",
-            ),
-            async_moe_split=coerce_extra_str(
-                raw.get("async_moe_split", ASYNC_MOE_REQUEST_SPLIT),
-                field_name="async_moe_split",
             ),
             hccl_buffer_size=coerce_optional_extra_positive_int(
                 raw.get("hccl_buffer_size"),
@@ -240,9 +209,6 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
         result: dict[str, Any] = {
             "dynamicQuant": self.dynamic_quant,
             "attn_ranks_per_dp": self.attn_ranks_per_dp,
-            "async_moe_ubatching": self.async_moe_ubatching,
-            "async_moe_num_ubatches": self.async_moe_num_ubatches,
-            "async_moe_split": self.async_moe_split,
         }
         if self.hccl_buffer_size is not None:
             result["hccl_buffer_size"] = self.hccl_buffer_size
@@ -1096,9 +1062,6 @@ __all__ = [
     "AFDAsyncFFNWorkItem",
     "AFDAsyncTopology",
     "ATTN_RANKS_PER_DP_CONFIG_KEY",
-    "ASYNC_MOE_NUM_STAGES",
-    "ASYNC_MOE_REQUEST_SPLIT",
-    "ASYNC_MOE_TOKEN_SPLIT",
     "CAM_COMM_ID",
     "build_async_topology",
     "select_cam_experts",

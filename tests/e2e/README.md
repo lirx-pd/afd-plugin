@@ -251,10 +251,8 @@ weights and a DSV4-capable vLLM/vLLM-Ascend runtime with CAM operators.
 
 The fixed deployment uses eager execution, MBT=8192, max-model-len=1048576,
 max-num-seqs=16, block-size=128, memory utilization=0.7, and seed=1024.
-CAM uses `dynamicQuant=1`, Attention-side gating, and the legacy
-`async_moe_ubatching` flag, which enables two native DBO children on
-Attention. The retained `async_moe_split="token"` field is ignored by the
-current runtime. Native DBO requires target-device validation.
+CAM uses `dynamicQuant=1`, Attention-side gating, and `--enable-dbo`
+to enable two native DBO children on Attention. Native DBO requires target-device validation.
 The ten short prompts below do not guarantee the native DBO thresholds are
 reached. This case retains its original concurrent-answer and cleanup oracle;
 DSV4 DSA DBO requires separate live above-threshold qualification.

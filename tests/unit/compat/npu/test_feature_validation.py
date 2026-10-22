@@ -141,14 +141,12 @@ def _mla_dbo(cudagraph_mode, **model_fields):
         ),
         pytest.param(_async_moe_config(), None, id="moe-request-tp1"),
         pytest.param(
-            _async_moe_config(
-                tensor_parallel_size=2, num_attention_ranks=2, async_moe_split="token"
-            ),
+            _async_moe_config(tensor_parallel_size=2, num_attention_ranks=2),
             None,
             id="moe-token-attention-tp2",
         ),
         pytest.param(
-            _async_moe_config(role="ffn", async_moe_split="token"),
+            _async_moe_config(role="ffn"),
             None,
             id="moe-token-ffn-tp1",
         ),
@@ -158,18 +156,18 @@ def _mla_dbo(cudagraph_mode, **model_fields):
             id="moe-missing-attention-gate",
         ),
         pytest.param(
-            _async_moe_config(async_moe_num_ubatches=3),
+            _async_moe_config(num_ubatches=3),
             "exactly two",
             id="moe-three-stages",
         ),
         pytest.param(
             _async_moe_config(decode_context_parallel_size=2),
-            "context parallel",
+            "CP",
             id="moe-decode-context-parallel",
         ),
         pytest.param(
             _async_moe_config(prefill_context_parallel_size=2),
-            "context parallel",
+            "CP",
             id="moe-prefill-context-parallel",
         ),
         pytest.param(
@@ -298,13 +296,13 @@ def test_npu_async_mrv2_features_allow_model_layouts(
         use_mla=use_mla,
         tensor_parallel_size=tp_size,
         use_sequence_parallel_moe=use_sp,
+        use_ubatching=local_ubatching,
+        num_ubatches=2,
         num_attention_ranks=2 * tp_size,
         data_parallel_size=2,
         extra_config={
             "attn_ranks_per_dp": tp_size,
             "dynamicQuant": 1,
-            "async_moe_ubatching": local_ubatching,
-            "async_moe_split": "token" if tp_size > 1 else "request",
         },
     )
     config.model_config.hf_text_config.model_type = model_type

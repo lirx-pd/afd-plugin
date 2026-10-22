@@ -8,11 +8,9 @@ from typing import TYPE_CHECKING
 
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
-    connector_extra_config_from_source,
     is_afd_async_dp,
     parse_afd_config,
 )
-from afd_plugin.config_utils import coerce_extra_bool
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -24,7 +22,7 @@ DEEPSEEK_V2_MODEL_TYPES = frozenset(
 
 
 def configure_async_cam_dbo(vllm_config: VllmConfig) -> None:
-    """Treat the legacy Async flag as native DBO on every Attention DP size."""
+    """Normalize native ubatching to DBO on every Attention DP size."""
     afd_config = parse_afd_config(vllm_config)
     parallel = vllm_config.parallel_config
     if (
@@ -32,19 +30,11 @@ def configure_async_cam_dbo(vllm_config: VllmConfig) -> None:
         or not afd_config.is_attention_server
     ):
         return
-    if not (
-        parallel.use_ubatching
-        or coerce_extra_bool(
-            connector_extra_config_from_source(vllm_config).get(
-                "async_moe_ubatching", False
-            ),
-            field_name="async_moe_ubatching",
-        )
-    ):
+    if not parallel.use_ubatching:
         return
 
     parallel.enable_dbo = True
-    # Enabling the legacy alias happens after ParallelConfig validation.
+    # Normalizing ubatching happens after ParallelConfig validation.
     # Repeat its native threshold guard so no empty child can be selected.
     if (
         min(

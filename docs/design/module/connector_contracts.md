@@ -94,7 +94,7 @@ than an `AFDConfig` field. Unknown fields fail in the selected connector parser.
 | --- | --- |
 | `P2pNcclAFDConnector` | None; the mapping must be empty. |
 | `CAMP2pAFDConnector` | `core_num`, optional `attn_core_num` / `ffn_core_num`, `compute_gate_on_attention`, `quant_mode`, and optional positive `hccl_buffer_size`. Core counts must be positive; the current runtime rejects gate-on-Attention and any nonzero quantization mode. |
-| `CAMAsyncAFDConnector` | `dynamicQuant`, `attn_ranks_per_dp`, optional positive `hccl_buffer_size`, and legacy `async_moe_ubatching`, `async_moe_num_ubatches`, `async_moe_split`. The enable flag aliases native Attention DBO, only two ubatches are accepted, and the request/token split selector is ignored with a warning. |
+| `CAMAsyncAFDConnector` | `dynamicQuant`, `attn_ranks_per_dp`, optional positive `hccl_buffer_size`, and FFN two-stream options. Attention microbatching uses native DBO configuration. |
 
 The common `afd_process_group_timeout_s` defaults to 120 seconds and controls
 AFD rendezvous. `hccl_buffer_size` sizes connector-owned HCCL domains in MB;

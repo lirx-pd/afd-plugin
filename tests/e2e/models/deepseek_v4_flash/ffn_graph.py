@@ -69,7 +69,6 @@ def profile(args) -> SimpleNamespace:
                 {
                     "dynamicQuant": 1,
                     "attn_ranks_per_dp": 4,
-                    "async_moe_ubatching": False,
                     "hccl_buffer_size": 256,
                 }
             )

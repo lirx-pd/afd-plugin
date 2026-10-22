@@ -304,7 +304,7 @@ hidden states together with `topk_weights`, `topk_ids`, and optional
 peer dispatch and let the resumed owner consume its result. Dense layers remain local to the
 Attention model path.
 
-The legacy `async_moe_ubatching` option is an alias for vLLM native DBO. It:
+Enable vLLM native DBO with `--enable-dbo` on Attention. It:
 
 - requires `compute_gate_on_attention=true`;
 - uses exactly two native microbatches, including Attention DP1;
@@ -315,8 +315,7 @@ The legacy `async_moe_ubatching` option is an alias for vLLM native DBO. It:
 - does not synchronize stage eligibility across asynchronous DP replicas;
 - does not support prefill or decode context parallel metadata.
 
-Native DBO owns request/token boundaries; `async_moe_split` is deprecated and
-ignored. Enable DBO on Attention only; Async FFN rejects native DBO flags and
+Native DBO owns request/token boundaries. Enable DBO on Attention only; Async FFN rejects native DBO flags and
 continues its work-item loop. For DeepSeek-V2/V3, enable chunked prefill so a
 request crossing a native microbatch boundary can attend to its prefix KV.
 `models/npu/async_cam_layout.py` retains only communication layout

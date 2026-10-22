@@ -187,18 +187,17 @@ def test_async_extra_info_rejects_unknown_and_invalid_fields():
         AFDAsyncExtraInfo.from_mapping({"attn_ranks_per_dp": 0})
 
 
-def test_async_extra_info_parses_async_moe_fields():
-    extra_info = AFDAsyncExtraInfo.from_mapping(
-        {
-            "async_moe_ubatching": "true",
-            "async_moe_num_ubatches": "2",
-            "async_moe_split": "Request",
-        },
-    )
-
-    assert extra_info.async_moe_ubatching is True
-    assert extra_info.async_moe_num_ubatches == 2
-    assert extra_info.async_moe_split == "request"
+@pytest.mark.parametrize(
+    "field",
+    [
+        "async_moe_ubatching",
+        "async_moe_num_ubatches",
+        "async_moe_split",
+    ],
+)
+def test_async_extra_info_rejects_removed_fields(field):
+    with pytest.raises(ValueError, match="unknown AFD async connector_extra_config"):
+        AFDAsyncExtraInfo.from_mapping({field: True})
 
 
 def test_async_connector_factory_creates_import_safe_connector():

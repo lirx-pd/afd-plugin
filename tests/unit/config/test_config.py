@@ -113,12 +113,12 @@ def test_connector_extra_config_is_extracted_for_connector_parser():
         "connector": "CAMAsyncAFDConnector",
         "role": "attention",
         "connector_extra_config": {
-            "async_moe_ubatching": "true",
+            "dynamicQuant": "1",
         },
     }
 
     assert connector_extra_config_from_mapping(raw) == {
-        "async_moe_ubatching": "true",
+        "dynamicQuant": "1",
     }
 
 

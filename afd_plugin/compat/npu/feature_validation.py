@@ -190,7 +190,8 @@ def _fail_if_unsupported_npu_afd_async_features(
             or extra_info.dynamic_quant != 1
             or parallel_config.tensor_parallel_size != 1
             or parallel_config.use_sequence_parallel_moe
-            or int(os.environ.get("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0"))
+            or os.environ.get("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0").strip().lower()
+            in ("1", "true")
         ):
             raise RuntimeError(
                 "FFN two-stream requires MRV2 layered W4A8, dynamicQuant=1, "

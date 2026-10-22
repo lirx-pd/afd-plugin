@@ -9,12 +9,13 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
+from afd_plugin.async_cam_startup import AsyncCAMGraphStartup
 from tests.unit.fakes.async_ffn import load_async_modules
 
 
 @pytest.fixture
 def pipeline(monkeypatch):
-    _, connector, _ = load_async_modules(monkeypatch)
+    _, connector, runtime = load_async_modules(monkeypatch)
     module = sys.modules["afd_plugin.v1.worker.npu.async_ffn_two_stream"]
     npu, history, produced = module.torch.npu, MagicMock(), []
     for name in ("compute_stream", "send_stream", "ready0", "done0", "ready1", "done1"):
@@ -56,7 +57,58 @@ def pipeline(monkeypatch):
         history.compute,
     )
     history.reset_mock()
-    return SimpleNamespace(owner=owner, npu=npu, history=history, produced=produced)
+    return SimpleNamespace(
+        owner=owner, npu=npu, history=history, produced=produced, runtime=runtime
+    )
+
+
+@pytest.fixture
+def warmup_runner(pipeline):
+    p = pipeline
+    runtime = p.runtime
+    runner = runtime.AsyncNPUFFNModelRunner.__new__(runtime.AsyncNPUFFNModelRunner)
+    runner.model = object()
+    runner._two_stream = p.owner
+    startup = AsyncCAMGraphStartup(1, 1, 2)
+    store = MagicMock()
+    startup._store = store
+    runner.connector = SimpleNamespace(graph_startup=startup)
+    p.history.done0.query.return_value = True
+    runner._ffn_forward_connector_driven(single=True)
+    p.history.reset_mock()
+    p.produced.clear()
+    return runner, store
+
+
+@pytest.mark.parametrize("outcome", ["ready", "peer_failure", "timeout"])
+def test_warmup_observes_completion_or_failure_without_blocking_fence(
+    pipeline, warmup_runner, monkeypatch, outcome
+):
+    p = pipeline
+    runner, store = warmup_runner
+    p.history.done1.query.return_value = outcome == "ready"
+    store.check.return_value = outcome == "peer_failure"
+    store.get.return_value = b"Attention rank failed"
+    clock = iter([0, p.runtime.GRAPH_STARTUP_TIMEOUT_SECONDS])
+    monkeypatch.setattr(p.runtime.time, "monotonic", lambda: next(clock))
+    p.npu.synchronize.side_effect = AssertionError("warmup must poll completion")
+    if outcome == "ready":
+        runner._ffn_forward_connector_driven(single=True)
+        p.owner.close(receiver_exited=True)
+        p.history.reset_mock()
+        assert all(ref() is None for ref in p.produced)
+    else:
+        error, message = (
+            (RuntimeError, "Attention rank failed")
+            if outcome == "peer_failure"
+            else (TimeoutError, "warmup timed out; retain resources")
+        )
+        with pytest.raises(error, match=message):
+            runner._ffn_forward_connector_driven(single=True)
+        with pytest.raises(RuntimeError, match="failed; retain resources"):
+            p.owner.close(receiver_exited=True)
+        p.history.reset_mock()
+        assert all(ref() is not None for ref in p.produced)
 
 
 def test_eager_orders_events_and_retires_before_allocating_third_item(pipeline):

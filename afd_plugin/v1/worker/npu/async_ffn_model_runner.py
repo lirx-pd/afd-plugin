@@ -421,7 +421,7 @@ class AsyncNPUFFNModelRunner:
         assert self.model is not None
         if self._two_stream is not None:
             self._two_stream.submit(1 if single else len(self.layer_ids))
-            self._two_stream.complete()
+            self._two_stream.complete(wait=self._wait_graph_device if single else None)
             return None
         stage_idx = 0
         rank_ffn_output = None

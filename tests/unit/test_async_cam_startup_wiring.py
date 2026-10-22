@@ -68,6 +68,58 @@ def test_two_stream_attention_preflight_rejects_unqualified_modes(
             connector._validate_two_stream_attention()
 
 
+@pytest.mark.parametrize("role", ["attention", "ffn"])
+@pytest.mark.parametrize(
+    "value,enabled",
+    [
+        (None, False),
+        ("0", False),
+        ("", False),
+        ("false", False),
+        (" False ", False),
+        ("1", True),
+        ("true", True),
+        (" TRUE ", True),
+        ("yes", False),
+        ("2", False),
+    ],
+)
+def test_two_stream_flashcomm1_matches_ascend_boolean_parsing(
+    modules, monkeypatch, role, value, enabled
+):
+    _, module, _ = modules
+    if value is None:
+        monkeypatch.delenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", value)
+    monkeypatch.setenv("AFD_ASYNC_CAM_LAYERED_GMM", "1")
+    config = npu_vllm_config(
+        role=role,
+        connector="CAMAsyncAFDConnector",
+        async_dp=True,
+        compute_gate_on_attention=True,
+        use_mla=True,
+    )
+    if role == "ffn":
+
+        def validate():
+            _fail_if_unsupported_npu_afd_async_features(
+                config,
+                parse_afd_config(config),
+                module.AFDAsyncExtraInfo(ffn_two_stream=True, dynamic_quant=1),
+            )
+
+    else:
+        connector = module.CAMAsyncAFDConnector.__new__(module.CAMAsyncAFDConnector)
+        connector.vllm_config = config
+        validate = connector._validate_two_stream_attention
+    if enabled:
+        with pytest.raises((ValueError, RuntimeError), match="two-stream"):
+            validate()
+    else:
+        validate()
+
+
 @pytest.mark.parametrize(
     "invalid,dbo_flag",
     [

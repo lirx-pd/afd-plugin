@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
@@ -159,13 +160,19 @@ class AsyncFFNTwoStream:
             self.failure = exc
             raise
 
-    def complete(self) -> bool:
+    def complete(
+        self, *, wait: Callable[[torch.npu.Event], None] | None = None
+    ) -> bool:
         self._check_live()
         if not self.pending:
             raise RuntimeError("Async FFN two-stream has no pending submission")
         try:
-            # Match the existing bounded-batch completion policy.
-            torch.npu.synchronize()
+            if wait is None:
+                # Match the existing bounded-batch completion policy.
+                torch.npu.synchronize()
+            else:
+                # FIFO send completion also covers all preceding compute work.
+                wait(self.slots[(self.sequence - 1) % len(self.slots)].done)
         except Exception as exc:
             self.failure = exc
             raise

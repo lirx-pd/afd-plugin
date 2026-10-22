@@ -458,7 +458,8 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             or parallel.prefill_context_parallel_size != 1
             or parallel.decode_context_parallel_size != 1
             or parallel.use_sequence_parallel_moe
-            or int(os.environ.get("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0"))
+            or os.environ.get("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0").strip().lower()
+            in ("1", "true")
             or config.speculative_config is not None
         ):
             raise ValueError(

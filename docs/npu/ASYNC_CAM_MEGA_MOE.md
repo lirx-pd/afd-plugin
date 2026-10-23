@@ -219,7 +219,55 @@ topology below. Then compare against layered eager and layered FULL with
 identical topology, capacity, routing and model settings. Measure rather than
 infer the performance benefit.
 
-## Functional upgrade qualification
+## CANN 9.1 const fix and fresh-kernel qualification
+
+`TileTransport::Count()` and `Prefix()` are non-const because CANN 9.1
+`TBuf::Get()` has no const overload. Receive/send callers are already non-const;
+this fix changes no routing or numerical operations.
+
+On 2026-10-23, all existing MegaMoE kernel `.o` and `.json` artifacts were removed
+before rebuilding. The build checked compiler logs as well as exit codes,
+required a newly written kernel with a different hash, and verified the installed
+kernel against it. The new SHA-256 is
+`8b4b0ee93d70513e3a32ca4dae655bda24981bf25ad20a5f8be5aa061f3f1146`.
+Kernel compilation, packaging and installation passed on CANN 9.1.0 / A3.
+
+The new kernel passed 25 interface/graph tests, FP16/BF16 communication with
+quantization off/on, the TP2 32/33-token boundary, and eager/FULL small-capacity
+and H4096/I2048 finite comparisons against saved layered outputs.
+
+The same 300-document GSM8K evaluation completed with **283/300 (94.33%)** for
+strict-match and flexible-extract. Attention remains DP2/TP4 eager, FFN is
+DP8/TP1/EP8 FULL, with 8-shot greedy evaluation, 512 output tokens, concurrency
+12 and MBT/max-model-len 32768. All eight FFN ranks captured two graphs and
+recorded at least 176,128 completed logical transactions each. Source and native
+binary hashes matched before and after evaluation; inference errors were zero.
+
+All document, prompt and target hashes match the historical Phase 2 run, as do
+model metadata, dataset and package versions. Against its 286/300 score, two
+answers improved and five worsened; 165 generated texts differ. No fresh baseline
+was run. The observed score is 1 percentage point lower; accuracy parity and the
+cause of the difference are not established. The invalidated 287/300 upgrade
+run below is not a reference for the new kernel.
+
+The model test and complete qualification both exited 0. Test processes and
+ports were released; both iTASK allocations remain Running. Forced service
+shutdown still logs existing exceptions and resource-tracker warnings.
+Changed-file pre-commit passes. Performance, graceful shutdown and long-running
+fault recovery remain unqualified.
+
+[Fresh-kernel validation](ASYNC_CAM_MEGA_MOE_CONST_FIX_VALIDATION.json) records
+build identity, actual scores, sample comparison and the retained archive hash.
+
+## Superseded upgrade qualification
+
+**Invalidated:** the build log contains a CANN 9.1 const-correctness error in
+`TileTransport::Prefix()`. Packaging continued with a pre-existing kernel.
+The recorded 287/300 run and finite tests below do not qualify the upgraded
+kernel, even though source and installed-binary hashes were recorded.
+The fresh-kernel qualification above replaces this invalidated conclusion.
+
+### Original observations
 
 The combined DS8/CR8, K=4 graph and metadata-cache build passed the following
 checks on A3 with CANN 9.1.0:

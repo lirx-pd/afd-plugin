@@ -2,7 +2,7 @@
   "date": "2026-10-23",
   "branch": "feat/async-cam-megamoe-phase2",
   "base_commit": "22334e2",
-  "status": "fixed functional upgrade qualified; performance qualification deferred",
+  "status": "INVALID as qualification of the upgraded kernel: CANN compilation failed and packaging continued with a pre-existing binary",
   "task": "afd-cross-task-f-20261021",
   "retained_tasks": {
     "afd-cross-task-f-20261021": "Running",
@@ -1194,5 +1194,6 @@
     "Long-running peer-failure recovery and graceful service shutdown are unqualified.",
     "Repository-wide pre-commit has unrelated pre-existing failures; the passing scope is changed files.",
     "CPU pytest excludes unconfigured real-model E2E tests; unavailable and opt-in tests are skipped."
-  ]
+  ],
+  "invalidated_reason": "TileTransport::Prefix() const called non-const TBuf::Get(). build-final.log records the compiler failure despite a successful outer build exit. The 287/300 measurement cannot qualify the upgraded kernel."
 }

@@ -219,10 +219,10 @@ public:
         }
     }
 private:
-    __aicore__ uint32_t Count(uint32_t tp, uint32_t expert) const {
+    __aicore__ uint32_t Count(uint32_t tp, uint32_t expert) {
         return Prefix(tp, expert + 1) - Prefix(tp, expert);
     }
-    __aicore__ uint32_t Prefix(uint32_t tp, uint32_t expert) const {
+    __aicore__ uint32_t Prefix(uint32_t tp, uint32_t expert) {
         return expert == 0 ? 0 : metadata_.Get<int64_t>().GetValue(
             5 + t_.recv.tpSize + tp * t_.recv.routeExpertNumPerMoe + expert - 1);
     }

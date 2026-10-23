@@ -25,7 +25,8 @@ def config():
     return [16, 256, 256, 2, 2, 1, 4, 1, 3, 1, 16, 2, 2, 2]
 
 
-def test_mega_moe_meta_shapes_and_weight_contract(torch_runtime):
+@pytest.mark.parametrize("use_out", [False, True])
+def test_mega_moe_meta_shapes_and_weight_contract(torch_runtime, use_out):
     torch = torch_runtime
     anchor = torch.empty(1, dtype=torch.bfloat16, device="meta")
     comm = torch.empty(1, dtype=torch.float16, device="meta")
@@ -37,7 +38,7 @@ def test_mega_moe_meta_shapes_and_weight_contract(torch_runtime):
     s2 = [torch.empty(4, 2, 256, dtype=torch.int64, device="meta")] * 2
     b13 = [torch.empty(4, 512, dtype=torch.float32, device="meta")] * 2
     b2 = [torch.empty(4, 256, dtype=torch.float32, device="meta")] * 2
-    output = torch.ops.afd_ascend.afd_mega_moe_ffn(
+    args = (
         anchor,
         comm,
         w13,
@@ -52,24 +53,20 @@ def test_mega_moe_meta_shapes_and_weight_contract(torch_runtime):
         "meta-contract",
         2.5,
     )
+    op = torch.ops.afd_ascend.afd_mega_moe_ffn
+    kwargs = {}
+    if use_out:
+        op = op.out
+        kwargs["out"] = torch.empty(1, dtype=torch.int64, device="meta")
+    output = op(*args, **kwargs)
     assert output.shape == (1,)
     assert output.dtype == torch.int64 and output.device.type == "meta"
+    if use_out:
+        assert output is kwargs["out"]
+        with pytest.raises(RuntimeError, match="completion must have shape"):
+            op(*args, out=torch.empty(2, dtype=torch.int64, device="meta"))
     with pytest.raises(RuntimeError, match="layer table length"):
-        torch.ops.afd_ascend.afd_mega_moe_ffn(
-            anchor,
-            comm,
-            w13[:1],
-            w2,
-            s13,
-            s2,
-            b13,
-            b2,
-            layer_map,
-            scratch,
-            config(),
-            "meta-contract",
-            2.5,
-        )
+        op(*args[:2], w13[:1], *args[3:], **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -98,3 +95,7 @@ def test_mega_moe_workspace_is_available_before_receiving(torch_runtime):
     scratch = torch.ops.afd_ascend.afd_mega_moe_ffn_workspace(anchor, config())
     assert scratch.device == anchor.device
     assert scratch.dtype == torch.uint8 and scratch.ndim == 1 and scratch.numel() > 0
+    larger = config()
+    larger[10] = 262144
+    other = torch.ops.afd_ascend.afd_mega_moe_ffn_workspace(anchor, larger)
+    assert other.shape == scratch.shape

@@ -56,6 +56,7 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
+MEGA_GRAPH_BATCH_SIZE = 4
 
 
 class FFNModel(Protocol):
@@ -220,7 +221,11 @@ class AsyncNPUFFNModelRunner:
         )
         signature = ""
         if executor:
-            backend_prefix = "mega_moe_v1:" if self._mega_executor else ""
+            backend_prefix = (
+                f"mega_moe_v2:graph_batch={MEGA_GRAPH_BATCH_SIZE}:"
+                if self._mega_executor
+                else ""
+            )
             signature = backend_prefix + executor.graph_signature(
                 cam_receive_capacity()
             )
@@ -278,6 +283,7 @@ class AsyncNPUFFNModelRunner:
         self._graph_stream = stream
         self._graph_pool = torch.npu.graph_pool_handle()
         self._graph_tensors: list[torch.Tensor] = []
+        self._batch_graph: torch.npu.NPUGraph | None = None
 
     def _check_graph_live(self) -> None:
         if self._graph_failure is not None:
@@ -325,6 +331,16 @@ class AsyncNPUFFNModelRunner:
                         self._graph_output, self._graph_payload.context
                     )
             self._graph_capture_count = 1
+            if self._mega_executor is not None and MEGA_GRAPH_BATCH_SIZE > 1:
+                self._batch_graph = torch.npu.NPUGraph()
+                with torch.npu.graph(
+                    self._batch_graph, pool=self._graph_pool, stream=self._graph_stream
+                ):
+                    for _ in range(MEGA_GRAPH_BATCH_SIZE):
+                        self._mega_executor(
+                            self.connector.comm_args, self.connector.group_name
+                        )
+                self._graph_capture_count += 1
         except Exception as exc:
             self._graph_failure = exc
             raise
@@ -341,7 +357,7 @@ class AsyncNPUFFNModelRunner:
             return
         if (
             self._graph is None
-            or self._graph_capture_count != 1
+            or self._graph_capture_count != (2 if self._batch_graph is not None else 1)
             or self._graph_pending
             or self._graph_receiver_exited
             or count < 1
@@ -350,6 +366,13 @@ class AsyncNPUFFNModelRunner:
         self._graph_pending = True  # A failed launch may already have queued work.
         try:
             with torch.npu.stream(self._graph_stream):
+                if self._mega_executor is not None:
+                    self._mega_executor.completion.zero_()
+                if self._batch_graph is not None:
+                    batches, count = divmod(count, MEGA_GRAPH_BATCH_SIZE)
+                    for _ in range(batches):
+                        self._batch_graph.replay()
+                        self._graph_replay_count += MEGA_GRAPH_BATCH_SIZE
                 for _ in range(count):
                     self._graph.replay()
                     self._graph_replay_count += 1
@@ -369,6 +392,12 @@ class AsyncNPUFFNModelRunner:
             # One fence per bounded batch. The original DR cannot be cancelled;
             # a blocked batch retains its graph, model and communication buffers.
             torch.npu.synchronize()
+            if self._mega_executor is not None:
+                status = self._mega_executor.completion.item()
+                if status != 0:
+                    raise RuntimeError(
+                        f"MegaMoE transaction failed with status {status}"
+                    )
         except Exception as exc:
             self._graph_failure = exc
             raise
@@ -389,6 +418,9 @@ class AsyncNPUFFNModelRunner:
             )
         assert self._graph is not None
         self._graph.reset()
+        if self._batch_graph is not None:
+            self._batch_graph.reset()
+            self._batch_graph = None
         self._graph = None
         self._graph_tensors.clear()
         if self._mega_executor is None:

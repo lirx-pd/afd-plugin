@@ -244,7 +244,7 @@ def main():
             def align(n):
                 return (n + 511) // 512 * 512
 
-            batch_offset = align(capacity * HIDDEN) + align(capacity * 4)
+            batch_offset = 0
             batch_bytes = (5 + 1 + EXPERTS) * 8
             count_offset = batch_offset + align(batch_bytes)
             mega_state = SimpleNamespace(
@@ -257,7 +257,7 @@ def main():
             )
         if args.full_graph:
             assert runner.effective_mode == "full"
-            assert runner._graph_capture_count == 1
+            assert runner._graph_capture_count == (2 if args.mega_moe else 1)
 
             def capture_addresses():
                 session = runner

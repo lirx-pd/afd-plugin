@@ -11,6 +11,7 @@
 #include "tiling/platform/platform_ascendc.h"
 #include "tiling/hccl/hccl_tiling.h"
 #include "../op_kernel/afd_async_combine_recv_tiling.h"
+#include "cam_attention_tiling.h"
 
 #include "ops_log.h"
 #include "ops_error.h"
@@ -182,18 +183,21 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 
     uint32_t blockDim = 1U;
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    uint64_t aivNum = ascendcPlatform.GetCoreNumAiv();
+    const uint32_t availableAivs = ascendcPlatform.GetCoreNumAiv();
+    const uint32_t dispatchAivs = DispatchAivs(batchSize, availableAivs);
+    uint64_t aivNum = CombineAivs(batchSize, availableAivs);
     uint64_t ubSize = 0UL;
     ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
     blockDim = ascendcPlatform.CalcTschBlockDim(aivNum, 0, aivNum);
     context->SetBlockDim(blockDim);
 
     tilingData->moeDistributeCombineInfo.aivNum = aivNum;
+    tilingData->moeDistributeCombineInfo.dispatchAivNum = dispatchAivs;
     tilingData->moeDistributeCombineInfo.totalUbSize = ubSize;
     tilingData->moeDistributeCombineInfo.totalWorkspaceSize = sharedMemSize;
 
     // Keep the original kernel for at most one token per core; larger batches reuse dispatch prefixes.
-    bool useDispatchPrefix = batchSize > static_cast<int64_t>(aivNum);
+    bool useDispatchPrefix = aivNum == dispatchAivs && batchSize > static_cast<int64_t>(aivNum);
     auto xDtype = context->GetInputDesc(0)->GetDataType();
     if (xDtype == ge::DT_BF16) {
         context->SetTilingKey(useDispatchPrefix ? TILING_KEY_BF16_PREFIX : TILING_KEY_BF16);

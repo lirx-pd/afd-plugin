@@ -1,64 +1,71 @@
-# Async CAM MegaMoE phase 1 (A3)
+# Async CAM MegaMoE (A3)
 
-Status: experimental A3 implementation; qualification scope is recorded below.
-The branch is `feat/async-cam-megamoe-phase1`, based on afd-plugin
-`df8d6a0c403c3ca1b4ed9cf1687e7204908bebec`.
+Status: experimental A3 implementation. A runnable Phase 2 version is available on
+`feat/async-cam-megamoe-phase2`, based on Phase 1 commit `22334e2`.
+The current functional upgrade fixes small-batch DS/CR at 8 AIVs, batches four
+MegaMoE transactions per FULL graph, and caches immutable chunk metadata.
+It remains disabled by default. Performance qualification is deferred; the
+historical Phase 2 measurements below describe the pre-upgrade implementation.
 
 ## Scope and entry points
 
 `afd_mega_moe_ffn` is a single bounded `MIX_AIC_1_2` kernel:
 
 ```text
-all AIV: compact-v2 DR
-all cores: barrier, validate layer/counts
-for each nonempty expert and each <=128-row tile:
-    AIV: copy activation/scales and publish tile counts
-    AIV: existing MSD INT8 -> high/low INT4 preprocessing
-    AIC: GMM1 with packed NZ INT4 weights
-    AIV: existing dequant/compensation/SwiGLU/full-row quantization
-    AIV: existing MSD preprocessing of the quantized activation
-    AIC: GMM2
-    AIV: dequant/compensation -> BF16 -> routed scaling -> BF16
-all AIV: compact-v2 CS
+AIV 0: select compact-v2 source/expert chunk and publish metadata
+all cores: validate layer/counts, initialize per-invocation sequence flags
+8 communication AIVs: receive two tiles, then send completed tile / refill freed slot
+remaining AIVs: INT8->INT4 prep, SwiGLU/full-row quantization, BF16 output
+all AICs: G1(0), G1(1), G2(0), G1(2), G2(1), ..., G2(last)
+communication AIV 0: release consumed input and publish final compact-v2 completion
 all cores: drain, write completion status
 ```
 
+Two 128-row slots hold independent G1 and G2 intermediates. A tile belongs to
+one expert and may span multiple Attention TP sources. The producer publishes
+its sequence only after every participating core has drained its writes.
+The communication group reuses a slot only after all senders have consumed it.
+G1/G2 share the AIC pool; no second mixed kernel competes for AIV resources.
+On a full A3 die the allocation is 24 AIC, 8 communication AIV and 40 compute AIV.
+This is the fixed split used for the current functional qualification.
+
 Attention still runs its existing dispatch, shared experts and weighted combine.
 The wire layout and `cam_async_routed_only_compact_v2` identity are unchanged.
-The batch header's total row count is not used as the chunk's valid length;
-compute uses the sum of the selected expert counts.
+Data returns per tile, but Attention observes completion only after the final
+expert chunk; no partial Attention consumption is introduced.
+The selected source stays fixed for one invocation. Stream-v3 credits,
+independent-source scheduling and source preemption remain outside Phase 2.
 
-This implements the phase-ordered P1 candidate. Communication/compute overlap,
-per-tile return, multi-slot credits, stream_v3 and source preemption are P2/P4 work.
-There is no claimed speedup relative to the existing layered FULL baseline.
-
-The standalone DR/CS classes are reused only with **every AIV participating**,
-with their original vector-only barriers inside each phase. Every AIC and AIV
-then executes the same mixed barriers. P2 cannot assign a subset of AIVs to
-these classes without replacing their barriers and core indexing. The mixed
-operator uses batch scheduling and one launch block per Cube (two sibling AIVs),
-covering all available A3 cores. This follows the
-[Ascend SyncAll contract](https://www.hiascend.com/document/detail/zh/canncommercial/850/API/ascendcopapi/atlasascendc_api_07_0204.html).
+The standalone DR runs metadata-only on AIV 0. Its payload path and vector-only
+barriers remain unchanged for existing callers. The ring uses explicit group
+completion flags instead of placing subset participants in `SyncAll`.
+Only entry and exit use mixed global barriers. The mixed kernel uses batch
+scheduling with one block per AIC, including its two sibling AIVs.
 
 ## Ownership and numerical contract
 
-- `AsyncCAMMegaMoeExecutor` owns stable layer mapping, weights, anchor and scratch.
+- `AsyncCAMMegaMoeExecutor` owns stable layer mapping, weights, anchor, scratch
+  and completion status.
   The connector owns the HCCL domain and windows. Graph replay reuses the scratch
   on one stream. Shutdown retains the existing receiver-exit and device-completion
   requirements before releasing either owner.
-- Whole-chunk expanded input/output remain in scratch for compatibility. Only
-  GMM/activation intermediates are bounded to 128 rows. There is no duplicate
-  full-model weight conversion or new weight copy.
-- Input and output route order, expert-chunk continuation and last-chunk completion
-  are inherited from DR/CS. Empty experts skip compute; an empty FFN still runs CS.
+- Scratch contains metadata, per-core completion flags and two 128-row slots.
+  Its size is independent of receive capacity. G1 and G2 have separate scratch
+  in each slot. There is no duplicate full-model weight conversion or new copy.
+- Input and output preserve compact-v2 expert/TP route order, expert-chunk
+  continuation and final completion. Empty experts skip compute; an empty FFN
+  still releases input and publishes completion.
 - W4A8 per-channel and per-group use the existing MSD preprocessing and GMM1
   epilogue. GMM2 reuses the MSD matmul and implements its output epilogue. This
   selection may differ in rounding from the layered autotiling path; compare
   numerical outputs before accepting it. `swiglu_limit` remains ignored as in
   the current layered executor. Routed scaling rounds to BF16 before multiplying.
 - All mutable cross-phase control reads invalidate the relevant cache line.
-  Each packed tile also invalidates scalar cache before the MSD helpers read
-  its counts and token scales.
+  Each tile stage invalidates scalar cache before the MSD helpers read its
+  counts and token scales. Each flag writer has a separate aligned cache line;
+  scalar control writes explicitly flush it, and readers invalidate before polling.
+  AIV publication waits for MTE3; AIC publication waits for FIX. Replay clears
+  flags at entry after the previous invocation has drained on the same stream.
   Each Cube matmul stage resets its TPipe after `Matmul.End()` so buffer records
   do not accumulate across experts and tiles.
   Scratch and window data transfers use MTE; barriers do not substitute for
@@ -66,8 +73,43 @@ covering all available A3 cores. This follows the
 - The output tensor is an INT64 status: `0` success, `-1` invalid layer mapping,
   `-2` invalid chunk counts. Invalid control data does **not** publish successful
   remote completion. The service must be treated as failed and cleaned up at
-  process level; device-status propagation to the control plane is not yet
-  qualified. The finite harness checks the status after completion.
+  process level. FULL checks the first error after its bounded batch completes,
+  then blocks replay and resource release. Cross-role cancellation and recovery
+  are not provided; an invocation waiting for a failed peer can still block.
+
+## Fixed functional upgrade
+
+Attention DS and CR use at most 8 AIVs for 1–32 local tokens; larger batches
+retain the platform's full AIV count. The CR tiling records the DS statistic
+row count separately from its own execution count. It uses dispatch prefixes
+only when both operators partition tokens identically. The reserved 48-row
+window region and compact-v2 wire layout remain unchanged. This rule applies
+to existing Async CAM callers as well as MegaMoE.
+
+FULL captures a single-transaction graph and a graph containing four serial
+transactions. Submission of N chunks uses N // 4 batched replays and N % 4
+single replays, without rounding N upward. A chunk is selected by compact-v2
+at runtime; graph position does not identify a fixed model layer. Both graphs
+share the stream, pool and scratch. The graph signature includes the batch size.
+
+The new `afd_mega_moe_ffn.out` overload reuses an initialized INT64 completion
+tensor. A negative status is sticky across subsequent transactions. FULL zeros
+it once before submission and reads it after the existing batch fence; it does
+not clear it inside either captured graph. The original overload allocates a
+zero-initialized status for each independent call. Callers of `.out` must
+initialize their status before starting a new independent batch.
+
+Each communication core loads the current chunk's immutable metadata into UB
+once and computes per-TP expert prefixes there. Receive/send reuse these values;
+the tile cursor reads each expert's aggregate count once. Metadata and payload
+buffers remain live until the communication pipeline finishes. Host tiling
+checks their combined UB footprint. Dynamic stage flags, slot visibility,
+global scalar-cache invalidation and MTE3/FIX fences retain their existing rules.
+
+Device-side multi-transaction polling (P3) is deferred. Each native invocation
+still consumes one compact-v2 chunk. Qualification of the fixed version focuses
+on function and accuracy, with no claimed performance gain or selected optimal
+core count.
 
 ## Supported bounds
 
@@ -81,7 +123,7 @@ There are at most 256 local experts and at most 384 A+F ranks.
 bound is `(max_seq_len / TP) * top_k <= 65535`. Receive capacity must be at least
 `max_seq_len`, so a complete expert fits even under worst-case routing. Explicit
 window and UB checks also run in host tiling. The legacy receive-capacity
-`BATCH_SIZE_FACTOR` still applies. These are P1 bounds, not newly claimed
+`BATCH_SIZE_FACTOR` still applies. These retain the P1 bounds, not newly claimed
 capabilities of the older operators.
 
 ## Build and enable
@@ -172,12 +214,139 @@ for a real checkpoint's accuracy budget.
 
 Before enabling real service traffic, complete invalid-layer/count fault
 handling, long-running lifecycle checks, and a profiler showing one FFN mixed
-kernel. Extend checkpoint accuracy coverage beyond the specific eager case
-below. Then compare against layered eager and layered FULL with
+kernel. Extend checkpoint accuracy coverage beyond the tested checkpoint and
+topology below. Then compare against layered eager and layered FULL with
 identical topology, capacity, routing and model settings. Measure rather than
 infer the performance benefit.
 
-## Current evidence
+## Functional upgrade qualification
+
+The combined DS8/CR8, K=4 graph and metadata-cache build passed the following
+checks on A3 with CANN 9.1.0:
+
+- 25 compiled Meta/workspace and graph-runner tests, including exact transaction
+  counts, remainder batches, sticky errors and resource-retention guards.
+- Existing four-operator CAM tests against the CPU oracle for FP16/BF16 with
+  dynamic quantization off/on, sparse routing and an empty FFN. A separate
+  TP2 case uses 32 and 33 local tokens to cross the small-batch tiling boundary.
+- Eager and FULL against saved layered outputs with dense signed per-group
+  weights, H256/I512, routed scale 2.5, two sources and capacity 256. Both FULL
+  ranks capture two graphs and complete 16 and 14 logical transactions.
+- Eager and FULL at H4096/I2048, 32 experts and capacity 262144, including empty
+  FFN work, repeated layers and 129-token workloads spanning multiple tiles.
+  Both FULL ranks capture two graphs and complete seven logical transactions.
+- 596 local CPU tests and 33 subtests; 184 unavailable or opt-in checks skip.
+  The 162-case host workspace check passes ASan/UBSan with leak detection off.
+
+The independent graph candidate also completed native K=1/2/4 submissions of
+1, 5, 43 and 43 transactions, then released its resources. An invalid layer map
+produced status -1; a subsequent successful native call retained -1. This
+checks first-error retention, not recovery from a failed peer or a stuck kernel.
+All functional fixtures completed their cleanup.
+
+The combined build completed **287/300 GSM8K samples (95.67%)** for both
+strict-match and flexible-extract on `afd-cross-task-f-20261021`. It uses the
+same DeepSeek-V4-Flash DSpark W4A8 checkpoint, Attention DP2/TP4 eager and
+FFN DP8/TP1/EP8 FULL configuration as the historical Phase 2 run. The 8-shot,
+greedy, 512-output-token, concurrency-12 evaluation settings and 32768 token
+limits are unchanged. The historical Phase 2 score is 286/300; no fresh baseline
+was run, and this comparison does not establish accuracy parity.
+
+All 300 document, prompt and target hashes match that historical run. Model
+metadata, dataset and package versions also match. Four answers improved and
+three worsened; 166 generated texts differ. All eight FFN ranks selected
+MegaMoE for 43 layers, captured two graphs and recorded at least 176,128
+successfully completed logical transactions each. Counts include warmup,
+smoke and evaluation work; they are not Python replay-call counts.
+
+Source and native binary hashes match before and after evaluation. There were
+no inference errors or missing/duplicate documents. The first archive verifier
+encountered TCP TIME_WAIT on port 6455 after process cleanup; the unchanged
+verifier passed once the port was released, without rerunning inference.
+The harness still logs exceptions and resource-tracker warnings during forced
+shutdown. Test processes are gone, ports are free, and both existing iTASK
+allocations remain Running. Graceful shutdown remains unqualified.
+
+Changed-file pre-commit passes. Repository-wide pre-commit still has unrelated
+pre-existing failures; local pytest excludes unconfigured model E2E tests.
+[Upgrade evidence](ASYNC_CAM_MEGA_MOE_UPGRADE_VALIDATION.json) records the fixed
+source/binary identities, test scopes, sample comparison and artifact hashes.
+
+## Historical Phase 2 qualification before this upgrade
+
+The runnable version uses two 128-row slots with separate G1/G2 scratch,
+8 communication AIVs and 40 compute AIVs. At H=4096, I=2048, 32 local experts
+and Attention TP=4, scratch is 23,773,696 bytes (22.67 MiB), independent of
+receive capacity. The entry points, flags and compact-v2 wire format are
+unchanged from Phase 1.
+
+The frozen kernel passed eager and FULL finite tests at H=4096/I=2048 with
+32 local experts and receive capacity 262144. These compare all seven
+7/16/129-token workloads against saved layered outputs and cover empty FFN
+work, repeated layers and slot reuse. FULL records one capture and seven
+replays per FFN rank, stable addresses and poisoned scratch between requests.
+A separate Attention TP4/FFN2 fixture passed 12 repetitions with distinct TP
+source values and an analytic output check. These are operator tests, not a
+real-model accuracy conclusion.
+
+The small-capacity fixture also passed eager and FULL against saved layered
+outputs with dense signed per-group weights, H=256/I=512, routed scale 2.5,
+capacity 256 and two independent Attention sources. It covers the 129-row
+case spanning two expert chunks, source switching, empty FFN work and poisoned
+scratch. The two FULL FFN ranks captured once and completed 16 and 14 replays.
+
+The compiled binding passed all seven Meta/workspace tests. Local pytest passed
+596 tests and 33 subtests, with 183 tests skipped; the CPU environment does not
+replace native NPU qualification. Pre-commit and the 162-case ASan/UBSan
+workspace check passed.
+
+The polling loop must reload its flag after cache invalidation: a non-volatile
+load caused a reproducible wait despite the other participants publishing
+their sequence. The frozen version uses a volatile GM load and explicit
+per-writer cache flushes. Broader cache and DMA optimizations were not retained.
+
+The following diagnostic measurements use the native kernel duration from
+the CANN profiler, with dispatch completed before FFN launch. Each value is
+the maximum across FFN ranks of the last five kernel durations averaged after
+12 repetitions and a cold warmup. Both versions use the same synthetic
+workload and topology. These are not end-to-end model performance results.
+
+| Workload | Attention TP | Phase 1 (us) | Phase 2 (us) |
+| --- | --- | --- | --- |
+| 7 tokens | 1 | 676.704 | 1097.832 |
+| 1024 tokens, one expert | 1 | 1368.604 | 2387.948 |
+| 1024 tokens, balanced experts | 1 | 1593.324 | 2998.564 |
+| 129 tokens, one expert | 4 | 926.336 | 1562.212 |
+
+Phase 2 has not met a performance acceptance criterion. Further tuning and
+an end-to-end performance comparison are deferred. No new real-model baseline
+was run.
+
+The frozen build completed **286/300 GSM8K samples (95.33%)**, for both
+strict-match and flexible-extract, on `afd-cross-task-f-20261021`. DeepSeek-V4-Flash
+DSpark W4A8 ran with Attention DP2/TP4 in eager mode and FFN DP8/TP1/EP8 in
+FULL graph mode. The run retained 8-shot greedy evaluation, 512 output tokens,
+concurrency 12, MBT/max-model-len 32768, DBO off and FFN two-stream off.
+All eight FFN ranks selected MegaMoE for 43 layers, captured once and recorded
+at least 176,128 successfully completed replays each. Exit code was 0; there
+were no inference errors, missing documents or duplicate documents.
+
+All 300 document, prompt and target hashes match the historical Phase 1 runs;
+model metadata, dataset and package versions also match the Phase 1 FULL run.
+Relative to its 288/300 score, two documents improved and four worsened, with
+159 generated texts differing. The historical eager score was 285/300.
+This establishes completion on this checkpoint, not numerical or accuracy parity.
+
+The source and native-artifact hashes were verified before and after evaluation.
+The harness cleaned up its service processes and freed its ports; its forced
+shutdown still logs FFN exceptions and resource-tracker warnings. The iTASK
+allocation remains Running. Graceful shutdown and long-running lifecycle are
+not qualified by this run.
+
+[Phase 2 evidence](ASYNC_CAM_MEGA_MOE_PHASE2_VALIDATION.json) records the frozen
+source/binary hashes, finite checks, real-model results and diagnostic timings.
+
+## Historical Phase 1 evidence
 
 Validated on 2026-10-23 with A3 / ascend910_93 and CANN 9.1.0. The isolated
 source build compiled the mixed kernel, generated ACLNN API and PyTorch binding.
@@ -250,7 +419,27 @@ at the user's request.
 
 [GSM8K evidence](ASYNC_CAM_MEGA_MOE_GSM8K_300.json) records the fixed source and
 binary hashes, settings, scores, retained artifact hashes and remaining limits.
-This follow-up covers that checkpoint and Attention TP=4 in eager mode. The
-fixed build's FULL mode, dedicated concurrent-source stress, invalid-control
-recovery, long-running lifecycle, kernel profiling and performance benefit
-remain unqualified.
+This follow-up covers that checkpoint and Attention TP=4 in eager mode.
+
+### Real-checkpoint FFN FULL follow-up
+
+The Phase 1 Python runner and the same repaired native kernel subsequently
+passed 300 GSM8K samples on A3 task `afd-cross-task-f-20261021`: strict-match
+and flexible-extract both **288/300 (96.00%)**. Attention remained eager with
+DP2/TP4; FFN used FULL graph with DP8/TP1/EP8. All other evaluation settings
+above were retained. Test-only wrappers recorded one capture and at least
+176,128 successfully completed replays on each of the eight FFN ranks, with
+MegaMoE active. Counts include startup, smoke and evaluation work.
+
+All 300 document, prompt and target hashes matched the saved eager run. Seven
+documents changed correctness (five improved, two worsened); 165 generated
+texts differed. The historical eager score was 285/300. No fresh baseline was
+run, and this cross-host comparison does not establish numerical parity or
+an accuracy gain caused by graph mode.
+
+[FFN FULL evidence](ASYNC_CAM_MEGA_MOE_GRAPH_GSM8K_300.json) records the source
+and native hashes, scores and capture/replay observations. Test exit code was
+0; no inference errors or remaining tagged test processes were found. The
+iTASK allocation remains Running. Attention graph mode, dedicated
+concurrent-source stress, invalid-control recovery, long-running lifecycle,
+kernel profiling and performance benefit remain unqualified.

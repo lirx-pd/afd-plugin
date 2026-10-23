@@ -11,6 +11,7 @@
 #include "tiling/platform/platform_ascendc.h"
 #include "tiling/hccl/hccl_tiling.h"
 #include "../op_kernel/afd_async_dispatch_send_tiling.h"
+#include "cam_attention_tiling.h"
 
 #include "ops_log.h"
 #include "ops_error.h"
@@ -195,7 +196,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 
     uint32_t blockDim = 1U;
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    uint64_t aivNum = ascendcPlatform.GetCoreNumAiv();
+    uint64_t aivNum = DispatchAivs(batchSize, ascendcPlatform.GetCoreNumAiv());
     uint64_t ubSize = 0UL;
     ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
     blockDim = ascendcPlatform.CalcTschBlockDim(aivNum, 0, aivNum);

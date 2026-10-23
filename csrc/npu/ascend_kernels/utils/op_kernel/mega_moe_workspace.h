@@ -33,25 +33,33 @@ AFD_MEGA_HOST_DEVICE constexpr uint64_t MegaAlign(uint64_t n) {
     return (n + MEGA_ALIGNMENT - 1) / MEGA_ALIGNMENT * MEGA_ALIGNMENT;
 }
 
-// One chunk retains the compact-v2 DR/CS ordering; compute scratch is tile-sized.
+constexpr uint32_t MEGA_RING_SLOTS = 2;
+constexpr uint32_t MEGA_COMM_AIVS = 8;
+constexpr uint32_t MEGA_MAX_AIVS = 48;
+constexpr uint32_t MEGA_PIPELINE_STAGES = 7;
+
+// One cache line per writer; no payload-sized allocation depends on chunk capacity.
 struct MegaWorkspace {
-    uint64_t x, scales, batch, counts, y, tileX, tileScales, tileCounts, z, zScales, compute, bytes;
-    AFD_MEGA_HOST_DEVICE MegaWorkspace(uint64_t capacity, uint64_t h, uint64_t i, uint64_t e,
+    uint64_t batch, counts, flags, tileX, tileScales, tileCounts, z, zScales;
+    uint64_t compute, compute2, y, slotBytes, bytes;
+    AFD_MEGA_HOST_DEVICE MegaWorkspace(uint64_t /*capacity*/, uint64_t h, uint64_t i, uint64_t e,
                                        uint64_t tp) {
-        x = 0;
-        scales = MegaAlign(capacity * h);
-        batch = scales + MegaAlign(capacity * sizeof(float));
-        counts = batch + MegaAlign((5 + tp + e * tp) * sizeof(int64_t));
-        y = counts + MegaAlign(e * sizeof(int64_t));
-        tileX = y + MegaAlign(capacity * h * sizeof(uint16_t));
+        batch = 0;
+        counts = MegaAlign((5 + tp + e * tp) * sizeof(int64_t));
+        flags = counts + MegaAlign(e * sizeof(int64_t));
+        tileX = flags + MEGA_PIPELINE_STAGES * (MEGA_MAX_AIVS + 1) * MEGA_ALIGNMENT;
         tileScales = tileX + MegaAlign(MEGA_TILE_ROWS * h);
         tileCounts = tileScales + MegaAlign(MEGA_TILE_ROWS * sizeof(float));
         z = tileCounts + MegaAlign(e * sizeof(int64_t));
         zScales = z + MegaAlign(MEGA_TILE_ROWS * i);
         compute = zScales + MegaAlign(MEGA_TILE_ROWS * sizeof(float));
-        uint64_t g1 = 2 * MEGA_TILE_ROWS * h + 8 * MEGA_TILE_ROWS * 2 * i;
-        uint64_t g2 = 2 * MEGA_TILE_ROWS * i + 8 * MEGA_TILE_ROWS * h;
-        bytes = compute + MegaAlign(g1 > g2 ? g1 : g2);
+        compute2 = compute + MegaAlign(2 * MEGA_TILE_ROWS * h + 8 * MEGA_TILE_ROWS * 2 * i);
+        y = compute2 + MegaAlign(2 * MEGA_TILE_ROWS * i + 8 * MEGA_TILE_ROWS * h);
+        slotBytes = y + MegaAlign(MEGA_TILE_ROWS * h * sizeof(uint16_t)) - tileX;
+        bytes = tileX + MEGA_RING_SLOTS * slotBytes;
+    }
+    AFD_MEGA_HOST_DEVICE uint64_t SlotOffset(uint32_t sequence) const {
+        return ((sequence - 1) % MEGA_RING_SLOTS) * slotBytes;
     }
 };
 

@@ -54,7 +54,8 @@ public:
                                 GM_ADDR workspaceGM, TPipe *pipe,
                                 const AfdAsyncDispatchRecvTilingData *tilingData,
                                 GM_ADDR commArgs, int32_t isCamComm);
-    __aicore__ inline void Process();
+    // MegaMoE calls metadata-only mode on AIV 0; payload ownership stays with its tile pipeline.
+    __aicore__ inline void Process(bool copyPayload = true);
 
 private:
     __aicore__ inline uint32_t MathCeil(uint32_t n, uint32_t align)
@@ -72,9 +73,9 @@ private:
             epWinContext_->remoteRes[rankId].nextDevicePtr)->windowsIn;
     }
 
-    __aicore__ inline void DispatchRecv();
+    __aicore__ inline void DispatchRecv(bool copyPayload);
     __aicore__ inline void DispatchRecvRouted(uint32_t tpAttnRankId, uint32_t tpIndex,
-                                               uint32_t startExpert, uint32_t endExpert);
+                                               uint32_t startExpert, uint32_t endExpert, bool copyPayload);
 
     __aicore__ inline uint32_t WaitFromAttn();
 
@@ -230,17 +231,17 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::Init(
 }
 
 template <TemplateMC2TypeClass>
-__aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::Process()
+__aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::Process(bool copyPayload)
 {
     if (isError_ == true) {
         return;
     }
 
-    DispatchRecv();
+    DispatchRecv(copyPayload);
 }
 
 template <TemplateMC2TypeClass>
-__aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::DispatchRecv()
+__aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::DispatchRecv(bool copyPayload)
 {
     uint32_t tpAttnRankId = WaitFromAttn();
 
@@ -305,11 +306,13 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::DispatchRecv()
         isError_ = true;
         return;
     }
-    SyncAll<true>();
+    if (copyPayload) {
+        SyncAll<true>();
+    }
 
 
     for (uint32_t tpIndex = 0; tpIndex < tpSize_; ++tpIndex) {
-        DispatchRecvRouted(tpAttnRankId, tpIndex, startExpert, endExpert);
+        DispatchRecvRouted(tpAttnRankId, tpIndex, startExpert, endExpert, copyPayload);
     }
 
     if (aivId_ == 0) {
@@ -354,7 +357,7 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::DispatchRecv()
 
 template <TemplateMC2TypeClass>
 __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::DispatchRecvRouted(
-    uint32_t tpAttnRankId, uint32_t tpIndex, uint32_t startExpert, uint32_t endExpert)
+    uint32_t tpAttnRankId, uint32_t tpIndex, uint32_t startExpert, uint32_t endExpert, bool copyPayload)
 {
     uint32_t maxSeqLenPerRank = maxSeqLen_ / tpSize_;
     uint32_t attnRankId = tpAttnRankId + tpIndex;
@@ -393,6 +396,13 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::DispatchRecvRo
     SyncFunc<HardEvent::S_MTE2>();
     for (uint32_t i = 0; i < expertNumPerMoe_; ++i) {
         tpBatchInfoTensor_(INFO_NUM + tpSize_ + expertNumPerMoe_ * tpIndex + i) = expertRecvTokenNumTensor_(i);
+    }
+
+    if (!copyPayload) {
+        for (uint32_t i = startExpert; i <= endExpert; ++i) {
+            tpExpertRecvTokenNumTensor_(expertNumPerMoe_ + i) += expertRecvTokenNumTensor_(i);
+        }
+        return;
     }
 
     uint32_t tokenNumSum = 0;

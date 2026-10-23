@@ -20,15 +20,21 @@ from afd_plugin.v1.worker.npu.async_ffn_model_runner import (  # noqa: E402
 @pytest.fixture
 def session_harness(monkeypatch):
     calls = []
+    capturing = []
     connector = SimpleNamespace()
 
     class FakeGraph:
         fail_launch = False
 
+        def __init__(self):
+            self.operations = []
+
         def replay(self):
             calls.append("replay")
             if self.fail_launch:
                 raise RuntimeError("partial launch")
+            for operation in self.operations:
+                operation()
 
         def reset(self):
             calls.append("reset")
@@ -36,7 +42,11 @@ def session_harness(monkeypatch):
     @contextmanager
     def capture(graph, *, pool, stream):
         calls.append("capture")
-        yield
+        capturing.append(graph)
+        try:
+            yield
+        finally:
+            capturing.pop()
 
     monkeypatch.setattr(
         torch,
@@ -76,6 +86,7 @@ def session_harness(monkeypatch):
 
     connector.recv_attn_output = receive
     connector.send_ffn_output = send
+    connector.capture_operation = lambda fn: capturing[-1].operations.append(fn)
     session = AsyncNPUFFNModelRunner.__new__(AsyncNPUFFNModelRunner)
     session.model = torch.nn.Linear(1, 1)
     session._layered_executor = execute
@@ -87,6 +98,74 @@ def session_harness(monkeypatch):
     session._graph_failure = None
     session._initialize_graph(SimpleNamespace(synchronize=lambda: calls.append("wait")))
     return session, connector, calls
+
+
+@pytest.fixture
+def mega_session(session_harness):
+    session, connector, calls = session_harness
+    pending: list[tuple[int, int]] = []
+    consumed: list[tuple[int, int]] = []
+    completion = torch.zeros(1, dtype=torch.int64)
+
+    def consume():
+        consumed.append(pending.pop(0))
+
+    class Executor:
+        def __init__(self):
+            self.completion = completion
+
+        def __call__(self, *args):
+            connector.capture_operation(consume)
+            return self.completion
+
+    session._mega_executor = Executor()
+    connector.comm_args, connector.group_name = None, "fake-cam"
+    return session, pending, consumed, completion, calls
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+@pytest.mark.parametrize("count", [1, 5, 43])
+def test_mega_graph_consumes_exactly_the_available_transactions(
+    mega_session, monkeypatch, batch_size, count
+):
+    session, pending, consumed, completion, _ = mega_session
+    monkeypatch.setattr(
+        "afd_plugin.v1.worker.npu.async_ffn_model_runner.MEGA_GRAPH_BATCH_SIZE",
+        batch_size,
+    )
+    session._capture_graph()
+    for _ in range(2):
+        # Transactions are chunks selected at replay time, including repeated layers.
+        pending.extend((i % 3, i // 3) for i in range(count))
+        expected = consumed + pending
+        completion.fill_(-9)
+        session._submit_graph(count)
+        assert session._complete_graph()
+        assert consumed == expected and pending == []
+    session._graph_receiver_exited = True
+    session._close_graph()
+    session._close_graph()
+    with pytest.raises(RuntimeError, match="closed"):
+        session._submit_graph()
+
+
+def test_mega_graph_status_failure_blocks_retry_and_release(mega_session):
+    session, pending, _, completion, calls = mega_session
+    session._capture_graph()
+    pending.extend((i, 0) for i in range(5))
+    session._submit_graph(5)
+    completion.fill_(-2)
+    with pytest.raises(RuntimeError, match="status -2"):
+        session._complete_graph()
+    session._graph_receiver_exited = True
+    for operation in (
+        session._submit_graph,
+        session._complete_graph,
+        session._close_graph,
+    ):
+        with pytest.raises(RuntimeError, match="failed"):
+            operation()
+    assert "reset" not in calls
 
 
 def test_replay_retains_transaction_until_receiver_exit(session_harness):

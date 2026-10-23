@@ -28,7 +28,7 @@ class AsyncCAMMegaMoeExecutor:
         experts, hidden, packed = weights.w13[0].shape
         intermediate = packed * INT4_PER_INT32 // 2
         if weights.output_dtype != torch.bfloat16:
-            raise ValueError("MegaMoE phase 1 requires BF16 output")
+            raise ValueError("MegaMoE requires BF16 output")
         self.config = [
             max_seq_len,
             hidden,
@@ -53,7 +53,8 @@ class AsyncCAMMegaMoeExecutor:
                 len(weights.layer_ids), dtype=torch.int64, device=self.anchor.device
             )
         # Resolve both schemas and validate static bounds before consuming CAM work.
-        self.op = torch.ops.afd_ascend.afd_mega_moe_ffn
+        self.op = torch.ops.afd_ascend.afd_mega_moe_ffn.out
+        self.completion = torch.zeros(1, dtype=torch.int64, device=self.anchor.device)
         self.scratch = torch.ops.afd_ascend.afd_mega_moe_ffn_workspace(
             self.anchor, self.config
         )
@@ -74,4 +75,5 @@ class AsyncCAMMegaMoeExecutor:
             self.config,
             group_name,
             weights.routed_scaling_factor,
+            out=self.completion,
         )

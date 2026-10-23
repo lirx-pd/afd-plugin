@@ -46,6 +46,11 @@ class GMMA8W4PreProcess {
     __aicore__ inline void Process(WorkSpaceSplitConfig &workspaceSplitConfig, int64_t workspaceSplitLoopIdx,
                                    TPipe *pipe);
     __aicore__ inline void CustomInitBuffer(TPipe *pipe);
+    // AFD MegaMoE reserves other AIVs for communication.
+    __aicore__ inline void SetVectorGroup(uint32_t id, uint32_t count) {
+        curCoreId = id;
+        blockDim = count;
+    }
 
   private:
     __aicore__ inline void InitInput(const GMAddrParams &gmAddrParams,
@@ -97,6 +102,7 @@ __aicore__ inline void GMMA8W4PreProcess::InitInput(
     groupNum = static_cast<uint32_t>(gmmSwigluQuantV2BaseParams->groupNum);
     // M * K * 7B (1B + 0.5B + 0.5B + 2B + 4B) <= UBsize - 256B
     blockDim = GetBlockNum() * GetTaskRation();
+    curCoreId = GetBlockIdx();
 }
 
 __aicore__ inline void GMMA8W4PreProcess::Init(
@@ -130,7 +136,6 @@ __aicore__ inline void GMMA8W4PreProcess::CalculateTaskInfoEachCore(uint32_t &cu
     int64_t usedCoreNum = totalM >= blockDim ? blockDim : totalM;
     // Start index of the tail core
     uint32_t tailCoreIdx = totalM - (eachCoreTaskNum - 1) * usedCoreNum;
-    curCoreId = GetBlockIdx();
     // Task count processed by each core = is tail core ? even task count : (even task count - 1)
     curCoreTaskNum_ = curCoreId < tailCoreIdx ? eachCoreTaskNum : eachCoreTaskNum - 1;
     // Start offset address processed by each core = is tail core ? even task count * blockId : (even task count - 1) *

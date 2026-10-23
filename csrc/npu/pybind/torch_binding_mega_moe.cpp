@@ -63,16 +63,19 @@ at::Tensor prepare(const at::Tensor &anchor, at::IntArrayRef config) {
   return at::empty({int64_t(w.bytes)}, anchor.options().dtype(at::kByte));
 }
 template <bool NPU>
-at::Tensor run(const at::Tensor &anchor, const at::Tensor &comm, at::TensorList w13,
+at::Tensor run_out(const at::Tensor &anchor, const at::Tensor &comm, at::TensorList w13,
                at::TensorList w2, at::TensorList s13, at::TensorList s2,
                at::TensorList b13, at::TensorList b2, const at::Tensor &map,
                at::Tensor &scratch, at::IntArrayRef c, c10::string_view group,
-               double routed_scale) {
+               double routed_scale, at::Tensor &output) {
   check_config(c);
   check_tensor(anchor, anchor, at::kBFloat16);
   check_tensor(comm, anchor, at::kHalf);
   check_tensor(map, anchor, at::kLong);
   check_tensor(scratch, anchor, at::kByte);
+  check_tensor(output, anchor, at::kLong);
+  TORCH_CHECK(output.dim() == 1 && output.numel() == 1,
+              "MegaMoE completion must have shape [1]");
   TORCH_CHECK(anchor.dim() == 1 && anchor.numel() == 1 && map.dim() == 1 &&
                   map.numel() > 0 && map.numel() <= 262144,
               "MegaMoE anchor/map shape mismatch");
@@ -123,7 +126,6 @@ at::Tensor run(const at::Tensor &anchor, const at::Tensor &comm, at::TensorList 
   }
   const c10::OptionalDeviceGuard guard(anchor.is_privateuseone() ? at::device_of(anchor)
                                                                  : std::nullopt);
-  auto output = at::empty({1}, anchor.options().dtype(at::kLong));
   if constexpr (NPU) {
     // IntArrayRef selects the ACL int-array converter; std::vector does not.
     std::string group_name(group.data(), group.size());
@@ -133,6 +135,18 @@ at::Tensor run(const at::Tensor &anchor, const at::Tensor &comm, at::TensorList 
   }
   return output;
 }
+template <bool NPU>
+at::Tensor run(const at::Tensor &anchor, const at::Tensor &comm, at::TensorList w13,
+               at::TensorList w2, at::TensorList s13, at::TensorList s2,
+               at::TensorList b13, at::TensorList b2, const at::Tensor &map,
+               at::Tensor &scratch, at::IntArrayRef c, c10::string_view group,
+               double routed_scale) {
+  const c10::OptionalDeviceGuard guard(anchor.is_privateuseone() ? at::device_of(anchor)
+                                                                 : std::nullopt);
+  auto output = at::zeros({1}, anchor.options().dtype(at::kLong));
+  return run_out<NPU>(anchor, comm, w13, w2, s13, s2, b13, b2, map, scratch,
+                      c, group, routed_scale, output);
+}
 }  // namespace
 TORCH_LIBRARY_FRAGMENT(afd_ascend, m) {
   m.def("afd_mega_moe_ffn_workspace(Tensor anchor, int[] config) -> Tensor");
@@ -141,13 +155,20 @@ TORCH_LIBRARY_FRAGMENT(afd_ascend, m) {
       "Tensor[] s13, Tensor[] s2, Tensor[] b13, Tensor[] b2, Tensor layer_map, "
       "Tensor(a!) scratch, int[] config, str group_name, float routed_scale=1.0) -> "
       "Tensor");
+  m.def(
+      "afd_mega_moe_ffn.out(Tensor anchor, Tensor comm_args, Tensor[] w13, Tensor[] w2, "
+      "Tensor[] s13, Tensor[] s2, Tensor[] b13, Tensor[] b2, Tensor layer_map, "
+      "Tensor(a!) scratch, int[] config, str group_name, float routed_scale=1.0, "
+      "*, Tensor(b!) out) -> Tensor(b!)");
 }
 TORCH_LIBRARY_IMPL(afd_ascend, PrivateUse1, m) {
   m.impl("afd_mega_moe_ffn_workspace", &prepare);
   m.impl("afd_mega_moe_ffn", &run<true>);
+  m.impl("afd_mega_moe_ffn.out", &run_out<true>);
 }
 TORCH_LIBRARY_IMPL(afd_ascend, Meta, m) {
   m.impl("afd_mega_moe_ffn_workspace", &prepare);
   m.impl("afd_mega_moe_ffn", &run<false>);
+  m.impl("afd_mega_moe_ffn.out", &run_out<false>);
 }
 }  // namespace afd_plugin::mega_moe

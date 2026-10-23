@@ -67,7 +67,7 @@ ge::graphStatus Tiling(gert::TilingContext *ctx) {
     auto platform = platform_ascendc::PlatformAscendC(ctx->GetPlatformInfo());
     const auto cubes = platform.GetCoreNumAic();
     const auto vectors = platform.GetCoreNumAiv();
-    if (cubes == 0 || vectors != 2 * cubes || vectors > 48)
+    if (cubes == 0 || vectors != 2 * cubes || vectors > 48 || vectors <= Cam::MEGA_COMM_AIVS)
         return ge::GRAPH_FAILED;
     uint64_t ub = 0;
     platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ub);
@@ -83,11 +83,12 @@ ge::graphStatus Tiling(gert::TilingContext *ctx) {
                              Align32(c[Cam::MEGA_LOCAL_EXPERTS] * 8);
     const uint64_t csFixed = meta + Align32(c[Cam::MEGA_LOCAL_EXPERTS] * c[Cam::MEGA_ATTN_TP] * 4) +
                              Align32(c[Cam::MEGA_ATTN_TP] * 4);
-    if (drFixed + Align32(((c[Cam::MEGA_MAX_SEQ_LEN] / c[Cam::MEGA_ATTN_TP] * c[Cam::MEGA_TOP_K] +
-                            vectors - 1) /
-                           vectors) *
-                          2) >
-            ub ||
+    const uint64_t transport = meta + Align32(c[Cam::MEGA_HIDDEN_SIZE] * 2 + 64 +
+                                               c[Cam::MEGA_LOCAL_EXPERTS] * 8);
+    const uint64_t routeIndices = Align32(
+        ((c[Cam::MEGA_MAX_SEQ_LEN] / c[Cam::MEGA_ATTN_TP] * c[Cam::MEGA_TOP_K] +
+          vectors - 1) / vectors) * 2);
+    if (transport > ub || drFixed + routeIndices > ub ||
         csFixed + std::max<uint64_t>(c[Cam::MEGA_HIDDEN_SIZE] * 2, c[Cam::MEGA_FFN_RANKS] * 4) > ub)
         return ge::GRAPH_FAILED;
     uint64_t window = GetMaxWindowSize();

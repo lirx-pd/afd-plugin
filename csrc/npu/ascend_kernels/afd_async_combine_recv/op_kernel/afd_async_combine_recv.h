@@ -96,6 +96,7 @@ private:
 
     uint32_t aivId_{0};
     uint32_t aivNum_{0};
+    uint32_t dispatchAivNum_{0};
     uint32_t attnRankId_{0};
     uint32_t worldSize_{0};
     uint32_t attnRankNum_{0};
@@ -147,6 +148,7 @@ __aicore__ inline void AfdAsyncCombineRecv<TemplateMC2TypeFunc>::Init(GM_ADDR ex
 {
     aivId_ = GetBlockIdx();
     aivNum_ = tilingData->moeDistributeCombineInfo.aivNum;
+    dispatchAivNum_ = tilingData->moeDistributeCombineInfo.dispatchAivNum;
     attnRankId_ = tilingData->moeDistributeCombineInfo.attnRankId;
     worldSize_ = tilingData->moeDistributeCombineInfo.worldSize;
     attnRankNum_ = tilingData->moeDistributeCombineInfo.attnRankNum;
@@ -243,7 +245,7 @@ __aicore__ inline void AfdAsyncCombineRecv<TemplateMC2TypeFunc>::LoadPreProcess(
     SyncFunc<HardEvent::V_S>();
 
     uint32_t statEntriesPerAiv = moeRankNum_ + expertNum_;
-    uint32_t bufSize = MathCeil(sizeof(uint32_t) * statEntriesPerAiv * aivNum_, UB_ALIGN); // 30720 30KB
+    uint32_t bufSize = MathCeil(sizeof(uint32_t) * statEntriesPerAiv * dispatchAivNum_, UB_ALIGN);
     LocalTensor<uint32_t> aivStatTensor = ubBuffer_.GetWithOffset<uint32_t>(bufSize / sizeof(uint32_t), bufOffset);
     bufOffset += bufSize;
     if (bufOffset > totalUbSize_) {
@@ -256,12 +258,12 @@ __aicore__ inline void AfdAsyncCombineRecv<TemplateMC2TypeFunc>::LoadPreProcess(
     GlobalTensor<uint32_t> aivStatGMTensor;
     aivStatGMTensor.SetGlobalBuffer((__gm__ uint32_t *)srcGM);
     DataCopyPad(aivStatTensor, aivStatGMTensor,
-        {1U, (uint32_t)(sizeof(uint32_t) * statEntriesPerAiv * aivNum_), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+        {1U, (uint32_t)(sizeof(uint32_t) * statEntriesPerAiv * dispatchAivNum_), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
     SyncFunc<HardEvent::MTE2_S>();
     SyncFunc<HardEvent::S_MTE2>();
 
     // The final AIV row contains cumulative counts for every routed expert.
-    uint32_t lastRowIdx = aivNum_ - 1;
+    uint32_t lastRowIdx = dispatchAivNum_ - 1;
     for (uint32_t expertId = 0; expertId < expertNum_; ++expertId) {
         uint32_t col = moeRankNum_ + expertId;
         expertRecvTokenNumTensor_(expertId) = aivStatTensor(statEntriesPerAiv * lastRowIdx + col);

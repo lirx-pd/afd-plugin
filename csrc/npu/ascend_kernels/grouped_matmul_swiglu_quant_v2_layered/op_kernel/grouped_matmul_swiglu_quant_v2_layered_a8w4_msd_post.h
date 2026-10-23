@@ -37,6 +37,11 @@ constexpr float DEFAULT_MUL_SCALE = 16.0f;
 class GMMA8W4PostProcess {
   public:
     __aicore__ inline GMMA8W4PostProcess(){};
+    // AFD MegaMoE reserves other AIVs for communication.
+    __aicore__ inline void SetVectorGroup(uint32_t id, uint32_t count) {
+        blockIdx = id;
+        aivCoreNum = count;
+    }
     __aicore__ inline void Init(const GMAddrParams gmAddrParams,
                                 const GMMSwigluQuantV2BaseParams *__restrict gmmSwigluQuantV2BaseParamsIN,
                                 const GMMSwigluQuantV2 *__restrict gmmSwigluIN);

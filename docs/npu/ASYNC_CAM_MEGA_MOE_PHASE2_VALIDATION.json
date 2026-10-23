@@ -1,0 +1,435 @@
+{
+  "date": "2026-10-23",
+  "branch": "feat/async-cam-megamoe-phase2",
+  "base_commit": "22334e2",
+  "status": "functional qualification passed; performance optimization deferred",
+  "task": "afd-cross-task-f-20261021",
+  "task_status": "Running",
+  "platform": "A3 / ascend910_93",
+  "cann": "9.1.0",
+  "versions": {
+    "torch": "2.10.0+cpu",
+    "torch-npu": "2.10.0.post4",
+    "vllm": "0.30.0+empty",
+    "vllm-ascend": "0.19.1rc2.dev2448+g8d4409d62",
+    "lm_eval": "0.4.12",
+    "datasets": "4.4.1"
+  },
+  "implementation": {
+    "ring_slots": 2,
+    "tile_rows": 128,
+    "communication_aiv": 8,
+    "compute_aiv": 40,
+    "aic": 24,
+    "scratch_bytes_h4096_i2048_e32_tp4": 23773696,
+    "receive_capacity_independent_scratch": true,
+    "protocol": "cam_async_routed_only_compact_v2",
+    "default_enabled": false
+  },
+  "source_sha256": {
+    "afd_plugin/model_executor/npu/async_cam_mega_moe.py": "22b07e63f83fecaaeda2a859429665e6960c1fe2ea36b1505b580fc5be57729e",
+    "csrc/npu/ascend_kernels/afd_async_dispatch_recv/op_kernel/afd_async_dispatch_recv.h": "95c94f58c01a5824384b03fc6b743f029a2725614f4dcf5a23d872abe198f74b",
+    "csrc/npu/ascend_kernels/afd_mega_moe_ffn/op_host/afd_mega_moe_ffn.cpp": "bd7dd809a75d9f13060d1f6fe699228cb08d997b89b86efb3b3761f1d2104e97",
+    "csrc/npu/ascend_kernels/afd_mega_moe_ffn/op_kernel/afd_mega_moe_ffn.cpp": "e1b8737e534c991f6eaf17a6a1fd6167606f3a40d8eae3c5c4691d0875b6f332",
+    "csrc/npu/ascend_kernels/grouped_matmul_swiglu_quant_v2_layered/op_kernel/grouped_matmul_swiglu_quant_v2_layered_a8w4_msd_post.h": "f9808cfb52aa444a99cfbd3a872f96a1e48caadb54aa71ccbd3ff21fbe7302cb",
+    "csrc/npu/ascend_kernels/grouped_matmul_swiglu_quant_v2_layered/op_kernel/grouped_matmul_swiglu_quant_v2_layered_a8w4_msd_pre.h": "0cb2db7e97fc8dd50da936cc32b41329ee9a28b0514026628db976769395552a",
+    "csrc/npu/ascend_kernels/utils/op_kernel/mega_moe_workspace.h": "fdaa6db090ad343573536990f97f0537fcabdfa4698b413ca9e93c0d7127c59d",
+    "tests/npu/async_cam_runtime.py": "6c754ff4e2c5b33c4b931ca310d95bc0d7c1d4d94512048844fafd1e8e3243d5",
+    "tests/npu/check_mega_moe_workspace.cpp": "06007f55f17654f35d5a84b2f431fbcb2555210f6ea988eb4b948b8b9f6e1396",
+    "tests/npu/test_async_cam_mega_moe_meta.py": "6b18f685709f00c1a1337a8f443ac5199ce6a0c88d451f1d3bd4faa115f9202a",
+    "csrc/npu/ascend_kernels/afd_mega_moe_ffn/op_kernel/afd_mega_moe_pipeline.h": "d30cdbffa82823822df699d27992b56a64dbbe7b591ade8cddf9912afc5312d8"
+  },
+  "full_source_manifest_sha256": "d83a9def92c5797a362f7979e04c43fb0266b6235a5c0fbb01dd7b8a6bd864f8",
+  "native_artifacts_sha256": {
+    "afd_plugin/_C_ascend.cpython-312-aarch64-linux-gnu.so": "5db5d68667ececc4afaf79cba0352fa9a2756bca336e030562cf68989dc1ea38",
+    "afd_plugin/_cann_ops_custom/vendors/afd-plugin/op_api/lib/libcust_opapi.so": "736453b7c901bfc59f2b02cdbccfcc74d42cc169da65b5d9bc6a4643a8c3bd76",
+    "afd_plugin/_cann_ops_custom/vendors/afd-plugin/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64/libcust_opmaster_rt2.0.so": "082b5594c8ab164f5ce9463d7c30fb3e4bba855cb0c2486bad1609156895c0cc",
+    "afd_plugin/_cann_ops_custom/vendors/afd-plugin/op_impl/ai_core/tbe/kernel/ascend910_93/afd_mega_moe_ffn/AfdMegaMoeFFN_989547696d243c85c3d86b7bd464a2df.o": "9baa9e4da072d0477c571eefa82de9f737028e759b75cf7e070b2b0432edf013"
+  },
+  "checks": {
+    "pre_commit": "PASS",
+    "pytest": {
+      "passed": 596,
+      "skipped": 183,
+      "subtests_passed": 33
+    },
+    "host_workspace_asan_ubsan": {
+      "result": "PASS",
+      "cases": 162,
+      "leak_detection": false
+    },
+    "compiled_meta_workspace": {
+      "passed": 7
+    },
+    "wide_eager": {
+      "result": "PASS",
+      "hidden": 4096,
+      "intermediate": 2048,
+      "local_experts": 32,
+      "capacity": 262144,
+      "workloads": 7
+    },
+    "wide_full": {
+      "result": "PASS",
+      "capture_count_per_ffn": 1,
+      "replay_count_per_ffn": 7,
+      "stable_addresses": true,
+      "poisoned_scratch": true
+    },
+    "chunk_boundary": {
+      "eager": "PASS",
+      "full": "PASS",
+      "hidden": 256,
+      "intermediate": 512,
+      "capacity": 256,
+      "attention_sources": 2,
+      "ffn_ranks": 2,
+      "per_group": true,
+      "dense_signed_weights": true,
+      "routed_scale": 2.5,
+      "expert_continuation": true,
+      "full_replay_counts": [
+        16,
+        14
+      ]
+    },
+    "tp4_hot129": {
+      "result": "PASS",
+      "rounds": 12,
+      "attention_tp": 4,
+      "ffn_ranks": 2,
+      "distinct_tp_values": true,
+      "oracle": "analytic diagonal output"
+    }
+  },
+  "real_checkpoint": {
+    "implementation": "phase2",
+    "graph_evidence": {
+      "captures": [
+        {
+          "pid": 102073,
+          "rank": 14,
+          "effective_mode": "full",
+          "mega_moe": true,
+          "capture_count": 1,
+          "replay_count": 0,
+          "event": "_capture_graph",
+          "graph_pending": false
+        },
+        {
+          "pid": 102070,
+          "rank": 10,
+          "effective_mode": "full",
+          "mega_moe": true,
+          "capture_count": 1,
+          "replay_count": 0,
+          "event": "_capture_graph",
+          "graph_pending": false
+        },
+        {
+          "pid": 102071,
+          "rank": 15,
+          "effective_mode": "full",
+          "mega_moe": true,
+          "capture_count": 1,
+          "replay_count": 0,
+          "event": "_capture_graph",
+          "graph_pending": false
+        },
+        {
+          "pid": 102072,
+          "rank": 11,
+          "effective_mode": "full",
+          "mega_moe": true,
+          "capture_count": 1,
+          "replay_count": 0,
+          "event": "_capture_graph",
+          "graph_pending": false
+        },
+        {
+          "pid": 102068,
+          "rank": 9,
+          "effective_mode": "full",
+          "mega_moe": true,
+          "capture_count": 1,
+          "replay_count": 0,
+          "event": "_capture_graph",
+          "graph_pending": false
+        },
+        {
+          "pid": 102067,
+          "rank": 12,
+          "effective_mode": "full",
+          "mega_moe": true,
+          "capture_count": 1,
+          "replay_count": 0,
+          "event": "_capture_graph",
+          "graph_pending": false
+        },
+        {
+          "pid": 102074,
+          "rank": 8,
+          "effective_mode": "full",
+          "mega_moe": true,
+          "capture_count": 1,
+          "replay_count": 0,
+          "event": "_capture_graph",
+          "graph_pending": false
+        },
+        {
+          "pid": 102069,
+          "rank": 13,
+          "effective_mode": "full",
+          "mega_moe": true,
+          "capture_count": 1,
+          "replay_count": 0,
+          "event": "_capture_graph",
+          "graph_pending": false
+        }
+      ],
+      "replays": [
+        {
+          "pid": 102072,
+          "rank": 11,
+          "effective_mode": "full",
+          "mega_moe": true,
+          "capture_count": 1,
+          "replay_count": 176128,
+          "event": "_complete_graph",
+          "graph_pending": false
+        },
+        {
+          "pid": 102073,
+          "rank": 14,
+          "effective_mode": "full",
+          "mega_moe": true,
+          "capture_count": 1,
+          "replay_count": 176128,
+          "event": "_complete_graph",
+          "graph_pending": false
+        },
+        {
+          "pid": 102070,
+          "rank": 10,
+          "effective_mode": "full",
+          "mega_moe": true,
+          "capture_count": 1,
+          "replay_count": 176128,
+          "event": "_complete_graph",
+          "graph_pending": false
+        },
+        {
+          "pid": 102068,
+          "rank": 9,
+          "effective_mode": "full",
+          "mega_moe": true,
+          "capture_count": 1,
+          "replay_count": 176128,
+          "event": "_complete_graph",
+          "graph_pending": false
+        },
+        {
+          "pid": 102074,
+          "rank": 8,
+          "effective_mode": "full",
+          "mega_moe": true,
+          "capture_count": 1,
+          "replay_count": 176128,
+          "event": "_complete_graph",
+          "graph_pending": false
+        },
+        {
+          "pid": 102071,
+          "rank": 15,
+          "effective_mode": "full",
+          "mega_moe": true,
+          "capture_count": 1,
+          "replay_count": 176128,
+          "event": "_complete_graph",
+          "graph_pending": false
+        },
+        {
+          "pid": 102069,
+          "rank": 13,
+          "effective_mode": "full",
+          "mega_moe": true,
+          "capture_count": 1,
+          "replay_count": 176128,
+          "event": "_complete_graph",
+          "graph_pending": false
+        },
+        {
+          "pid": 102067,
+          "rank": 12,
+          "effective_mode": "full",
+          "mega_moe": true,
+          "capture_count": 1,
+          "replay_count": 176128,
+          "event": "_complete_graph",
+          "graph_pending": false
+        }
+      ]
+    },
+    "result": "PASS",
+    "fresh_baseline": false,
+    "effective_samples": 300,
+    "sample_log_records": 600,
+    "scores": {
+      "strict-match": {
+        "correct": 286,
+        "samples": 300,
+        "accuracy": 0.9533333333333334,
+        "wrong_doc_ids": [
+          12,
+          24,
+          37,
+          78,
+          87,
+          119,
+          146,
+          182,
+          187,
+          201,
+          209,
+          236,
+          255,
+          267
+        ]
+      },
+      "flexible-extract": {
+        "correct": 286,
+        "samples": 300,
+        "accuracy": 0.9533333333333334,
+        "wrong_doc_ids": [
+          12,
+          24,
+          37,
+          78,
+          87,
+          119,
+          146,
+          182,
+          187,
+          201,
+          209,
+          236,
+          255,
+          267
+        ]
+      }
+    },
+    "ffn_backend": "mega_moe",
+    "ffn_ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "moe_layers": 43,
+    "attention_dp": 2,
+    "attention_tp": 4,
+    "ffn_ep": 8,
+    "ffn_tp": 1,
+    "ffn_mode": "FULL",
+    "attention_mode": "eager",
+    "max_model_len": 32768,
+    "max_num_batched_tokens": 32768,
+    "num_fewshot": 8,
+    "num_concurrent": 12,
+    "max_gen_toks": 512,
+    "temperature": 0,
+    "do_sample": false,
+    "dbo": false,
+    "sample_file": "gsm8k/dsv4-flash-attention/samples_gsm8k_2026-10-23T09-14-44.468526.jsonl",
+    "sample_file_sha256": "346e6b76d989aeb771ecb63b1c3c60d028ddd666ceb1a32e93a1b58d8f541827",
+    "native_artifacts_sha256": {
+      "afd_plugin/_C_ascend.cpython-312-aarch64-linux-gnu.so": "5db5d68667ececc4afaf79cba0352fa9a2756bca336e030562cf68989dc1ea38",
+      "afd_plugin/_cann_ops_custom/vendors/afd-plugin/op_api/lib/libcust_opapi.so": "736453b7c901bfc59f2b02cdbccfcc74d42cc169da65b5d9bc6a4643a8c3bd76",
+      "afd_plugin/_cann_ops_custom/vendors/afd-plugin/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64/libcust_opmaster_rt2.0.so": "082b5594c8ab164f5ce9463d7c30fb3e4bba855cb0c2486bad1609156895c0cc",
+      "afd_plugin/_cann_ops_custom/vendors/afd-plugin/op_impl/ai_core/tbe/kernel/ascend910_93/afd_mega_moe_ffn/AfdMegaMoeFFN_989547696d243c85c3d86b7bd464a2df.o": "9baa9e4da072d0477c571eefa82de9f737028e759b75cf7e070b2b0432edf013"
+    },
+    "source_hashes_match": true,
+    "duplicate_or_missing_documents": false,
+    "inference_errors": 0,
+    "remaining_e2e_processes": [],
+    "ports_free": true,
+    "shutdown": "E2E process termination; FFN logs include shutdown exceptions and resource_tracker warnings",
+    "unverified": [
+      "fresh baseline parity",
+      "end-to-end performance",
+      "Attention graph mode",
+      "64K context",
+      "invalid-device-control recovery",
+      "long-running service lifecycle"
+    ]
+  },
+  "historical_comparison": {
+    "phase1_full": {
+      "all_300_doc_prompt_target_hashes_match": true,
+      "old_correct": 288,
+      "new_correct": 286,
+      "improved": [
+        46,
+        106
+      ],
+      "worsened": [
+        24,
+        37,
+        209,
+        236
+      ],
+      "different_responses": 159
+    },
+    "phase1_eager": {
+      "all_300_doc_prompt_target_hashes_match": true,
+      "old_correct": 285,
+      "new_correct": 286,
+      "improved": [
+        43,
+        98,
+        106,
+        147
+      ],
+      "worsened": [
+        24,
+        37,
+        201
+      ],
+      "different_responses": 170
+    }
+  },
+  "historical_model_metadata_dataset_and_versions_match": true,
+  "performance_diagnostic": {
+    "scope": "native kernel duration with input ready; not end-to-end model latency",
+    "aggregation": "maximum FFN rank mean of the final five of twelve measured calls after cold warmup",
+    "max_rank_mean_us": {
+      "p1-balance1024-v2": 1593.3244,
+      "p2-balance1024": 2998.5644,
+      "p1-decode7": 676.7040000000001,
+      "p2-decode7": 1097.8319999999999,
+      "p1-hot1024": 1368.604,
+      "p2-hot1024": 2387.948,
+      "p1-tp4hot129": 926.336,
+      "p2-tp4hot129": 1562.212
+    },
+    "acceptance": "not met; Phase 2 takes 1.6 to 1.9 times Phase 1 in these cases"
+  },
+  "retained_archives_sha256": {
+    "finite-results.tar.gz": "5bd19341673b3e196207e8eb59c5a1f5a19618b4ab725f9b1e335f7d15ef35c0",
+    "chunk-results.tar.gz": "1b6f872d7dff6be09d2da40d1fc9a5e3b51931447cb64ab2b251e0798ded8e1c",
+    "mega-moe-phase2-full300-results.tar.gz": "9179836309e81cc071b9714d704b98c59f57c8f9819074040264eecb9a77894c"
+  },
+  "remaining_limits": [
+    "no new model baseline or numerical parity claim",
+    "performance optimization deferred",
+    "Attention graph mode untested",
+    "cross-host Phase 2 untested",
+    "dedicated concurrent-source stress untested",
+    "invalid-device-control recovery untested",
+    "graceful shutdown and long-running lifecycle unqualified"
+  ]
+}

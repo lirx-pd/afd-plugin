@@ -6,9 +6,6 @@
 #include "afd_async_dispatch_recv.h"
 #undef TemplateMC2TypeClass
 #undef TemplateMC2TypeFunc
-#include "afd_async_combine_send.h"
-#undef TemplateMC2TypeClass
-#undef TemplateMC2TypeFunc
 
 // Reuse the checked-in MSD math without importing its standalone kernel entry.
 #define GMM_SWIGLU_QUANT_V2_A8W4_MSD
@@ -39,12 +36,16 @@ __aicore__ inline int64_t ReadControl(GM_ADDR base, uint32_t index) {
     GlobalTensor<int64_t> gm;
     gm.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(base) + index);
     DataCacheCleanAndInvalid<int64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(gm);
-    return gm.GetValue(0);
+    // Polling must reload after cache invalidation; a non-volatile load may be hoisted.
+    return *(reinterpret_cast<volatile __gm__ int64_t *>(base) + index);
 }
 
 __aicore__ inline void WriteCompletion(GM_ADDR output, int64_t value, TPipe &pipe) {
     if ASCEND_IS_AIV {
         if (GetBlockIdx() == 0) {
+            // The caller clears this status once per batch, never between its transactions.
+            const auto previous = ReadControl(output, 0);
+            if (previous < 0) value = previous;
             pipe.Reset();
             TBuf<TPosition::VECCALC> buf;
             pipe.InitBuffer(buf, 32);
@@ -56,46 +57,6 @@ __aicore__ inline void WriteCompletion(GM_ADDR output, int64_t value, TPipe &pip
             DataCopyPad(gm, local, {1U, 8U, 0U, 0U, 0U});
             Fence<HardEvent::MTE3_S>();
         }
-    }
-}
-
-__aicore__ inline void PackTile(GM_ADDR scratch, const Cam::MegaWorkspace &w,
-                                const Cam::AfdMegaMoeFFNTilingData &t, uint64_t row, uint32_t rows,
-                                uint32_t expert, TPipe &pipe) {
-    if ASCEND_IS_AIV {
-        pipe.Reset();
-        TBuf<TPosition::VECCALC> buf;
-        pipe.InitBuffer(buf, Cam::MegaAlign(t.recv.hiddenSize) +
-                                 Cam::MegaAlign(t.recv.routeExpertNumPerMoe * 8) + 32);
-        auto x = buf.Get<int8_t>();
-        auto counts = buf.GetWithOffset<int64_t>(t.recv.routeExpertNumPerMoe,
-                                                 Cam::MegaAlign(t.recv.hiddenSize));
-        auto scale = buf.GetWithOffset<float>(
-            8, Cam::MegaAlign(t.recv.hiddenSize) + Cam::MegaAlign(t.recv.routeExpertNumPerMoe * 8));
-        GlobalTensor<int8_t> src, dst;
-        GlobalTensor<float> sSrc, sDst;
-        src.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(scratch + w.x));
-        dst.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(scratch + w.tileX));
-        sSrc.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scratch + w.scales));
-        sDst.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scratch + w.tileScales));
-        for (uint32_t r = GetBlockIdx(); r < rows; r += t.recv.aivNum) {
-            DataCopy(x, src[(row + r) * t.recv.hiddenSize], t.recv.hiddenSize);
-            DataCopyPad(scale, sSrc[row + r], {1U, 4U, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
-            Fence<HardEvent::MTE2_MTE3>();
-            DataCopy(dst[r * t.recv.hiddenSize], x, t.recv.hiddenSize);
-            DataCopyPad(sDst[r], scale, {1U, 4U, 0U, 0U, 0U});
-            Fence<HardEvent::MTE3_MTE2>();
-        }
-        if (GetBlockIdx() == 0) {
-            for (uint32_t e = 0; e < t.recv.routeExpertNumPerMoe; ++e)
-                counts.SetValue(e, e == expert ? rows : 0);
-            GlobalTensor<int64_t> gm;
-            gm.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(scratch + w.tileCounts));
-            Fence<HardEvent::S_MTE3>();
-            DataCopyPad(gm, counts, {1U, uint32_t(t.recv.routeExpertNumPerMoe * 8), 0U, 0U, 0U});
-            Fence<HardEvent::MTE3_S>();
-        }
-        pipe.Reset();
     }
 }
 
@@ -121,30 +82,6 @@ __aicore__ inline GMAddrParams Addresses(GM_ADDR x, GM_ADDR scales, GM_ADDR coun
     return a;
 }
 
-__aicore__ inline void MatmulStage(MM::MT &mm, GMAddrParams &a, const Cam::MegaGmmParams &p,
-                                   WorkSpaceSplitConfig &split, TCubeTiling &tiling, TPipe &pipe) {
-    GMMA8W4PreProcess pre;
-    GMMA8W4MidProcess<MM> mid(mm);
-    pre.Init(a, &p);
-    mid.Init(a, &p);
-    pre.Process(split, 0, &pipe);
-    if ASCEND_IS_AIV {
-        pipe.Reset();
-    }
-    SyncAll<false>();
-    if ASCEND_IS_AIC {
-        mm.SetSubBlockIdx(0);
-        mm.Init(&tiling);
-    }
-    mid.Process(split, 0);
-    if ASCEND_IS_AIC {
-        mm.End();
-        // Init allocates new TPipe buffer records for every matrix stage.
-        pipe.Reset();
-    }
-    SyncAll<false>();
-}
-
 __aicore__ inline void OutputTile(GM_ADDR scratch, const Cam::MegaWorkspace &w,
                                   const Cam::AfdMegaMoeFFNTilingData &t, GM_ADDR biasList,
                                   int64_t layer, uint32_t expert, uint64_t outRow, uint32_t rows,
@@ -165,13 +102,14 @@ __aicore__ inline void OutputTile(GM_ADDR scratch, const Cam::MegaWorkspace &w,
         GlobalTensor<float> biases, scales;
         GlobalTensor<bfloat16_t> output;
         raw.SetGlobalBuffer(
-            reinterpret_cast<__gm__ half *>(scratch + w.compute + t.g2.workSpaceOffset1));
+            reinterpret_cast<__gm__ half *>(scratch + w.compute2 + t.g2.workSpaceOffset1));
         biases.SetGlobalBuffer(GetLayerTensorAddr<float>(layer, t.g2.layerNum, biasList));
         scales.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scratch + w.zScales));
         output.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(scratch + w.y));
         DataCopy(bias, biases[expert * h], h);
         Fence<HardEvent::MTE2_V>();
-        for (uint32_t r = GetBlockIdx(); r < rows; r += t.recv.aivNum) {
+        for (uint32_t r = GetBlockIdx() - Cam::MEGA_COMM_AIVS; r < rows;
+             r += t.recv.aivNum - Cam::MEGA_COMM_AIVS) {
             DataCopy(hi, raw[2 * r * h], h);
             DataCopy(lo, raw[(2 * r + 1) * h], h);
             DataCopyPad(scale, scales[r], {1U, 4U, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
@@ -209,6 +147,8 @@ __aicore__ inline void OutputTile(GM_ADDR scratch, const Cam::MegaWorkspace &w,
 }
 } // namespace AfdMegaMoe
 
+#include "afd_mega_moe_pipeline.h"
+
 extern "C" __global__ __aicore__ void
 afd_mega_moe_ffn(GM_ADDR anchor, GM_ADDR commArgs, GM_ADDR layerMap, GM_ADDR scratch, GM_ADDR w13,
                  GM_ADDR w2, GM_ADDR s13, GM_ADDR s2, GM_ADDR b13, GM_ADDR b2, GM_ADDR completion,
@@ -221,16 +161,20 @@ afd_mega_moe_ffn(GM_ADDR anchor, GM_ADDR commArgs, GM_ADDR layerMap, GM_ADDR scr
         const Cam::MegaWorkspace w(t.capacity, t.recv.hiddenSize, t.intermediate,
                                    t.recv.routeExpertNumPerMoe, t.recv.tpSize);
         TPipe pipe;
+        PipelineFlags flags(scratch + w.flags);
         if ASCEND_IS_AIV {
-            Cam::AfdAsyncDispatchRecvTilingData dr{};
-            dr.moeDistributeDispatchInfo = t.recv;
-            MoeDistributeDispatchImpl::AfdAsyncDispatchRecv<bfloat16_t, int8_t, true> rx;
-            rx.Init(anchor, scratch + w.x, scratch + w.scales, scratch + w.batch,
-                    scratch + w.counts, workspace, &pipe, &dr, commArgs, 1);
-            rx.Process();
-            pipe.Reset();
+            flags.Clear(t.recv.aivNum);
+            if (GetBlockIdx() == 0) {
+                StoreControl(scratch + w.batch, 2, -1);
+                Cam::AfdAsyncDispatchRecvTilingData dr{};
+                dr.moeDistributeDispatchInfo = t.recv;
+                MoeDistributeDispatchImpl::AfdAsyncDispatchRecv<bfloat16_t, int8_t, true> rx;
+                rx.Init(anchor, scratch + w.tileX, scratch + w.tileScales, scratch + w.batch,
+                        scratch + w.counts, workspace, &pipe, &dr, commArgs, 1);
+                rx.Process(false);
+                pipe.Reset();
+            }
         }
-        // All AIVs run DR, and every AIC/AIV reaches each mixed barrier once.
         SyncAll<false>();
         const auto layerId = ReadControl(scratch + w.batch, 2);
         const auto layer =
@@ -248,53 +192,16 @@ afd_mega_moe_ffn(GM_ADDR anchor, GM_ADDR commArgs, GM_ADDR layerMap, GM_ADDR scr
             }
             total += count;
         }
-        TCubeTiling cube1 = *reinterpret_cast<TCubeTiling *>(t.cube1);
-        TCubeTiling cube2 = *reinterpret_cast<TCubeTiling *>(t.cube2);
-        MM::MT mm;
-        uint64_t base = 0;
-        for (uint32_t e = 0; e < t.recv.routeExpertNumPerMoe; ++e) {
-            const uint32_t count = ReadControl(scratch + w.counts, e);
-            for (uint32_t offset = 0; offset < count; offset += Cam::MEGA_TILE_ROWS) {
-                const uint32_t rows =
-                    count - offset < Cam::MEGA_TILE_ROWS ? count - offset : Cam::MEGA_TILE_ROWS;
-                PackTile(scratch, w, t, base + offset, rows, e, pipe);
-                SyncAll<false>();
-                // MSD helpers read both tile counts and token scales through scalar cache.
-                GlobalTensor<int64_t> controls;
-                controls.SetGlobalBuffer(
-                    reinterpret_cast<__gm__ int64_t *>(scratch + w.tileCounts));
-                DataCacheCleanAndInvalid<int64_t, CacheLine::ENTIRE_DATA_CACHE,
-                                         DcciDst::CACHELINE_OUT>(controls);
-                WorkSpaceSplitConfig split{
-                    rows, 1,   0, int64_t(e), int64_t(e), int64_t(e), Cam::MEGA_TILE_ROWS,
-                    rows, true};
-                auto a1 = Addresses(scratch + w.tileX, scratch + w.tileScales,
-                                    scratch + w.tileCounts, w13, s13, b13, scratch + w.z,
-                                    scratch + w.zScales, scratch + w.compute, t.g1, layer);
-                MatmulStage(mm, a1, t.g1, split, cube1, pipe);
-                GMMA8W4PostProcess act;
-                act.Init(a1, &t.g1, &t.quant);
-                act.Process(split, 0, &pipe);
-                if ASCEND_IS_AIV {
-                    pipe.Reset();
-                }
-                SyncAll<false>();
-                auto a2 =
-                    Addresses(scratch + w.z, scratch + w.zScales, scratch + w.tileCounts, w2, s2,
-                              b2, scratch + w.y, nullptr, scratch + w.compute, t.g2, layer);
-                MatmulStage(mm, a2, t.g2, split, cube2, pipe);
-                OutputTile(scratch, w, t, b2, layer, e, base + offset, rows, pipe);
-                SyncAll<false>();
-            }
-            base += count;
+        TileCursor cursor(scratch + w.counts, t.recv.routeExpertNumPerMoe);
+        if ASCEND_IS_AIC {
+            ComputePipeline(scratch, w, t, flags, cursor, w13, w2, s13, s2, b13, b2, layer, pipe);
         }
         if ASCEND_IS_AIV {
-            Cam::AfdAsyncCombineSendTilingData cs{};
-            cs.moeDistributeCombineInfo = t.send;
-            MoeDistributeCombineSendImpl::AfdAsyncCombineSend<bfloat16_t> tx;
-            tx.Init(scratch + w.y, workspace, &pipe, &cs, commArgs, scratch + w.batch, 1);
-            tx.Process();
-            pipe.Reset();
+            if (GetBlockIdx() < Cam::MEGA_COMM_AIVS) {
+                TransportPipeline(scratch, w, t, flags, cursor, pipe);
+            } else {
+                VectorPipeline(scratch, w, t, flags, cursor, w13, w2, s13, s2, b13, b2, layer, pipe);
+            }
         }
         SyncAll<false>();
         WriteCompletion(completion, 0, pipe);

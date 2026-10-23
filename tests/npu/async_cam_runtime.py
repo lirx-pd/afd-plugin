@@ -41,35 +41,68 @@ LIMIT = 10.0
 class SyntheticModel(torch.nn.Module):
     """Diagonal experts shared by eager/FULL runs; no checkpoint is loaded."""
 
-    def __init__(self, device, per_channel):
+    def __init__(
+        self,
+        device,
+        per_channel,
+        random_weights=False,
+        routed_scale=1.0,
+        ffn_rank=0,
+        intermediate_size=HIDDEN,
+    ):
         super().__init__()
         self.layers = []
+        torch.manual_seed(7 + ffn_rank)
         for slot, layer_id in enumerate(LAYERS):
-            w13, s13, b13 = self.make_weight(device, per_channel, slot + 1, True)
-            w2, s2, b2 = self.make_weight(device, per_channel, 1, False)
+            w13, s13, b13 = self.make_weight(
+                device, per_channel, slot + 1, True, random_weights, intermediate_size
+            )
+            w2, s2, b2 = self.make_weight(
+                device, per_channel, 1, False, random_weights, intermediate_size
+            )
             self.layers.append(
                 W4A8LayerWeights(
-                    layer_id, w13, w2, s13, s2, b13, b2, per_channel, LIMIT, 1.0
+                    layer_id,
+                    w13,
+                    w2,
+                    s13,
+                    s2,
+                    b13,
+                    b2,
+                    per_channel,
+                    LIMIT,
+                    routed_scale,
                 )
             )
 
     @staticmethod
-    def make_weight(device, per_channel, factor, gate_up):
-        width = HIDDEN * (2 if gate_up else 1)
-        values = torch.zeros(EXPERTS, HIDDEN, width, dtype=torch.int8)
-        diagonal = torch.arange(HIDDEN)
+    def make_weight(
+        device,
+        per_channel,
+        factor,
+        gate_up,
+        random_weights=False,
+        intermediate_size=HIDDEN,
+    ):
+        width = 2 * intermediate_size if gate_up else HIDDEN
+        reduction_size = HIDDEN if gate_up else intermediate_size
+        values = torch.zeros(EXPERTS, reduction_size, width, dtype=torch.int8)
+        diagonal = torch.arange(min(HIDDEN, intermediate_size))
         values[:, diagonal, diagonal] = 1
         if gate_up:
-            values[:, diagonal, diagonal + HIDDEN] = 1
+            values[:, diagonal, diagonal + intermediate_size] = 1
+        if random_weights:
+            values.random_(-7, 8)
+            factor *= 0.01
         groups = 1 if per_channel else 2
         scale = torch.full((EXPERTS, groups, width), float(factor))
         if not per_channel:
             scale[:, 1] *= 2
-        dequant = values.float() * scale.repeat_interleave(HIDDEN // groups, 1)
+        dequant = values.float() * scale.repeat_interleave(reduction_size // groups, 1)
         bias = (8 * dequant.sum(1)).to(device)
         packed = values.reshape(-1, 2)
         packed = ((packed[:, 1] << 4) | (packed[:, 0] & 15)).reshape(
-            EXPERTS, HIDDEN, width // 2
+            EXPERTS, reduction_size, width // 2
         )
         weight = torch_npu.npu_format_cast(packed.to(device), 29).view(torch.int32)
         encoded = scale.view(torch.int32).to(torch.int64)
@@ -87,17 +120,26 @@ class SyntheticModel(torch.nn.Module):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--per-group", action="store_true")
+    parser.add_argument("--mega-moe", action="store_true")
+    parser.add_argument("--random-weights", action="store_true")
+    parser.add_argument("--routed-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--intermediate-size", type=int, choices=(256, 512), default=HIDDEN
+    )
     parser.add_argument("--full-graph", action="store_true")
     parser.add_argument("--attn-ranks", type=int, choices=(1, 2), default=1)
     parser.add_argument("--boundary", action="store_true")
+    parser.add_argument("--tile-boundary", action="store_true")
     parser.add_argument("--save-outputs")
     parser.add_argument("--reference-outputs")
     args = parser.parse_args()
-    if args.full_graph and not args.reference_outputs:
-        parser.error("FULL replay requires saved matching eager outputs")
+    if (args.full_graph or args.mega_moe) and not args.reference_outputs:
+        parser.error("FULL/MegaMoE requires saved matching layered eager outputs")
+    os.environ["AFD_ASYNC_CAM_MEGA_MOE"] = "1" if args.mega_moe else "0"
     faulthandler.dump_traceback_later(60)
     os.environ["AFD_ASYNC_CAM_LAYERED_GMM"] = "1"
-    os.environ["BATCH_SIZE_FACTOR"] = str(16 / 262144)
+    capacity = 256 if args.tile_boundary else 16
+    os.environ["BATCH_SIZE_FACTOR"] = str(capacity / 262144)
     os.environ["HCCL_BUFFSIZE"] = "64"
     ensure_cam_async_ops_available()
     rank = int(os.environ["RANK"])
@@ -147,7 +189,7 @@ def main():
                 model_type="deepseek_v4",
             ),
         ),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=capacity),
         parallel_config=SimpleNamespace(
             enable_dbo=False,
             use_ubatching=False,
@@ -175,20 +217,60 @@ def main():
         parse_afd_config(config),
         rank - args.attn_ranks if is_ffn else rank,
     )
-    report = {"rank": rank, "per_group": args.per_group, "work": []}
+    report = {
+        "rank": rank,
+        "per_group": args.per_group,
+        "mega_moe": args.mega_moe,
+        "work": [],
+    }
     print(json.dumps({"rank": rank, "stage": "connector_created"}), flush=True)
     if is_ffn:
         runner = AsyncNPUFFNModelRunner(config, device, connector)
-        runner.model = SyntheticModel(device, not args.per_group)
+        runner.model = SyntheticModel(
+            device,
+            not args.per_group,
+            args.random_weights,
+            args.routed_scale,
+            ffn_rank=rank - args.attn_ranks,
+            intermediate_size=args.intermediate_size,
+        )
         print(json.dumps({"rank": rank, "stage": "weights_ready"}), flush=True)
         runner.initialize_afd_connector()
         assert runner._layered_executor is not None
+        if args.mega_moe:
+            mega = runner._mega_executor
+            assert mega is not None
+
+            def align(n):
+                return (n + 511) // 512 * 512
+
+            batch_offset = align(capacity * HIDDEN) + align(capacity * 4)
+            batch_bytes = (5 + 1 + EXPERTS) * 8
+            count_offset = batch_offset + align(batch_bytes)
+            mega_state = SimpleNamespace(
+                token_nums_rankid_layeridx=mega.scratch[
+                    batch_offset : batch_offset + batch_bytes
+                ].view(torch.int64),
+                group_list=mega.scratch[count_offset : count_offset + EXPERTS * 8].view(
+                    torch.int64
+                ),
+            )
         if args.full_graph:
             assert runner.effective_mode == "full"
             assert runner._graph_capture_count == 1
 
             def capture_addresses():
                 session = runner
+                if args.mega_moe:
+                    return tuple(
+                        t.data_ptr()
+                        for t in (
+                            mega.anchor,
+                            mega.layer_map,
+                            mega.scratch,
+                            session._graph_output,
+                        )
+                    )
                 state = session._graph_payload.context.states
                 return tuple(
                     tensor.data_ptr()
@@ -217,7 +299,9 @@ def main():
             # Test-only per-replay observations, fenced once at the batch end.
             # Production batching performs no host metadata copy.
             session = runner
-            state = session._graph_payload.context.states
+            state = (
+                mega_state if args.mega_moe else session._graph_payload.context.states
+            )
             headers = torch.empty(
                 (len(LAYERS), state.token_nums_rankid_layeridx.numel()),
                 dtype=torch.int64,
@@ -270,13 +354,18 @@ def main():
     cases = [(2, False, 7), (5, True, 7), (2, False, 7)]
     if args.boundary:
         cases.extend(((5, False, 16), (2, True, 16)))
+    if args.tile_boundary:
+        cases.extend(((5, True, 129), (2, False, 129)))
     expected: list[tuple[int, int, int | None]] = []
     for layer_id, sparse, tokens in cases:
         for source in range(args.attn_ranks):
-            chunks = 2 if sparse and tokens == 16 and rank == args.attn_ranks else 1
+            chunks = (
+                2 if sparse and 2 * tokens > capacity and rank == args.attn_ranks else 1
+            )
             rows = 0 if sparse and rank == args.attn_ranks + 1 else None
             expected.extend(
-                (source, layer_id, 16 if chunks == 2 else rows) for _ in range(chunks)
+                (source, layer_id, tokens if chunks == 2 else rows)
+                for _ in range(chunks)
             )
 
     def observe(context):
@@ -291,7 +380,18 @@ def main():
             }
         )
 
-    if is_ffn and not args.full_graph:
+    if is_ffn and args.mega_moe and not args.full_graph:
+        original_step = runner._ffn_forward_connector_driven
+
+        def observe_mega_step(**kwargs):
+            result = original_step(**kwargs)
+            torch.npu.current_stream().synchronize()
+            assert result.item() == 0, "MegaMoE device control validation failed"
+            observe(SimpleNamespace(states=mega_state))
+            return result
+
+        runner._ffn_forward_connector_driven = observe_mega_step
+    if is_ffn and not args.mega_moe and not args.full_graph:
         original_send = connector.send_ffn_output
 
         def observe_eager(output, context, **kwargs):
@@ -322,6 +422,8 @@ def main():
                 runner._submit_graph(count)
                 runner._complete_graph()
                 session = runner
+                if args.mega_moe:
+                    assert session._graph_output.item() == 0
                 assert capture_addresses() == captured_addresses
                 for header, group in zip(
                     headers[:count].tolist(), counts[:count], strict=True
@@ -341,9 +443,14 @@ def main():
                         torch.inference_mode(),
                         torch.npu.stream(session._graph_stream),
                     ):
-                        session._graph_payload.hidden_states.fill_(113)
-                        session._graph_payload.context.states.dynamic_scales.fill_(3)
-                        session._graph_output.fill_(123)
+                        if args.mega_moe:
+                            mega.scratch.fill_(113)
+                        else:
+                            session._graph_payload.hidden_states.fill_(113)
+                            session._graph_payload.context.states.dynamic_scales.fill_(
+                                3
+                            )
+                            session._graph_output.fill_(123)
             runner._graph_receiver_exited = True
         except Exception as exc:
             errors.append(exc)
@@ -364,7 +471,9 @@ def main():
     for layer_id, sparse, tokens in cases:
         for source in range(args.attn_ranks):
             if rank == source:
-                values = torch.tensor([-12, -9, -0.5, 0.5, 9, 12, 1]).repeat(3)[:tokens]
+                values = torch.tensor([-12, -9, -0.5, 0.5, 9, 12, 1]).repeat(
+                    (tokens + 6) // 7
+                )[:tokens]
                 inputs = (
                     (values * (rank + 1))
                     .bfloat16()[:, None]
@@ -398,7 +507,10 @@ def main():
                 actual = output.cpu()
                 if references is not None:
                     torch.testing.assert_close(
-                        actual, references[len(outputs)], rtol=0, atol=0
+                        actual,
+                        references[len(outputs)],
+                        rtol=0.04 if args.mega_moe else 0,
+                        atol=2e-5 if args.mega_moe else 0,
                     )
                 outputs.append(actual)
                 report["work"].append(
@@ -412,7 +524,9 @@ def main():
             torch.save(outputs, f"{args.save_outputs}.rank{rank}.pt")
         if references is not None:
             assert len(references) == len(outputs)
-            report["eager_exact_match"] = True
+            report[
+                "layered_reference_close" if args.mega_moe else "eager_exact_match"
+            ] = True
         assert not connector._pending_attention_payloads
     else:
         assert thread is not None

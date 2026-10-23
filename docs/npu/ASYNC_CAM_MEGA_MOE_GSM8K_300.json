@@ -1,0 +1,292 @@
+{
+  "date": "2026-10-23",
+  "branch": "feat/async-cam-megamoe-phase1",
+  "base_commit": "df8d6a0c403c3ca1b4ed9cf1687e7204908bebec",
+  "target": "A3 / ascend910_93",
+  "cann": "9.1.0",
+  "versions": {
+    "torch": "2.10.0+cpu",
+    "torch-npu": "2.10.0.post4",
+    "vllm": "0.30.0+empty",
+    "vllm-ascend": "0.19.1rc2.dev2448+g8d4409d62",
+    "lm_eval": "0.4.12",
+    "datasets": "4.4.1"
+  },
+  "model": {
+    "name": "DeepSeek-V4-Flash DSpark W4A8",
+    "registry": "hcr.meta-guian02.guian.hw-a3.local/aistudio/modelhub_63300054_deepseek-v4-flash-dspark-w4a8-test:135500129_20260721185415",
+    "architecture": "DeepseekV4ForCausalLM",
+    "hidden_size": 4096,
+    "moe_intermediate_size": 2048,
+    "routed_experts": 256,
+    "top_k": 6,
+    "layers": 43,
+    "shards": 42,
+    "total_shard_bytes": 169741361632,
+    "metadata_sha256": {
+      "config.json": "6c6cdc4a47e00e41137081429b95bd5c1cf91ba62e87309d1398431de7f4a8e1",
+      "quant_model_description.json": "a2e85871ba049d8b475bb5de5b75a79b6fedb577eefc2ae86d57879143431b60",
+      "quant_model_weights.safetensors.index.json": "d31d82605fa440e5c6ccfdf8bccdebe65626e2cf7f3deb0292ba2a686d611752",
+      "tokenizer.json": "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf",
+      "tokenizer_config.json": "6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547"
+    },
+    "shard_contents_fully_hashed": false
+  },
+  "runtime": {
+    "host_count": 1,
+    "a3_dies": 16,
+    "attention_devices": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "ffn_devices": [
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "attention_dp": 2,
+    "attention_tp": 4,
+    "attention_runner": "MRV2",
+    "ffn_dp": 8,
+    "ffn_tp": 1,
+    "ffn_ep": 8,
+    "ffn_runner": "AsyncNPUFFNModelRunner",
+    "mode": "eager",
+    "dbo": false,
+    "ffn_two_stream": false,
+    "attention_flashcomm1": true,
+    "ffn_flashcomm1": false,
+    "max_model_len": 32768,
+    "max_num_batched_tokens": 32768,
+    "max_num_seqs": 16,
+    "gpu_memory_utilization": 0.7,
+    "block_size": 128,
+    "server_seed": 1024,
+    "environments": {
+      "attention": {
+        "VLLM_PLUGINS": "ascend,afd",
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "ASCEND_RT_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+        "AFD_ASYNC_CAM_LAYERED_GMM": "0",
+        "AFD_ASYNC_CAM_MEGA_MOE": "0"
+      },
+      "ffn": {
+        "VLLM_PLUGINS": "ascend,afd",
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "ASCEND_RT_VISIBLE_DEVICES": "8,9,10,11,12,13,14,15",
+        "AFD_ASYNC_CAM_LAYERED_GMM": "1",
+        "AFD_ASYNC_CAM_MEGA_MOE": "1"
+      }
+    }
+  },
+  "evaluation": {
+    "dataset": "gsm8k/main",
+    "test_doc_ids": "0-299",
+    "num_fewshot": 8,
+    "temperature": 0,
+    "do_sample": false,
+    "max_gen_toks": 512,
+    "num_concurrent": 12,
+    "request_truncation": false,
+    "seeds": {
+      "random": 0,
+      "numpy": 1234,
+      "torch": 1234,
+      "fewshot": 1234
+    },
+    "data_sha256": {
+      "test-00000-of-00001.parquet": "ee7b8da9e381df27b9e3f7758a159ab2bdaa4dbaa910546cbbc47e0cb44e4f59",
+      "train-00000-of-00001.parquet": "ea82612ea9582142387730c793eb67d3b12849002bc0b7fa6f8efafa7351419d"
+    },
+    "selected_samples_sha256": "7efaba6d8ce41705df00333b3babe01a9214a40d7e3182ae6e0b532d5afc227b"
+  },
+  "verified_result": {
+    "result": "PASS",
+    "fresh_baseline": false,
+    "effective_samples": 300,
+    "sample_log_records": 600,
+    "scores": {
+      "strict-match": {
+        "correct": 285,
+        "samples": 300,
+        "accuracy": 0.95,
+        "wrong_doc_ids": [
+          12,
+          43,
+          78,
+          87,
+          98,
+          106,
+          119,
+          146,
+          147,
+          182,
+          187,
+          209,
+          236,
+          255,
+          267
+        ]
+      },
+      "flexible-extract": {
+        "correct": 285,
+        "samples": 300,
+        "accuracy": 0.95,
+        "wrong_doc_ids": [
+          12,
+          43,
+          78,
+          87,
+          98,
+          106,
+          119,
+          146,
+          147,
+          182,
+          187,
+          209,
+          236,
+          255,
+          267
+        ]
+      }
+    },
+    "ffn_backend": "mega_moe",
+    "ffn_ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "moe_layers": 43,
+    "attention_dp": 2,
+    "attention_tp": 4,
+    "ffn_ep": 8,
+    "ffn_tp": 1,
+    "mode": "eager",
+    "max_model_len": 32768,
+    "max_num_batched_tokens": 32768,
+    "num_fewshot": 8,
+    "num_concurrent": 12,
+    "max_gen_toks": 512,
+    "temperature": 0,
+    "do_sample": false,
+    "dbo": false,
+    "sample_file": "gsm8k/dsv4-flash-attention/samples_gsm8k_2026-10-23T07-08-00.804188.jsonl",
+    "sample_file_sha256": "6aac4c40a7e59e35354f5e2c58146bee0b4c825bed7bad4e9a34b4dbe9a71e6d",
+    "native_artifacts_sha256": {
+      "afd_plugin/_C_ascend.cpython-312-aarch64-linux-gnu.so": "1069acd83f4c1f474f546888c50660e0d02e555255bce7cc8bd6ab36a4e856e0",
+      "afd_plugin/_cann_ops_custom/vendors/afd-plugin/op_api/lib/libcust_opapi.so": "5b4d7663f5ebb6c8aa8bbc1622f6de3e6b33a01ff7787ae2f5af81cc3c778716",
+      "afd_plugin/_cann_ops_custom/vendors/afd-plugin/op_impl/ai_core/tbe/kernel/ascend910_93/afd_mega_moe_ffn/AfdMegaMoeFFN_989547696d243c85c3d86b7bd464a2df.o": "d550fecd12c48654a1e74ba14183147588943360b69a25fc867ff92d25375623",
+      "afd_plugin/_cann_ops_custom/vendors/afd-plugin/op_impl/ai_core/tbe/kernel/ascend910_93/afd_mega_moe_ffn/AfdMegaMoeFFN_989547696d243c85c3d86b7bd464a2df.json": "2118d959d655d6a98a6a5afaa92a5e05b1388dbb1e7fcabd82adbf20d6b5f98e",
+      "afd_plugin/_cann_ops_custom/vendors/afd-plugin/op_impl/ai_core/tbe/op_tiling/liboptiling.so": "4d2576a373e7ba892237655a6b0d8eb5b4b6009cc48ce85e2f7629cda8f2065b"
+    },
+    "source_hashes_match": true,
+    "duplicate_or_missing_documents": false,
+    "inference_errors": 0,
+    "remaining_e2e_processes": [],
+    "ports_free": true,
+    "shutdown": "E2E process termination; FFN logs include shutdown exceptions and resource_tracker warnings",
+    "unverified": [
+      "fresh baseline parity",
+      "performance",
+      "real-checkpoint FULL",
+      "64K context",
+      "invalid-device-control recovery",
+      "long-running service lifecycle"
+    ]
+  },
+  "exit_code": 0,
+  "start_time_utc": "2026-10-23T06:58:52Z",
+  "end_time_utc": "2026-10-23T07:08:20Z",
+  "sources_sha256": {
+    "afd_plugin/envs.py": "0212eeb843248b206ae21498160aa1dcd24332eefb641eebfe7fe1680894232f",
+    "afd_plugin/model_executor/npu/async_cam_mega_moe.py": "2dd21d2121fc7dc0ab59a0d9d1ba6d805bbb3ace8a7100d46a3cc00f388b8191",
+    "afd_plugin/v1/worker/npu/async_ffn_model_runner.py": "4d21920f651ab9da542a0546df9eea8c168519ff67849f5954b646ecd7cc9830",
+    "csrc/npu/ascend_kernels/afd_mega_moe_ffn/op_api/aclnn_afd_mega_moe_ffn.cpp": "60a45425e8c614d7843d5c555b8e0dba04529f05097821b7f1f21d18104be070",
+    "csrc/npu/ascend_kernels/afd_mega_moe_ffn/op_api/aclnn_afd_mega_moe_ffn.h": "1468f2b09f2b4e8a9ec729603aadfa0319ef40f08be1276d3a465d6f4279613f",
+    "csrc/npu/ascend_kernels/afd_mega_moe_ffn/op_host/afd_mega_moe_ffn.cpp": "3d53f80804ea0854ec591fe6bc58234e0422da4ac1fefe2dfa368ac5a4356e28",
+    "csrc/npu/ascend_kernels/afd_mega_moe_ffn/op_kernel/afd_mega_moe_ffn.cpp": "4f6e990755c6cdb2805103e1885601fc8c7d839d530d21c3adf39cab6caa5e0f",
+    "csrc/npu/ascend_kernels/afd_mega_moe_ffn/op_kernel/afd_mega_moe_ffn_tiling.h": "315311594aa0a980a82f5058b2a73d28f121b667354b69cd58045005afca99d1",
+    "csrc/npu/ascend_kernels/operator_registry.json": "91971377ac569340a7c641554537a196d2cda62ba300d0ab27fcff97013ab5bc",
+    "csrc/npu/ascend_kernels/utils/op_kernel/mega_moe_workspace.h": "e9f9eb478ce8a607ae12d5192d29173de3493056b5d73f77c5f9433a113df1eb",
+    "csrc/npu/pybind/CMakeLists.txt": "5797621ce8dfc6e18a4313130d75c7ac5916f9e357afa37f317339d659faac78",
+    "csrc/npu/pybind/torch_binding_mega_moe.cpp": "53f8e7c1cfe3d1d5e9e6149b5c252d693acb8aa743343dd4c794d86a9f161d58",
+    "tests/npu/async_cam_runtime.py": "8ff61a56db44c4233e8113e1c31b583efb2f3fd210b2402daa7b6ce61852c63c",
+    "tests/npu/check_mega_moe_workspace.cpp": "5c2edacd2d3d92f3016669f89775f1a3b9842f80ebb29ae3c1cfc6f7d0e017d7",
+    "tests/npu/test_async_cam_mega_moe_meta.py": "d5193803663151d3aa978af6c3ea0ea5c21fb1607bbd681165b97a67040f8b22"
+  },
+  "source_audit": {
+    "count": 115,
+    "all_current_hashes_match": true,
+    "full_manifest": "expected.json"
+  },
+  "regression_fix": {
+    "problem": "Repeated Matmul Init/End accumulated AIC TPipe buffer records across experts and tiles.",
+    "observed_failure": "AfdMegaMoeFFN error 507015, scalar GM address exceeds 48 bits, AIC PC offset 0x4058",
+    "fix": "Reset AIC TPipe after every Matmul.End().",
+    "reproduction": {
+      "mode": "eager",
+      "hidden_size": 4096,
+      "moe_intermediate_size": 2048,
+      "local_experts": 32,
+      "scratch_description": "approximately 3 GB",
+      "reference": "Previously saved diagonal synthetic output expanded in equal feature columns; no fresh model baseline."
+    },
+    "original_kernel_sha256": "35c106c27f2b7d25269c11db07d8ba42eb924f0a7ab3cdf44640f35b14d1e51d",
+    "fixed_kernel_sha256": "d550fecd12c48654a1e74ba14183147588943360b69a25fc867ff92d25375623",
+    "before": "same 507015 / PC offset reproduced",
+    "after": "7 finite workloads passed, including tile continuation and empty FFN work; real 300-sample eager run passed",
+    "post_fix_full_mode_rerun": false,
+    "historical_matrix": "ASYNC_CAM_MEGA_MOE_VALIDATION.json predates this fix; its hashes and FULL results describe the earlier build."
+  },
+  "failed_capacity_attempt": {
+    "max_model_len": 65536,
+    "kv_required_gib": 34.5,
+    "kv_available_gib": 21.57,
+    "resolution": "Lower runtime context to 32768; evaluation settings unchanged."
+  },
+  "artifacts": {
+    "local_directory": "results/mega-moe-gsm8k-300-20261023 (sibling workspace directory above afd-plugin)",
+    "remote_directory": "/a3_inference/itask/workdir/jcz02615514/lrx/afd-mrv2-async/mega-moe-gsm8k-300-20261023",
+    "remote_source_root": "/a3_inference/itask/workdir/jcz02615514/lrx/afd-mrv2-async/megamoe-phase1-20261023-build01/src",
+    "archive": "artifacts.tar.gz",
+    "archive_sha256": "d9546b76429f128b57f14372e7145f752512291f6f4a4b04ba8edf09667b3257",
+    "archive_bytes": 1353637,
+    "transferred_files": 70,
+    "files_sha256": {
+      "expected.json": "c5f137f3da11d26c95a08efa885be934920c14330dd939fc1989581e9d0b7179",
+      "preflight.json": "9b6b9512beb753979393b8d5bc4416ba8abf21bf7adadbb7395039316547733a",
+      "manifest.json": "f9d06921e6adb39c64715aef0d2f9d5b8cc3c321af8a0132f916c234793f59cf",
+      "selected-samples.json": "7efaba6d8ce41705df00333b3babe01a9214a40d7e3182ae6e0b532d5afc227b",
+      "metrics.json": "1a09710867232f42a2d3b0bf4a06263ffdb83e69ad492d9bb07bcfc6fa058aed",
+      "verified-summary.json": "c26bf007696573213ddfaff31cfca0449015543238d5e48b42fe3fd179085fe2",
+      "test.log": "20513c393d0fd3124c8fa89d253536a2962f1d11417c0b871928c48678a1f25c",
+      "transfer-sha256.json": "01cf669dc85d9b840ce4a053129c7e14c936b437d61adbd1da795ebceeab734e"
+    },
+    "large_cann_fault_dump": "Retained remotely under attempt01/extra-info; excluded from downloaded archive."
+  },
+  "task": {
+    "name": "afd-mrv2-async",
+    "status": "Running",
+    "checked_at_utc": "2026-10-23 07:20 UTC (minute precision)",
+    "retained_by_user_request": true,
+    "test_services_running": false
+  },
+  "qualification_limit": "Only the stated checkpoint, first 300 GSM8K samples, and eager topology are measured; no baseline parity, speedup, FULL-mode, 64K-context or long-running service claim."
+}

@@ -192,3 +192,9 @@ Batch-end metadata samples do not prove per-layer coverage.
 Inference results and cleanup are recorded separately; remaining owned processes
 or failed requests block acceptance. Validation evidence must identify the
 source and native artifacts actually deployed.
+
+## Experimental MegaMoE phase 1
+
+The optional `AFD_ASYNC_CAM_MEGA_MOE=1` FFN backend has a phase-ordered single-kernel
+implementation for A3 compact-v2 W4A8. Native qualification is pending. See
+[the implementation and validation guide](ASYNC_CAM_MEGA_MOE.md) before enabling it.

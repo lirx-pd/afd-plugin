@@ -2,10 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 from __future__ import annotations
 
+import pytest
+
 from afd_plugin.envs import (
     AFD_ASYNC_CAM_LAYERED_GMM,
+    AFD_ASYNC_CAM_MEGA_MOE,
     AFD_FORCE_BALANCED_TOPK_IDS,
     async_cam_layered_gmm_enabled,
+    async_cam_mega_moe_enabled,
     force_balanced_topk_ids_enabled,
 )
 
@@ -23,12 +27,21 @@ def test_force_balanced_topk_ids_env_accepts_true_values(monkeypatch):
         assert force_balanced_topk_ids_enabled() is True
 
 
-def test_async_cam_layered_gmm_defaults_and_boolean_values(monkeypatch):
-    monkeypatch.delenv(AFD_ASYNC_CAM_LAYERED_GMM, raising=False)
-    assert async_cam_layered_gmm_enabled() is False
+@pytest.mark.parametrize(
+    "name, enabled",
+    [
+        (AFD_ASYNC_CAM_LAYERED_GMM, async_cam_layered_gmm_enabled),
+        (AFD_ASYNC_CAM_MEGA_MOE, async_cam_mega_moe_enabled),
+    ],
+)
+def test_async_cam_compute_switch_defaults_and_boolean_values(
+    monkeypatch, name, enabled
+):
+    monkeypatch.delenv(name, raising=False)
+    assert enabled() is False
     for value in ("1", "true", "yes", "on", "TRUE"):
-        monkeypatch.setenv(AFD_ASYNC_CAM_LAYERED_GMM, value)
-        assert async_cam_layered_gmm_enabled() is True
+        monkeypatch.setenv(name, value)
+        assert enabled() is True
     for value in ("", "0", "false", "no", "off"):
-        monkeypatch.setenv(AFD_ASYNC_CAM_LAYERED_GMM, value)
-        assert async_cam_layered_gmm_enabled() is False
+        monkeypatch.setenv(name, value)
+        assert enabled() is False

@@ -35,7 +35,8 @@ from afd_plugin.connectors.npu.async_cam import (
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
 )
-from afd_plugin.envs import async_cam_layered_gmm_enabled
+from afd_plugin.envs import async_cam_layered_gmm_enabled, async_cam_mega_moe_enabled
+from afd_plugin.model_executor.npu.async_cam_mega_moe import AsyncCAMMegaMoeExecutor
 from afd_plugin.model_executor.npu.async_cam_w4a8 import (
     AsyncCAMW4A8Executor,
     W4A8LayerWeights,
@@ -73,6 +74,7 @@ class FFNModel(Protocol):
 class AsyncNPUFFNModelRunner:
     afd_expected_role = "ffn"
     _two_stream: AsyncFFNTwoStream | None = None
+    _mega_executor: AsyncCAMMegaMoeExecutor | None = None
 
     def __init__(
         self,
@@ -163,6 +165,31 @@ class AsyncNPUFFNModelRunner:
                 raise
             stream_error = str(exc)
         executor = self._layered_executor
+        if async_cam_mega_moe_enabled():
+            if executor is None or config.ffn_two_stream:
+                raise ValueError(
+                    "MegaMoE requires layered W4A8 and ffn_two_stream=false"
+                )
+            if executor.w13[0].shape[:2] != (
+                self.connector.expert_per_rank,
+                self.connector.hidden_size,
+            ):
+                raise ValueError(
+                    "MegaMoE weights disagree with the CAM expert/hidden layout"
+                )
+            self._mega_executor = AsyncCAMMegaMoeExecutor(
+                executor,
+                max_seq_len=self.connector.max_num_batched_tokens,
+                top_k=self.connector.topk,
+                ffn_ranks=self.connector.ffn_size,
+                attn_ranks=self.connector.attn_size,
+                rank=self.connector.world_rank,
+                tp_size=self.connector.tp_size,
+                capacity=cam_receive_capacity(),
+            )
+            logger.info(
+                "Async CAM FFN backend=mega_moe protocol=compact_v2 tile_rows=128"
+            )
         if config.ffn_two_stream:
             stream_signature = repr(
                 (
@@ -191,12 +218,16 @@ class AsyncNPUFFNModelRunner:
             if executor is None
             else ""
         )
+        signature = ""
+        if executor:
+            backend_prefix = "mega_moe_v1:" if self._mega_executor else ""
+            signature = backend_prefix + executor.graph_signature(
+                cam_receive_capacity()
+            )
         self.connector.graph_startup.plan = FFNGraphPlan(
             requested=self.requested_mode,
             graph_error=graph_error,
-            signature=executor.graph_signature(cam_receive_capacity())
-            if executor
-            else "",
+            signature=signature,
             layer_ids=self.layer_ids,
             stream_signature=stream_signature,
             stream_error=stream_error,
@@ -271,21 +302,28 @@ class AsyncNPUFFNModelRunner:
             with torch.npu.graph(
                 self._graph, pool=self._graph_pool, stream=self._graph_stream
             ):
-                self._graph_payload = self.connector.recv_attn_output()
-                state = cast(AFDAsyncTransferState, self._graph_payload.context.states)
-                assert state.token_nums_rankid_layeridx is not None
-                assert state.group_list is not None
-                assert state.dynamic_scales is not None
-                self._graph_output = self._layered_executor(
-                    self._graph_payload.hidden_states,
-                    state.dynamic_scales,
-                    state.group_list,
-                    state.token_nums_rankid_layeridx,
-                    retained_tensors=self._graph_tensors,
-                )
-                self.connector.send_ffn_output(
-                    self._graph_output, self._graph_payload.context
-                )
+                if self._mega_executor is not None:
+                    self._graph_output = self._mega_executor(
+                        self.connector.comm_args, self.connector.group_name
+                    )
+                else:
+                    self._graph_payload = self.connector.recv_attn_output()
+                    state = cast(
+                        AFDAsyncTransferState, self._graph_payload.context.states
+                    )
+                    assert state.token_nums_rankid_layeridx is not None
+                    assert state.group_list is not None
+                    assert state.dynamic_scales is not None
+                    self._graph_output = self._layered_executor(
+                        self._graph_payload.hidden_states,
+                        state.dynamic_scales,
+                        state.group_list,
+                        state.token_nums_rankid_layeridx,
+                        retained_tensors=self._graph_tensors,
+                    )
+                    self.connector.send_ffn_output(
+                        self._graph_output, self._graph_payload.context
+                    )
             self._graph_capture_count = 1
         except Exception as exc:
             self._graph_failure = exc
@@ -353,7 +391,9 @@ class AsyncNPUFFNModelRunner:
         self._graph.reset()
         self._graph = None
         self._graph_tensors.clear()
-        del self._graph_payload, self._graph_output
+        if self._mega_executor is None:
+            del self._graph_payload
+        del self._graph_output
         del self._graph_pool, self._graph_stream
         self._graph_closed = True
 
@@ -423,6 +463,13 @@ class AsyncNPUFFNModelRunner:
             self._two_stream.submit(1 if single else len(self.layer_ids))
             self._two_stream.complete(wait=self._wait_graph_device if single else None)
             return None
+        if self._mega_executor is not None:
+            completion = None
+            for _ in self.layer_ids[:1] if single else self.layer_ids:
+                completion = self._mega_executor(
+                    self.connector.comm_args, self.connector.group_name
+                )
+            return completion
         stage_idx = 0
         rank_ffn_output = None
         connector = cast(CAMAsyncAFDConnector, self.connector)
@@ -517,6 +564,7 @@ class AsyncNPUFFNModelRunner:
             self._close_graph()
         stop_afd_npu_profiler(self.prof)
         self.connector.close()
+        self._mega_executor = None
         self._layered_executor = None
         free_before_shutdown(self.vllm_config)
         self.model = None

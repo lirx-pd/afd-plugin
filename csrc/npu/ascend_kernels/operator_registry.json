@@ -9,7 +9,8 @@
       "afd_async_combine_send",
       "afd_async_combine_recv",
       "grouped_matmul_swiglu_quant_v2_layered",
-      "grouped_matmul_layered"
+      "grouped_matmul_layered",
+      "afd_mega_moe_ffn"
     ],
     "ascend950": [
       "a2e",
@@ -39,6 +40,9 @@
       "requires_shmem": false
     },
     "grouped_matmul_layered": {
+      "requires_shmem": false
+    },
+    "afd_mega_moe_ffn": {
       "requires_shmem": false
     }
   }

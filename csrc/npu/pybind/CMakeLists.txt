@@ -61,7 +61,8 @@ if(AFD_SOC_VERSION STREQUAL "")
 endif()
 if(AFD_SOC_VERSION STREQUAL "910c" OR AFD_SOC_VERSION MATCHES "^ascend910_93")
   target_sources(afd_plugin_ascend_C PRIVATE
-    "${CMAKE_CURRENT_LIST_DIR}/torch_binding_cam_async.cpp")
+    "${CMAKE_CURRENT_LIST_DIR}/torch_binding_cam_async.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/torch_binding_mega_moe.cpp")
 elseif(AFD_SOC_VERSION STREQUAL "950" OR AFD_SOC_VERSION MATCHES "^[Aa]scend950")
   message(STATUS "CAM asynchronous bindings disabled for Ascend 950")
 else()

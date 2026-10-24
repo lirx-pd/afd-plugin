@@ -4,8 +4,10 @@ Status: experimental A3 implementation. A runnable Phase 2 version is available 
 `feat/async-cam-megamoe-phase2`, based on Phase 1 commit `22334e2`.
 The current functional upgrade fixes small-batch DS/CR at 8 AIVs, batches four
 MegaMoE transactions per FULL graph, and caches immutable chunk metadata.
-It remains disabled by default. Performance qualification is deferred; the
-historical Phase 2 measurements below describe the pre-upgrade implementation.
+It remains disabled by default. The subsequent
+[A3 profiling and optimization](ASYNC_CAM_MEGA_MOE_PERFORMANCE.md) records
+measured control-path improvements against the fresh CANN 9.1 kernel;
+the historical Phase 2 measurements below describe the pre-upgrade implementation.
 
 ## Scope and entry points
 
@@ -108,8 +110,8 @@ global scalar-cache invalidation and MTE3/FIX fences retain their existing rules
 
 Device-side multi-transaction polling (P3) is deferred. Each native invocation
 still consumes one compact-v2 chunk. Qualification of the fixed version focuses
-on function and accuracy, with no claimed performance gain or selected optimal
-core count.
+on function and accuracy. The subsequent profiling report qualifies a scoped
+control-path optimization; the optimal core count remains unestablished.
 
 ## Supported bounds
 

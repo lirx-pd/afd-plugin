@@ -32,9 +32,16 @@ public:
         if ASCEND_IS_AIV {
             Fence<HardEvent::MTE3_S>();
         }
+        // Leaders publish after their members; the root polls only leaders.
+        constexpr uint32_t group = 4;
+        if (id % group == 0) {
+            const uint32_t end = id + group < count ? id + group : count;
+            for (uint32_t i = id + 1; i < end; ++i)
+                WaitAt(Address(stage, i + 1), sequence);
+        }
         StoreControl(Address(stage, id + 1), 0, sequence);
         if (id == 0) {
-            for (uint32_t i = 1; i < count; ++i)
+            for (uint32_t i = group; i < count; i += group)
                 WaitAt(Address(stage, i + 1), sequence);
             StoreControl(Address(stage, 0), 0, sequence);
         }
@@ -57,10 +64,11 @@ struct Tile {
     }
 };
 
+// Counts were invalidated and validated at kernel entry.
 class TileCursor {
 public:
     __aicore__ TileCursor(GM_ADDR counts, uint32_t experts)
-        : counts_(counts), experts_(experts), count_(ReadControl(counts, 0)) {}
+        : counts_(counts), experts_(experts), count_(ReadImmutableCount(counts, 0)) {}
     __aicore__ Tile Next() {
         while (expert_ < experts_) {
             if (offset_ < count_) {
@@ -71,7 +79,7 @@ public:
             }
             ++expert_;
             offset_ = 0;
-            if (expert_ < experts_) count_ = ReadControl(counts_, expert_);
+            if (expert_ < experts_) count_ = ReadImmutableCount(counts_, expert_);
         }
         return {};
     }

@@ -32,6 +32,9 @@ template <HardEvent event> __aicore__ inline void Fence() {
     SetFlag<event>(id);
     WaitFlag<event>(id);
 }
+__aicore__ inline int64_t ReadImmutableCount(GM_ADDR base, uint32_t index) {
+    return *(reinterpret_cast<volatile __gm__ int64_t *>(base) + index);
+}
 __aicore__ inline int64_t ReadControl(GM_ADDR base, uint32_t index) {
     GlobalTensor<int64_t> gm;
     gm.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(base) + index);
@@ -183,9 +186,12 @@ afd_mega_moe_ffn(GM_ADDR anchor, GM_ADDR commArgs, GM_ADDR layerMap, GM_ADDR scr
             WriteCompletion(completion, -1, pipe);
             return;
         }
+        // Counts are immutable after DR; refresh each 64B scalar cache line once.
         uint64_t total = 0;
         for (uint32_t e = 0; e < t.recv.routeExpertNumPerMoe; ++e) {
-            const auto count = ReadControl(scratch + w.counts, e);
+            const auto count = e % (64 / sizeof(int64_t)) == 0
+                                   ? ReadControl(scratch + w.counts, e)
+                                   : ReadImmutableCount(scratch + w.counts, e);
             if (count < 0 || uint64_t(count) > t.capacity - total) {
                 WriteCompletion(completion, -2, pipe);
                 return;

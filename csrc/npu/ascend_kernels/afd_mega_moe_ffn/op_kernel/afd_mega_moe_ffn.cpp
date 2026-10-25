@@ -87,8 +87,8 @@ __aicore__ inline GMAddrParams Addresses(GM_ADDR x, GM_ADDR scales, GM_ADDR coun
 
 __aicore__ inline void OutputTile(GM_ADDR scratch, const Cam::MegaWorkspace &w,
                                   const Cam::AfdMegaMoeFFNTilingData &t, GM_ADDR biasList,
-                                  int64_t layer, uint32_t expert, uint64_t outRow, uint32_t rows,
-                                  TPipe &pipe) {
+                                  int64_t layer, uint32_t expert, uint32_t offset, uint32_t rows,
+                                  GM_ADDR counts, TPipe &pipe) {
     if ASCEND_IS_AIV {
         pipe.Reset();
         const uint32_t h = t.recv.hiddenSize;
@@ -109,10 +109,15 @@ __aicore__ inline void OutputTile(GM_ADDR scratch, const Cam::MegaWorkspace &w,
         biases.SetGlobalBuffer(GetLayerTensorAddr<float>(layer, t.g2.layerNum, biasList));
         scales.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scratch + w.zScales));
         output.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(scratch + w.y));
-        DataCopy(bias, biases[expert * h], h);
-        Fence<HardEvent::MTE2_V>();
+        uint32_t groupEnd = ReadImmutableCount(counts, expert) - offset;
+        uint32_t loadedExpert = UINT32_MAX;
         for (uint32_t r = GetBlockIdx() - Cam::MEGA_COMM_AIVS; r < rows;
              r += t.recv.aivNum - Cam::MEGA_COMM_AIVS) {
+            while (r >= groupEnd) groupEnd += ReadImmutableCount(counts, ++expert);
+            if (loadedExpert != expert) {
+                DataCopy(bias, biases[expert * h], h);
+                loadedExpert = expert;
+            }
             DataCopy(hi, raw[2 * r * h], h);
             DataCopy(lo, raw[(2 * r + 1) * h], h);
             DataCopyPad(scale, scales[r], {1U, 4U, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
@@ -141,7 +146,7 @@ __aicore__ inline void OutputTile(GM_ADDR scratch, const Cam::MegaWorkspace &w,
                 Cast(y, v, RoundMode::CAST_RINT, h);
             }
             Fence<HardEvent::V_MTE3>();
-            DataCopy(output[(outRow + r) * h], y, h);
+            DataCopy(output[r * h], y, h);
             Fence<HardEvent::MTE3_V>();
             Fence<HardEvent::V_MTE2>();
         }

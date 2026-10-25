@@ -1,5 +1,9 @@
 # A3 tile pipeline redesign
 
+This report records the historical 128-row implementation and its frozen
+measurements. The current [expert-packing update](ASYNC_CAM_MEGA_MOE_EXPERT_PACKING.md)
+retains this schedule with larger tiles spanning multiple experts.
+
 ## Dependency and buffer ownership
 
 The 2026-10-24 internal trace found little communication overlap in the two-slot

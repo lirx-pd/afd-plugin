@@ -7,7 +7,9 @@ MegaMoE transactions per FULL graph, and caches immutable chunk metadata.
 It remains disabled by default. The
 [A3 tile pipeline redesign](ASYNC_CAM_MEGA_MOE_TILE_PIPELINE.md) uses three slots,
 separate input/output release conditions, two-tile PRE1 lookahead and
-16 communication / 32 compute AIVs.
+16 communication / 32 compute AIVs. The current
+[expert-packed tiles](ASYNC_CAM_MEGA_MOE_EXPERT_PACKING.md) combine adjacent
+experts in 512-row tiles to reduce repeated initialization and synchronization.
 The historical Phase 2 measurements below describe the pre-upgrade implementation.
 
 ## Scope and entry points
@@ -24,8 +26,9 @@ communication AIV 0: release consumed input and publish final compact-v2 complet
 all cores: drain, write completion status
 ```
 
-Three 128-row slots hold independent G1 and G2 intermediates. A tile belongs to
-one expert and may span multiple Attention TP sources. The producer publishes
+Three 512-row slots hold independent G1 and G2 intermediates. A tile can span
+adjacent experts and multiple Attention TP sources. Its expert range and partial
+first-expert offset retain the original route order. The producer publishes
 its sequence only after every participating core has drained its writes.
 Input staging is refilled after G2; BF16 output is reused only after all senders
 have consumed it. These regions have independent release conditions.
@@ -53,7 +56,7 @@ scheduling with one block per AIC, including its two sibling AIVs.
   The connector owns the HCCL domain and windows. Graph replay reuses the scratch
   on one stream. Shutdown retains the existing receiver-exit and device-completion
   requirements before releasing either owner.
-- Scratch contains metadata, per-core completion flags and three 128-row slots.
+- Scratch contains metadata, per-core completion flags and three 512-row slots.
   Its size is independent of receive capacity. G1 and G2 have separate scratch
   in each slot. There is no duplicate full-model weight conversion or new copy.
 - Input and output preserve compact-v2 expert/TP route order, expert-chunk
@@ -209,8 +212,7 @@ AFD_RUN_ASCEND_OP_RUNTIME=1 pytest -q tests/npu/test_async_cam_mega_moe_meta.py
 ```
 
 The fixture tests non-contiguous layer IDs, repeated layers, empty experts/FFN,
-129-row experts split into 128+1 compute tiles, old expert-chunk continuation,
-fixed-address replay,
+129-row experts, old expert-chunk continuation and fixed-address replay,
 poisoned unused scratch and cleanup. New-path results are compared with the
 saved layered output using `rtol=0.04, atol=2e-5`; unchanged layered FULL retains
 its exact-match check. These are synthetic-fixture thresholds, not approval

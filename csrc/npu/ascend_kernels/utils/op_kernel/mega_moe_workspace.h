@@ -27,7 +27,7 @@ enum MegaConfigIndex : uint32_t {
     MEGA_CONFIG_SIZE = 14,
 };
 constexpr uint64_t MEGA_ALIGNMENT = 512;
-constexpr uint32_t MEGA_TILE_ROWS = 128;
+constexpr uint32_t MEGA_TILE_ROWS = 512;
 constexpr uint32_t MEGA_CUBE_TILING_BYTES = 1024;
 AFD_MEGA_HOST_DEVICE constexpr uint64_t MegaAlign(uint64_t n) {
     return (n + MEGA_ALIGNMENT - 1) / MEGA_ALIGNMENT * MEGA_ALIGNMENT;

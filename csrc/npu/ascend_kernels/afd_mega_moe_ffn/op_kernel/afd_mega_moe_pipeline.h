@@ -57,9 +57,9 @@ private:
 };
 
 struct Tile {
-    uint32_t expert = 0, offset = 0, rows = 0, sequence = 0;
+    uint32_t expert = 0, offset = 0, rows = 0, sequence = 0, lastExpert = 0;
     __aicore__ WorkSpaceSplitConfig Split() const {
-        return {rows, 1, 0, int64_t(expert), int64_t(expert), int64_t(expert),
+        return {rows, 1, 0, int64_t(expert), int64_t(expert), int64_t(lastExpert),
                 Cam::MEGA_TILE_ROWS, rows, true};
     }
 };
@@ -70,20 +70,27 @@ public:
     __aicore__ TileCursor(GM_ADDR counts, uint32_t experts)
         : counts_(counts), experts_(experts), count_(ReadImmutableCount(counts, 0)) {}
     __aicore__ Tile Next() {
-        while (expert_ < experts_) {
-            if (offset_ < count_) {
-                const uint32_t rows = count_ - offset_ < Cam::MEGA_TILE_ROWS ? count_ - offset_ : Cam::MEGA_TILE_ROWS;
-                const Tile tile{expert_, offset_, rows, ++sequence_};
-                offset_ += rows;
-                return tile;
-            }
+        SkipEmpty();
+        if (expert_ == experts_) return {};
+        Tile tile{expert_, offset_, 0, ++sequence_, expert_};
+        while (tile.rows < Cam::MEGA_TILE_ROWS && expert_ < experts_) {
+            const uint32_t remaining = Cam::MEGA_TILE_ROWS - tile.rows;
+            const uint32_t rows = count_ - offset_ < remaining ? count_ - offset_ : remaining;
+            tile.rows += rows;
+            tile.lastExpert = expert_;
+            offset_ += rows;
+            SkipEmpty();
+        }
+        return tile;
+    }
+private:
+    __aicore__ void SkipEmpty() {
+        while (expert_ < experts_ && offset_ == count_) {
             ++expert_;
             offset_ = 0;
             if (expert_ < experts_) count_ = ReadImmutableCount(counts_, expert_);
         }
-        return {};
     }
-private:
     GM_ADDR counts_;
     uint32_t experts_, count_, expert_ = 0, offset_ = 0, sequence_ = 0;
 };
@@ -135,42 +142,53 @@ public:
         const auto slot = scratch_ + w_.SlotOffset(tile.sequence);
         dst.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(slot + w_.tileX));
         dstScale.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(slot + w_.tileScales));
-        uint32_t tpBegin = 0;
-        for (uint32_t tp = 0; tp < t_.recv.tpSize; ++tp) {
-            const uint32_t count = Count(tp, tile.expert);
-            const uint32_t prefix = Prefix(tp, tile.expert);
-            const auto source = reinterpret_cast<GM_ADDR>(context_->localWindowsIn) + (source_ + tp) * sourceBytes_;
-            GlobalTensor<uint16_t> routes;
-            GlobalTensor<int8_t> tokens;
-            routes.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t *>(source + indices_));
-            tokens.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(source + payload_));
-            const uint32_t begin = tile.offset > tpBegin ? tile.offset : tpBegin;
-            const uint32_t end = tile.offset + tile.rows < tpBegin + count
-                                     ? tile.offset + tile.rows : tpBegin + count;
-            if (begin < end) {
-                // Fetch a contiguous route segment once, instead of synchronizing every row.
-                Fence<HardEvent::S_MTE2>();
-                DataCopyPad(index, routes[prefix + begin - tpBegin],
-                            {1U, uint32_t((end - begin) * sizeof(uint16_t)), 0U, 0U, 0U},
-                            {false, 0U, 0U, 0U});
-                Fence<HardEvent::MTE2_S>();
+        if (GetBlockIdx() == 0) {
+            for (uint32_t e = 0; e < t_.recv.routeExpertNumPerMoe; ++e) counts.SetValue(e, 0);
+        }
+        uint32_t tileRow = 0;
+        for (uint32_t expert = tile.expert; expert <= tile.lastExpert; ++expert) {
+            const uint32_t offset = expert == tile.expert ? tile.offset : 0;
+            uint32_t total = 0;
+            for (uint32_t tp = 0; tp < t_.recv.tpSize; ++tp) total += Count(tp, expert);
+            const uint32_t rows = total - offset < tile.rows - tileRow ? total - offset : tile.rows - tileRow;
+            if (GetBlockIdx() == 0) counts.SetValue(expert, rows);
+            uint32_t tpBegin = 0;
+            for (uint32_t tp = 0; tp < t_.recv.tpSize; ++tp) {
+                const uint32_t count = Count(tp, expert);
+                const uint32_t prefix = Prefix(tp, expert);
+                const auto source = reinterpret_cast<GM_ADDR>(context_->localWindowsIn) + (source_ + tp) * sourceBytes_;
+                GlobalTensor<uint16_t> routes;
+                GlobalTensor<int8_t> tokens;
+                routes.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t *>(source + indices_));
+                tokens.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(source + payload_));
+                const uint32_t begin = offset > tpBegin ? offset : tpBegin;
+                const uint32_t end = offset + rows < tpBegin + count
+                                         ? offset + rows : tpBegin + count;
+                if (begin < end) {
+                    // Fetch a contiguous route segment once, instead of synchronizing every row.
+                    Fence<HardEvent::S_MTE2>();
+                    DataCopyPad(index, routes[prefix + begin - tpBegin],
+                                {1U, uint32_t((end - begin) * sizeof(uint16_t)), 0U, 0U, 0U},
+                                {false, 0U, 0U, 0U});
+                    Fence<HardEvent::MTE2_S>();
+                }
+                for (uint32_t r = (GetBlockIdx() + Cam::MEGA_COMM_AIVS - tileRow % Cam::MEGA_COMM_AIVS) % Cam::MEGA_COMM_AIVS;
+                     r < rows; r += Cam::MEGA_COMM_AIVS) {
+                    const auto row = offset + r;
+                    if (row < tpBegin || row >= tpBegin + count) continue;
+                    const uint32_t token = index.GetValue(row - begin);
+                    Fence<HardEvent::S_MTE2>();
+                    DataCopy(x, tokens[token * (t_.recv.hiddenSize + 32)], t_.recv.hiddenSize + 32);
+                    Fence<HardEvent::MTE2_MTE3>();
+                    DataCopy(dst[(tileRow + r) * t_.recv.hiddenSize], x, t_.recv.hiddenSize);
+                    DataCopyPad(dstScale[tileRow + r], scales[t_.recv.hiddenSize / 4], {1U, 4U, 0U, 0U, 0U});
+                    Fence<HardEvent::MTE3_MTE2>();
+                }
+                tpBegin += count;
             }
-            for (uint32_t r = GetBlockIdx(); r < tile.rows; r += Cam::MEGA_COMM_AIVS) {
-                const auto row = tile.offset + r;
-                if (row < tpBegin || row >= tpBegin + count) continue;
-                const uint32_t token = index.GetValue(row - begin);
-                Fence<HardEvent::S_MTE2>();
-                DataCopy(x, tokens[token * (t_.recv.hiddenSize + 32)], t_.recv.hiddenSize + 32);
-                Fence<HardEvent::MTE2_MTE3>();
-                DataCopy(dst[r * t_.recv.hiddenSize], x, t_.recv.hiddenSize);
-                DataCopyPad(dstScale[r], scales[t_.recv.hiddenSize / 4], {1U, 4U, 0U, 0U, 0U});
-                Fence<HardEvent::MTE3_MTE2>();
-            }
-            tpBegin += count;
+            tileRow += rows;
         }
         if (GetBlockIdx() == 0) {
-            for (uint32_t e = 0; e < t_.recv.routeExpertNumPerMoe; ++e)
-                counts.SetValue(e, e == tile.expert ? tile.rows : 0);
             GlobalTensor<int64_t> dstCounts;
             dstCounts.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(slot + w_.tileCounts));
             Fence<HardEvent::S_MTE3>();
@@ -182,22 +200,31 @@ public:
         auto local = buffer_.Get<bfloat16_t>();
         GlobalTensor<bfloat16_t> src;
         src.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(scratch_ + w_.SlotOffset(tile.sequence) + w_.y));
-        uint32_t tpBegin = 0;
-        for (uint32_t tp = 0; tp < t_.recv.tpSize; ++tp) {
-            const uint32_t count = Count(tp, tile.expert);
-            const uint32_t prefix = metadata_.Get<int64_t>().GetValue(5 + tp) + Prefix(tp, tile.expert);
-            GlobalTensor<bfloat16_t> dst;
-            dst.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(Peer(source_ + tp) + returnFlags_ +
-                                 Align32(t_.recv.moeRankNum * 4)));
-            for (uint32_t r = GetBlockIdx(); r < tile.rows; r += Cam::MEGA_COMM_AIVS) {
-                const auto row = tile.offset + r;
-                if (row < tpBegin || row >= tpBegin + count) continue;
-                DataCopy(local, src[r * t_.recv.hiddenSize], t_.recv.hiddenSize);
-                Fence<HardEvent::MTE2_MTE3>();
-                DataCopy(dst[(prefix + row - tpBegin) * t_.recv.hiddenSize], local, t_.recv.hiddenSize);
-                Fence<HardEvent::MTE3_MTE2>();
+        uint32_t tileRow = 0;
+        for (uint32_t expert = tile.expert; expert <= tile.lastExpert; ++expert) {
+            const uint32_t offset = expert == tile.expert ? tile.offset : 0;
+            uint32_t total = 0;
+            for (uint32_t tp = 0; tp < t_.recv.tpSize; ++tp) total += Count(tp, expert);
+            const uint32_t rows = total - offset < tile.rows - tileRow ? total - offset : tile.rows - tileRow;
+            uint32_t tpBegin = 0;
+            for (uint32_t tp = 0; tp < t_.recv.tpSize; ++tp) {
+                const uint32_t count = Count(tp, expert);
+                const uint32_t prefix = metadata_.Get<int64_t>().GetValue(5 + tp) + Prefix(tp, expert);
+                GlobalTensor<bfloat16_t> dst;
+                dst.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(Peer(source_ + tp) + returnFlags_ +
+                                     Align32(t_.recv.moeRankNum * 4)));
+                for (uint32_t r = (GetBlockIdx() + Cam::MEGA_COMM_AIVS - tileRow % Cam::MEGA_COMM_AIVS) % Cam::MEGA_COMM_AIVS;
+                     r < rows; r += Cam::MEGA_COMM_AIVS) {
+                    const auto row = offset + r;
+                    if (row < tpBegin || row >= tpBegin + count) continue;
+                    DataCopy(local, src[(tileRow + r) * t_.recv.hiddenSize], t_.recv.hiddenSize);
+                    Fence<HardEvent::MTE2_MTE3>();
+                    DataCopy(dst[(prefix + row - tpBegin) * t_.recv.hiddenSize], local, t_.recv.hiddenSize);
+                    Fence<HardEvent::MTE3_MTE2>();
+                }
+                tpBegin += count;
             }
-            tpBegin += count;
+            tileRow += rows;
         }
         Fence<HardEvent::MTE3_S>();
     }
@@ -385,7 +412,8 @@ __aicore__ inline void VectorPipeline(GM_ADDR scratch, const Cam::MegaWorkspace 
         // Refilled inputs do not imply that the old output has been sent.
         if (tile.sequence > Cam::MEGA_RING_SLOTS)
             flags.Wait(SENT, tile.sequence - Cam::MEGA_RING_SLOTS);
-        OutputTile(slot, w, t, b2, layer, tile.expert, 0, tile.rows, pipe);
+        OutputTile(slot, w, t, b2, layer, tile.expert, tile.offset, tile.rows,
+                   scratch + w.counts, pipe);
         flags.Arrive(OUTPUT, tile.sequence, id, vectors);
         tile = next;
         next = ahead;

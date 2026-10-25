@@ -17,10 +17,14 @@ __aicore__ inline void StoreControl(GM_ADDR base, uint32_t index, int64_t value)
 class PipelineFlags {
 public:
     __aicore__ explicit PipelineFlags(GM_ADDR base) : base_(base) {}
-    __aicore__ void Clear(uint32_t vectors) {
-        for (uint32_t i = GetBlockIdx(); i < Cam::MEGA_PIPELINE_STAGES * (Cam::MEGA_MAX_AIVS + 1);
-             i += vectors)
-            StoreControl(base_ + i * Cam::MEGA_ALIGNMENT, 0, 0);
+    __aicore__ void Clear(uint32_t vectors, uint32_t cubes) {
+        for (uint32_t stage = 0; stage < Cam::MEGA_PIPELINE_STAGES; ++stage) {
+            const uint32_t participants = stage == RECEIVED || stage == SENT
+                                              ? Cam::MEGA_COMM_AIVS
+                                              : (stage == G1 || stage == G2 ? cubes : vectors - Cam::MEGA_COMM_AIVS);
+            for (uint32_t lane = GetBlockIdx(); lane <= participants; lane += vectors)
+                StoreControl(Address(Stage(stage), lane), 0, 0);
+        }
     }
     __aicore__ void Wait(Stage stage, uint32_t sequence) const {
         WaitAt(Address(stage, 0), sequence);
@@ -164,7 +168,8 @@ public:
                 const uint32_t begin = offset > tpBegin ? offset : tpBegin;
                 const uint32_t end = offset + rows < tpBegin + count
                                          ? offset + rows : tpBegin + count;
-                if (begin < end) {
+                const uint32_t first = begin < end ? Cam::MegaFirstRow(begin - offset, tileRow, GetBlockIdx()) : rows;
+                if (begin < end && offset + first < end) {
                     // Fetch a contiguous route segment once, instead of synchronizing every row.
                     Fence<HardEvent::S_MTE2>();
                     DataCopyPad(index, routes[prefix + begin - tpBegin],
@@ -172,10 +177,8 @@ public:
                                 {false, 0U, 0U, 0U});
                     Fence<HardEvent::MTE2_S>();
                 }
-                for (uint32_t r = (GetBlockIdx() + Cam::MEGA_COMM_AIVS - tileRow % Cam::MEGA_COMM_AIVS) % Cam::MEGA_COMM_AIVS;
-                     r < rows; r += Cam::MEGA_COMM_AIVS) {
+                for (uint32_t r = first; begin < end && offset + r < end; r += Cam::MEGA_COMM_AIVS) {
                     const auto row = offset + r;
-                    if (row < tpBegin || row >= tpBegin + count) continue;
                     const uint32_t token = index.GetValue(row - begin);
                     Fence<HardEvent::S_MTE2>();
                     DataCopy(x, tokens[token * (t_.recv.hiddenSize + 32)], t_.recv.hiddenSize + 32);
@@ -331,14 +334,9 @@ __aicore__ inline void ComputeStage(GM_ADDR scratch, const Cam::MegaWorkspace &w
     auto a = Addresses(nullptr, nullptr, slot + w.tileCounts, weight, scale, bias, nullptr, nullptr,
                        slot + (first ? w.compute : w.compute2), p, layer);
     auto split = tile.Split();
-    TCubeTiling cube = *reinterpret_cast<const TCubeTiling *>(first ? t.cube1 : t.cube2);
-    mm.SetSubBlockIdx(0);
-    mm.Init(&cube);
     GMMA8W4MidProcess<MM> mid(mm);
     mid.Init(a, &p);
     mid.Process(split, 0);
-    mm.End();
-    pipe.Reset();
     flags.Arrive(first ? G1 : G2, tile.sequence, GetBlockIdx(), t.g1.coreNum);
 }
 
@@ -349,6 +347,11 @@ __aicore__ inline void ComputePipeline(GM_ADDR scratch, const Cam::MegaWorkspace
     MM::MT mm;
     auto tile = cursor.Next();
     if (!tile.rows) return;
+    // One sequential context covers both GMMs; SetOrgShape/SetSingleShape select each job.
+    const bool largerK = t.g1.K / t.g1.quantGroupNum >= t.g2.K / t.g2.quantGroupNum;
+    TCubeTiling cube = *reinterpret_cast<const TCubeTiling *>(largerK ? t.cube1 : t.cube2);
+    mm.SetSubBlockIdx(0);
+    mm.Init(&cube);
     ComputeStage(scratch, w, t, flags, tile, w13, s13, b13, layer, true, mm, pipe);
     while (tile.rows) {
         auto next = cursor.Next();
@@ -356,26 +359,27 @@ __aicore__ inline void ComputePipeline(GM_ADDR scratch, const Cam::MegaWorkspace
         ComputeStage(scratch, w, t, flags, tile, w2, s2, b2, layer, false, mm, pipe);
         tile = next;
     }
+    mm.End();
+    pipe.Reset();
 }
 
 __aicore__ inline void PrepareTile(GM_ADDR scratch, const Cam::MegaWorkspace &w,
                                    const AfdMegaMoeFFNTilingData &t, const PipelineFlags &flags,
                                    const Tile &tile, GM_ADDR weight, GM_ADDR scale, GM_ADDR bias,
-                                   int64_t layer, bool first, TPipe &pipe) {
+                                   int64_t layer, TPipe &pipe) {
     const auto slot = scratch + w.SlotOffset(tile.sequence);
-    if (first) flags.Wait(RECEIVED, tile.sequence);
-    InvalidateScalarInputs(slot + w.tileCounts);
-    const auto &p = first ? t.g1 : t.g2;
-    auto a = Addresses(slot + (first ? w.tileX : w.z), slot + (first ? w.tileScales : w.zScales),
+    flags.Wait(RECEIVED, tile.sequence);
+    const auto &p = t.g1;
+    auto a = Addresses(slot + w.tileX, slot + w.tileScales,
                        slot + w.tileCounts, weight, scale, bias, nullptr, nullptr,
-                       slot + (first ? w.compute : w.compute2), p, layer);
+                       slot + w.compute, p, layer);
     auto split = tile.Split();
     GMMA8W4PreProcess pre;
     pre.Init(a, &p);
     pre.SetVectorGroup(GetBlockIdx() - Cam::MEGA_COMM_AIVS, t.recv.aivNum - Cam::MEGA_COMM_AIVS);
     pre.Process(split, 0, &pipe);
     pipe.Reset();
-    flags.Arrive(first ? PRE1 : PRE2, tile.sequence, GetBlockIdx() - Cam::MEGA_COMM_AIVS,
+    flags.Arrive(PRE1, tile.sequence, GetBlockIdx() - Cam::MEGA_COMM_AIVS,
                  t.recv.aivNum - Cam::MEGA_COMM_AIVS);
 }
 
@@ -387,27 +391,28 @@ __aicore__ inline void VectorPipeline(GM_ADDR scratch, const Cam::MegaWorkspace 
     if (!tile.rows) return;
     const uint32_t id = GetBlockIdx() - Cam::MEGA_COMM_AIVS;
     const uint32_t vectors = t.recv.aivNum - Cam::MEGA_COMM_AIVS;
-    PrepareTile(scratch, w, t, flags, tile, w13, s13, b13, layer, true, pipe);
+    PrepareTile(scratch, w, t, flags, tile, w13, s13, b13, layer, pipe);
     auto next = cursor.Next();
-    if (next.rows) PrepareTile(scratch, w, t, flags, next, w13, s13, b13, layer, true, pipe);
+    if (next.rows) PrepareTile(scratch, w, t, flags, next, w13, s13, b13, layer, pipe);
     while (tile.rows) {
         const auto slot = scratch + w.SlotOffset(tile.sequence);
         flags.Wait(G1, tile.sequence);
         InvalidateScalarInputs(slot + w.tileCounts);
         auto a = Addresses(slot + w.tileX, slot + w.tileScales, slot + w.tileCounts, w13, s13,
-                           b13, slot + w.z, slot + w.zScales, slot + w.compute, t.g1, layer);
+                           b13, slot + w.compute2, slot + w.zScales, slot + w.compute, t.g1, layer);
         auto split = tile.Split();
         GMMA8W4PostProcess act;
         act.Init(a, &t.g1, &t.quant);
         act.SetVectorGroup(id, vectors);
+        act.SetMsdOutput(slot + w.compute2);
         act.Process(split, 0, &pipe);
         Fence<HardEvent::MTE3_S>();
         pipe.Reset();
-        // PRE2 reads the same row partition as postprocess, with MTE3 drained before reuse.
-        PrepareTile(scratch, w, t, flags, tile, w2, s2, b2, layer, false, pipe);
+        // The rounded INT8 activation has already been packed into G2's MSD input.
+        flags.Arrive(PRE2, tile.sequence, id, vectors);
         // Feed G1 two tiles ahead while Cube consumes this tile's prepared G2 input.
         auto ahead = cursor.Next();
-        if (ahead.rows) PrepareTile(scratch, w, t, flags, ahead, w13, s13, b13, layer, true, pipe);
+        if (ahead.rows) PrepareTile(scratch, w, t, flags, ahead, w13, s13, b13, layer, pipe);
         flags.Wait(G2, tile.sequence);
         // Refilled inputs do not imply that the old output has been sent.
         if (tile.sequence > Cam::MEGA_RING_SLOTS)

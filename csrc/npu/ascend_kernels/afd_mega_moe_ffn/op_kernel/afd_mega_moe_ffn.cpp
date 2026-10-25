@@ -90,6 +90,10 @@ __aicore__ inline void OutputTile(GM_ADDR scratch, const Cam::MegaWorkspace &w,
                                   int64_t layer, uint32_t expert, uint32_t offset, uint32_t rows,
                                   GM_ADDR counts, TPipe &pipe) {
     if ASCEND_IS_AIV {
+        const uint32_t id = GetBlockIdx() - Cam::MEGA_COMM_AIVS;
+        const uint32_t vectors = t.recv.aivNum - Cam::MEGA_COMM_AIVS;
+        const Cam::MegaRowRange range(rows, id, vectors);
+        if (range.begin == range.end) return;
         pipe.Reset();
         const uint32_t h = t.recv.hiddenSize;
         TBuf<TPosition::VECCALC> buf;
@@ -111,8 +115,7 @@ __aicore__ inline void OutputTile(GM_ADDR scratch, const Cam::MegaWorkspace &w,
         output.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(scratch + w.y));
         uint32_t groupEnd = ReadImmutableCount(counts, expert) - offset;
         uint32_t loadedExpert = UINT32_MAX;
-        for (uint32_t r = GetBlockIdx() - Cam::MEGA_COMM_AIVS; r < rows;
-             r += t.recv.aivNum - Cam::MEGA_COMM_AIVS) {
+        for (uint32_t r = range.begin; r < range.end; ++r) {
             while (r >= groupEnd) groupEnd += ReadImmutableCount(counts, ++expert);
             if (loadedExpert != expert) {
                 DataCopy(bias, biases[expert * h], h);
@@ -157,6 +160,32 @@ __aicore__ inline void OutputTile(GM_ADDR scratch, const Cam::MegaWorkspace &w,
 
 #include "afd_mega_moe_pipeline.h"
 
+namespace AfdMegaMoe {
+__aicore__ inline int64_t ValidateTransaction(GM_ADDR scratch, GM_ADDR layerMap,
+                                             const Cam::MegaWorkspace &w,
+                                             const AfdMegaMoeFFNTilingData &t, TPipe &pipe) {
+    const auto layerId = ReadControl(scratch + w.batch, 2);
+    const auto layer = layerId >= 0 && layerId < t.layerMapSize ? ReadControl(layerMap, layerId) : -1;
+    if (layer < 0 || layer >= t.g1.layerNum) return -1;
+    TBuf<TPosition::VECCALC> buffer;
+    pipe.InitBuffer(buffer, Cam::MegaAlign(t.recv.routeExpertNumPerMoe * sizeof(int64_t)));
+    auto counts = buffer.Get<int64_t>();
+    GlobalTensor<int64_t> gm;
+    gm.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(scratch + w.counts));
+    Fence<HardEvent::MTE3_MTE2>();
+    DataCopyPad(counts, gm, {1U, uint32_t(t.recv.routeExpertNumPerMoe * sizeof(int64_t)), 0U, 0U, 0U},
+                {false, 0U, 0U, 0U});
+    Fence<HardEvent::MTE2_S>();
+    uint64_t total = 0;
+    for (uint32_t e = 0; e < t.recv.routeExpertNumPerMoe; ++e) {
+        const auto count = counts.GetValue(e);
+        if (count < 0 || uint64_t(count) > t.capacity - total) return -2;
+        total += count;
+    }
+    return layer;
+}
+} // namespace AfdMegaMoe
+
 extern "C" __global__ __aicore__ void
 afd_mega_moe_ffn(GM_ADDR anchor, GM_ADDR commArgs, GM_ADDR layerMap, GM_ADDR scratch, GM_ADDR w13,
                  GM_ADDR w2, GM_ADDR s13, GM_ADDR s2, GM_ADDR b13, GM_ADDR b2, GM_ADDR completion,
@@ -171,7 +200,7 @@ afd_mega_moe_ffn(GM_ADDR anchor, GM_ADDR commArgs, GM_ADDR layerMap, GM_ADDR scr
         TPipe pipe;
         PipelineFlags flags(scratch + w.flags);
         if ASCEND_IS_AIV {
-            flags.Clear(t.recv.aivNum);
+            flags.Clear(t.recv.aivNum, t.g1.coreNum);
             if (GetBlockIdx() == 0) {
                 StoreControl(scratch + w.batch, 2, -1);
                 Cam::AfdAsyncDispatchRecvTilingData dr{};
@@ -181,27 +210,22 @@ afd_mega_moe_ffn(GM_ADDR anchor, GM_ADDR commArgs, GM_ADDR layerMap, GM_ADDR scr
                         scratch + w.counts, workspace, &pipe, &dr, commArgs, 1);
                 rx.Process(false);
                 pipe.Reset();
+                const auto result = ValidateTransaction(scratch, layerMap, w, t, pipe);
+                StoreControl(scratch + w.validation, 0, result);
+                pipe.Reset();
             }
         }
         SyncAll<false>();
-        const auto layerId = ReadControl(scratch + w.batch, 2);
-        const auto layer =
-            layerId >= 0 && layerId < t.layerMapSize ? ReadControl(layerMap, layerId) : -1;
-        if (layer < 0 || layer >= t.g1.layerNum) {
-            WriteCompletion(completion, -1, pipe);
+        const auto layer = ReadControl(scratch + w.validation, 0);
+        if (layer < 0) {
+            WriteCompletion(completion, layer, pipe);
             return;
         }
-        // Counts are immutable after DR; refresh each 64B scalar cache line once.
-        uint64_t total = 0;
-        for (uint32_t e = 0; e < t.recv.routeExpertNumPerMoe; ++e) {
-            const auto count = e % (64 / sizeof(int64_t)) == 0
-                                   ? ReadControl(scratch + w.counts, e)
-                                   : ReadImmutableCount(scratch + w.counts, e);
-            if (count < 0 || uint64_t(count) > t.capacity - total) {
-                WriteCompletion(completion, -2, pipe);
-                return;
-            }
-            total += count;
+        // The owner validated counts; refresh each consumer's immutable scalar view.
+        GlobalTensor<int64_t> counts;
+        counts.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(scratch + w.counts));
+        for (uint32_t e = 0; e < t.recv.routeExpertNumPerMoe; e += 64 / sizeof(int64_t)) {
+            DataCacheCleanAndInvalid<int64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(counts[e]);
         }
         TileCursor cursor(scratch + w.counts, t.recv.routeExpertNumPerMoe);
         if ASCEND_IS_AIC {

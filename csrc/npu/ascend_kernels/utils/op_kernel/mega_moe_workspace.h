@@ -40,20 +40,33 @@ constexpr uint32_t MEGA_COMM_AIVS = 16;
 constexpr uint32_t MEGA_MAX_AIVS = 48;
 constexpr uint32_t MEGA_PIPELINE_STAGES = 7;
 
+struct MegaRowRange {
+    uint32_t begin, end;
+    AFD_MEGA_HOST_DEVICE MegaRowRange(uint32_t rows, uint32_t id, uint32_t cores) {
+        const uint32_t base = rows / cores, extra = rows % cores;
+        begin = id * base + (id < extra ? id : extra);
+        end = begin + base + (id < extra);
+    }
+};
+
+AFD_MEGA_HOST_DEVICE inline uint32_t MegaFirstRow(uint32_t begin, uint32_t tileRow, uint32_t id) {
+    return begin + (id + MEGA_COMM_AIVS - (tileRow + begin) % MEGA_COMM_AIVS) % MEGA_COMM_AIVS;
+}
+
 // One cache line per writer; no payload-sized allocation depends on chunk capacity.
 struct MegaWorkspace {
-    uint64_t batch, counts, flags, tileX, tileScales, tileCounts, z, zScales;
+    uint64_t batch, counts, flags, validation, tileX, tileScales, tileCounts, zScales;
     uint64_t compute, compute2, y, slotBytes, bytes;
     AFD_MEGA_HOST_DEVICE MegaWorkspace(uint64_t /*capacity*/, uint64_t h, uint64_t i, uint64_t e,
                                        uint64_t tp) {
         batch = 0;
         counts = MegaAlign((5 + tp + e * tp) * sizeof(int64_t));
         flags = counts + MegaAlign(e * sizeof(int64_t));
-        tileX = flags + MEGA_PIPELINE_STAGES * (MEGA_MAX_AIVS + 1) * MEGA_ALIGNMENT;
+        validation = flags + MEGA_PIPELINE_STAGES * (MEGA_MAX_AIVS + 1) * MEGA_ALIGNMENT;
+        tileX = validation + MEGA_ALIGNMENT;
         tileScales = tileX + MegaAlign(MEGA_TILE_ROWS * h);
         tileCounts = tileScales + MegaAlign(MEGA_TILE_ROWS * sizeof(float));
-        z = tileCounts + MegaAlign(e * sizeof(int64_t));
-        zScales = z + MegaAlign(MEGA_TILE_ROWS * i);
+        zScales = tileCounts + MegaAlign(e * sizeof(int64_t));
         compute = zScales + MegaAlign(MEGA_TILE_ROWS * sizeof(float));
         compute2 = compute + MegaAlign(2 * MEGA_TILE_ROWS * h + 8 * MEGA_TILE_ROWS * 2 * i);
         y = compute2 + MegaAlign(2 * MEGA_TILE_ROWS * i + 8 * MEGA_TILE_ROWS * h);

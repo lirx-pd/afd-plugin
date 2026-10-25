@@ -34,7 +34,8 @@ int main() {
                             assert(offset % Cam::MEGA_ALIGNMENT == 0);
                         for (uint32_t sequence = 1; sequence < 100; ++sequence) {
                             assert(w.SlotOffset(sequence) + w.y + Cam::MEGA_TILE_ROWS * h * 2 <= w.bytes);
-                            assert(w.SlotOffset(sequence) != w.SlotOffset(sequence + 1));
+                            for (uint32_t live = 1; live < Cam::MEGA_RING_SLOTS; ++live)
+                                assert(w.SlotOffset(sequence) != w.SlotOffset(sequence + live));
                             assert(w.SlotOffset(sequence) == w.SlotOffset(sequence + Cam::MEGA_RING_SLOTS));
                         }
                         const Cam::MegaWorkspace larger(capacity * 2, h, i, e, tp);

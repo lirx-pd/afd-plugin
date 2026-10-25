@@ -1,0 +1,1248 @@
+{
+  "target": "A3/CANN9.1; 24 AIC +16 transport AIV +32 compute AIV",
+  "kernel_sha256": "fbc03d657ca009c65b1f6073ec4f4d7ffc31b970413c07775e1ebe143130cb2e",
+  "sources_and_artifacts_match_after_accuracy": true,
+  "performance_metric": "mean of repetitions; each repetition is max FFN-rank mean final-five native task durations; synthetic diagonal weights; no kernel-internal probes",
+  "performance": [
+    {
+      "case": "hot1024",
+      "control_us": [
+        2174.732,
+        2195.036,
+        2149.16,
+        2166.648
+      ],
+      "candidate_us": [
+        984.936,
+        934.04
+      ],
+      "control_mean_us": 2171.3940000000002,
+      "candidate_mean_us": 959.488,
+      "reduction_percent": 55.81234911766359
+    },
+    {
+      "case": "balanced1024",
+      "control_us": [
+        2596.8164,
+        2436.0664,
+        2379.0640000000003,
+        2452.0944
+      ],
+      "candidate_us": [
+        1282.3444,
+        1289.424
+      ],
+      "control_mean_us": 2466.0103,
+      "candidate_mean_us": 1285.8842,
+      "reduction_percent": 47.85568413886998
+    },
+    {
+      "case": "tp4hot129",
+      "control_us": [
+        1278.676,
+        1291.968,
+        1288.848,
+        1242.636
+      ],
+      "candidate_us": [
+        656.316,
+        665.196
+      ],
+      "control_mean_us": 1275.532,
+      "candidate_mean_us": 660.7560000000001,
+      "reduction_percent": 48.19761479915831
+    },
+    {
+      "case": "decode7",
+      "control_us": [
+        818.9,
+        834.532,
+        816.324,
+        792.188
+      ],
+      "candidate_us": [
+        565.736,
+        514.412
+      ],
+      "control_mean_us": 815.486,
+      "candidate_mean_us": 540.0740000000001,
+      "reduction_percent": 33.7727441059687
+    }
+  ],
+  "phase_metric": "union of software stage spans through completion fences, not DMA/MAC active cycles",
+  "phases": [
+    {
+      "case": "lookahead-phase-balanced1024-events",
+      "rank": 1,
+      "tiles": 32,
+      "samples": 5,
+      "communication_region_overlap_percent": 93.06977851869489,
+      "communication_cube_overlap_us": 149.86000000000035,
+      "cube_vector_overlap_us": 405.1199999999999,
+      "communication_region_us": 168.33999999999986,
+      "kernel_core_envelope_us": 1249.24,
+      "communication_cube_region_overlap_percent": 88.94724277870617,
+      "mean_core_stage_wait_us": {
+        "comm": 1097.1375,
+        "vector": 926.876875,
+        "cube": 511.1691666666666
+      }
+    },
+    {
+      "case": "lookahead-phase-balanced1024-events",
+      "rank": 2,
+      "tiles": 32,
+      "samples": 5,
+      "communication_region_overlap_percent": 93.51860152398027,
+      "communication_cube_overlap_us": 200.28000000000083,
+      "cube_vector_overlap_us": 411.3399999999994,
+      "communication_region_us": 223.10000000000088,
+      "kernel_core_envelope_us": 1229.76,
+      "communication_cube_region_overlap_percent": 89.58183776022966,
+      "mean_core_stage_wait_us": {
+        "comm": 1021.39,
+        "vector": 889.15125,
+        "cube": 445.62833333333333
+      }
+    },
+    {
+      "case": "lookahead-phase-hot1024-events",
+      "rank": 1,
+      "tiles": 16,
+      "samples": 5,
+      "communication_region_overlap_percent": 89.65545131025561,
+      "communication_cube_overlap_us": 213.54000000000036,
+      "cube_vector_overlap_us": 393.2399999999998,
+      "communication_region_us": 252.34000000000006,
+      "kernel_core_envelope_us": 1044.22,
+      "communication_cube_region_overlap_percent": 84.25266903914593,
+      "mean_core_stage_wait_us": {
+        "comm": 804.57375,
+        "vector": 696.974375,
+        "cube": 266.76166666666666
+      }
+    },
+    {
+      "case": "lookahead-phase-tp4hot129-events",
+      "rank": 4,
+      "tiles": 10,
+      "samples": 5,
+      "communication_region_overlap_percent": 84.88871144824826,
+      "communication_cube_overlap_us": 135.46,
+      "cube_vector_overlap_us": 182.22000000000003,
+      "communication_region_us": 199.22000000000008,
+      "kernel_core_envelope_us": 661.9,
+      "communication_cube_region_overlap_percent": 68.0806467711348,
+      "mean_core_stage_wait_us": {
+        "comm": 451.62874999999997,
+        "vector": 444.6775,
+        "cube": 214.04083333333332
+      }
+    },
+    {
+      "case": "new-phase-v2-balanced1024-events",
+      "rank": 1,
+      "tiles": 32,
+      "samples": 5,
+      "communication_region_overlap_percent": 91.7987240172876,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 137.51999999999956,
+      "communication_region_us": 194.3600000000008,
+      "kernel_core_envelope_us": 1724.26,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 1551.9975,
+        "vector": 1401.95625,
+        "cube": 929.4291666666667
+      }
+    },
+    {
+      "case": "new-phase-v2-balanced1024-events",
+      "rank": 2,
+      "tiles": 32,
+      "samples": 5,
+      "communication_region_overlap_percent": 92.81948280190801,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 173.60000000000002,
+      "communication_region_us": 239.03999999999985,
+      "kernel_core_envelope_us": 1922.54,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 1706.15125,
+        "vector": 1605.060625,
+        "cube": 983.7125
+      }
+    },
+    {
+      "case": "new-phase-v2-hot1024-events",
+      "rank": 1,
+      "tiles": 16,
+      "samples": 5,
+      "communication_region_overlap_percent": 88.70647949877076,
+      "communication_cube_overlap_us": 12.920000000000087,
+      "cube_vector_overlap_us": 215.27999999999986,
+      "communication_region_us": 253.09999999999982,
+      "kernel_core_envelope_us": 1467.08,
+      "communication_cube_region_overlap_percent": 5.123324609406022,
+      "mean_core_stage_wait_us": {
+        "comm": 1223.73625,
+        "vector": 1090.973125,
+        "cube": 706.52
+      }
+    },
+    {
+      "case": "new-phase-v2-tp4hot129-events",
+      "rank": 4,
+      "tiles": 10,
+      "samples": 5,
+      "communication_region_overlap_percent": 85.75912122400935,
+      "communication_cube_overlap_us": 76.96000000000024,
+      "cube_vector_overlap_us": 111.94000000000025,
+      "communication_region_us": 203.66000000000005,
+      "kernel_core_envelope_us": 922.94,
+      "communication_cube_region_overlap_percent": 37.78847098104695,
+      "mean_core_stage_wait_us": {
+        "comm": 711.5925,
+        "vector": 696.6725,
+        "cube": 440.88666666666666
+      }
+    },
+    {
+      "case": "old-phase-v2-balanced1024-events",
+      "rank": 1,
+      "tiles": 32,
+      "samples": 5,
+      "communication_region_overlap_percent": 1.4324950185794094,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 161.0199999999999,
+      "communication_region_us": 371.3800000000002,
+      "kernel_core_envelope_us": 2417.04,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 2020.915,
+        "vector": 2076.1705,
+        "cube": 1614.0875
+      }
+    },
+    {
+      "case": "old-phase-v2-balanced1024-events",
+      "rank": 2,
+      "tiles": 32,
+      "samples": 5,
+      "communication_region_overlap_percent": 1.709105105626162,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 126.09999999999982,
+      "communication_region_us": 459.54000000000065,
+      "kernel_core_envelope_us": 2455.04,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 1968.6575,
+        "vector": 2089.6095,
+        "cube": 1662.4783333333332
+      }
+    },
+    {
+      "case": "old-phase-v2-hot1024-events",
+      "rank": 1,
+      "tiles": 16,
+      "samples": 5,
+      "communication_region_overlap_percent": 3.7496256364180947,
+      "communication_cube_overlap_us": 6.840000000000003,
+      "cube_vector_overlap_us": 197.4800000000003,
+      "communication_region_us": 667.3800000000002,
+      "kernel_core_envelope_us": 2182.1,
+      "communication_cube_region_overlap_percent": 1.0242587601078186,
+      "mean_core_stage_wait_us": {
+        "comm": 1539.535,
+        "vector": 1840.0905,
+        "cube": 1443.8583333333333
+      }
+    },
+    {
+      "case": "old-phase-v2-tp4hot129-events",
+      "rank": 4,
+      "tiles": 10,
+      "samples": 5,
+      "communication_region_overlap_percent": 7.414344449520336,
+      "communication_cube_overlap_us": 16.719999999999885,
+      "cube_vector_overlap_us": 115.59999999999995,
+      "communication_region_us": 436.80000000000007,
+      "kernel_core_envelope_us": 1296.86,
+      "communication_cube_region_overlap_percent": 3.8278388278388014,
+      "mean_core_stage_wait_us": {
+        "comm": 849.605,
+        "vector": 1082.105,
+        "cube": 859.7108333333333
+      }
+    },
+    {
+      "case": "checkpoint-short-replay1075",
+      "rank": 10,
+      "tiles": 1,
+      "samples": 1,
+      "communication_region_overlap_percent": 0.0,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 0,
+      "communication_region_us": 4.599999999999909,
+      "kernel_core_envelope_us": 2875.58,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 79.04125,
+        "vector": 60.97125,
+        "cube": 45.4575
+      }
+    },
+    {
+      "case": "checkpoint-dense-replay3397",
+      "rank": 10,
+      "tiles": 12,
+      "samples": 1,
+      "communication_region_overlap_percent": 77.90951638065532,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 49.88000000000011,
+      "communication_region_us": 64.10000000000014,
+      "kernel_core_envelope_us": 1197.92,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 538.9575,
+        "vector": 498.260625,
+        "cube": 336.5175
+      }
+    },
+    {
+      "case": "checkpoint-dense-replay645",
+      "rank": 10,
+      "tiles": 14,
+      "samples": 1,
+      "communication_region_overlap_percent": 80.8628479813443,
+      "communication_cube_overlap_us": 17.46000000000049,
+      "cube_vector_overlap_us": 70.24000000000024,
+      "communication_region_us": 137.2199999999998,
+      "kernel_core_envelope_us": 3175.84,
+      "communication_cube_region_overlap_percent": 12.72409269785783,
+      "mean_core_stage_wait_us": {
+        "comm": 668.35,
+        "vector": 632.2075,
+        "cube": 414.5516666666667
+      }
+    },
+    {
+      "case": "checkpoint-dense-replay3397",
+      "rank": 11,
+      "tiles": 11,
+      "samples": 1,
+      "communication_region_overlap_percent": 74.63617463617457,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 47.34000000000003,
+      "communication_region_us": 57.720000000000255,
+      "kernel_core_envelope_us": 1236.94,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 511.625,
+        "vector": 471.87875,
+        "cube": 326.70666666666665
+      }
+    },
+    {
+      "case": "checkpoint-dense-replay645",
+      "rank": 11,
+      "tiles": 11,
+      "samples": 1,
+      "communication_region_overlap_percent": 72.25527312060488,
+      "communication_cube_overlap_us": 0.919999999999618,
+      "cube_vector_overlap_us": 49.42000000000007,
+      "communication_region_us": 73.96000000000095,
+      "kernel_core_envelope_us": 2904.9,
+      "communication_cube_region_overlap_percent": 1.2439156300697758,
+      "mean_core_stage_wait_us": {
+        "comm": 528.47375,
+        "vector": 489.72,
+        "cube": 336.5491666666667
+      }
+    },
+    {
+      "case": "checkpoint-short-replay989",
+      "rank": 11,
+      "tiles": 4,
+      "samples": 1,
+      "communication_region_overlap_percent": 49.48364888123872,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 21.660000000000764,
+      "communication_region_us": 23.239999999999327,
+      "kernel_core_envelope_us": 2785.42,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 193.51,
+        "vector": 169.849375,
+        "cube": 121.21166666666667
+      }
+    },
+    {
+      "case": "checkpoint-dense-replay3397",
+      "rank": 12,
+      "tiles": 12,
+      "samples": 1,
+      "communication_region_overlap_percent": 77.35216662676596,
+      "communication_cube_overlap_us": 0.5,
+      "cube_vector_overlap_us": 67.28000000000009,
+      "communication_region_us": 83.54000000000008,
+      "kernel_core_envelope_us": 1295.18,
+      "communication_cube_region_overlap_percent": 0.5985156811108445,
+      "mean_core_stage_wait_us": {
+        "comm": 543.72,
+        "vector": 503.331875,
+        "cube": 339.95
+      }
+    },
+    {
+      "case": "checkpoint-dense-replay645",
+      "rank": 12,
+      "tiles": 7,
+      "samples": 1,
+      "communication_region_overlap_percent": 73.75271149674681,
+      "communication_cube_overlap_us": 0.5199999999999818,
+      "cube_vector_overlap_us": 40.51999999999998,
+      "communication_region_us": 46.099999999999,
+      "kernel_core_envelope_us": 2832.06,
+      "communication_cube_region_overlap_percent": 1.1279826464208094,
+      "mean_core_stage_wait_us": {
+        "comm": 317.5025,
+        "vector": 285.37,
+        "cube": 195.26666666666668
+      }
+    },
+    {
+      "case": "checkpoint-short-replay989",
+      "rank": 12,
+      "tiles": 3,
+      "samples": 1,
+      "communication_region_overlap_percent": 45.23809523809723,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 17.5,
+      "communication_region_us": 18.480000000000473,
+      "kernel_core_envelope_us": 2932.06,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 140.915,
+        "vector": 121.1125,
+        "cube": 83.85583333333334
+      }
+    },
+    {
+      "case": "checkpoint-dense-replay3397",
+      "rank": 13,
+      "tiles": 13,
+      "samples": 1,
+      "communication_region_overlap_percent": 81.0684931506847,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 56.24000000000001,
+      "communication_region_us": 73.0,
+      "kernel_core_envelope_us": 1487.3,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 611.00625,
+        "vector": 569.53,
+        "cube": 383.3258333333333
+      }
+    },
+    {
+      "case": "checkpoint-dense-replay645",
+      "rank": 13,
+      "tiles": 14,
+      "samples": 1,
+      "communication_region_overlap_percent": 87.63318112633179,
+      "communication_cube_overlap_us": 39.460000000000036,
+      "cube_vector_overlap_us": 86.44000000000142,
+      "communication_region_us": 157.67999999999984,
+      "kernel_core_envelope_us": 3306.2,
+      "communication_cube_region_overlap_percent": 25.02536783358706,
+      "mean_core_stage_wait_us": {
+        "comm": 748.24875,
+        "vector": 723.263125,
+        "cube": 466.9433333333333
+      }
+    },
+    {
+      "case": "checkpoint-short-replay989",
+      "rank": 13,
+      "tiles": 3,
+      "samples": 1,
+      "communication_region_overlap_percent": 46.24999999999846,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 14.059999999999945,
+      "communication_region_us": 14.399999999999181,
+      "kernel_core_envelope_us": 2844.26,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 139.625,
+        "vector": 120.725625,
+        "cube": 84.35083333333333
+      }
+    },
+    {
+      "case": "checkpoint-short-replay1032",
+      "rank": 14,
+      "tiles": 1,
+      "samples": 1,
+      "communication_region_overlap_percent": 0.0,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 0,
+      "communication_region_us": 6.039999999999964,
+      "kernel_core_envelope_us": 2794.96,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 74.89875,
+        "vector": 61.263125,
+        "cube": 49.245
+      }
+    },
+    {
+      "case": "checkpoint-dense-replay3397",
+      "rank": 14,
+      "tiles": 14,
+      "samples": 1,
+      "communication_region_overlap_percent": 83.31143232588707,
+      "communication_cube_overlap_us": 9.960000000000264,
+      "cube_vector_overlap_us": 71.90000000000055,
+      "communication_region_us": 91.3200000000005,
+      "kernel_core_envelope_us": 1528.66,
+      "communication_cube_region_overlap_percent": 10.90670170827881,
+      "mean_core_stage_wait_us": {
+        "comm": 641.57625,
+        "vector": 596.115625,
+        "cube": 379.83916666666664
+      }
+    },
+    {
+      "case": "checkpoint-dense-replay645",
+      "rank": 14,
+      "tiles": 8,
+      "samples": 1,
+      "communication_region_overlap_percent": 64.90825688073359,
+      "communication_cube_overlap_us": 1.3400000000001455,
+      "cube_vector_overlap_us": 39.220000000000255,
+      "communication_region_us": 61.04000000000087,
+      "kernel_core_envelope_us": 3137.34,
+      "communication_cube_region_overlap_percent": 2.1952817824379527,
+      "mean_core_stage_wait_us": {
+        "comm": 371.52875,
+        "vector": 334.349375,
+        "cube": 227.395
+      }
+    },
+    {
+      "case": "checkpoint-short-replay1032",
+      "rank": 15,
+      "tiles": 1,
+      "samples": 1,
+      "communication_region_overlap_percent": 0.0,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 0,
+      "communication_region_us": 6.880000000000109,
+      "kernel_core_envelope_us": 2789.02,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 78.64125,
+        "vector": 65.503125,
+        "cube": 50.18083333333333
+      }
+    },
+    {
+      "case": "checkpoint-dense-replay3397",
+      "rank": 15,
+      "tiles": 17,
+      "samples": 1,
+      "communication_region_overlap_percent": 73.8072609770008,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 75.22000000000025,
+      "communication_region_us": 105.2199999999998,
+      "kernel_core_envelope_us": 1954.04,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 816.955,
+        "vector": 761.559375,
+        "cube": 529.1925
+      }
+    },
+    {
+      "case": "checkpoint-dense-replay645",
+      "rank": 15,
+      "tiles": 10,
+      "samples": 1,
+      "communication_region_overlap_percent": 64.24731182795915,
+      "communication_cube_overlap_us": 1.8800000000001091,
+      "cube_vector_overlap_us": 44.099999999999,
+      "communication_region_us": 66.95999999999913,
+      "kernel_core_envelope_us": 3169.18,
+      "communication_cube_region_overlap_percent": 2.8076463560336524,
+      "mean_core_stage_wait_us": {
+        "comm": 476.08625,
+        "vector": 434.770625,
+        "cube": 301.6666666666667
+      }
+    },
+    {
+      "case": "checkpoint-dense-replay3397",
+      "rank": 8,
+      "tiles": 13,
+      "samples": 1,
+      "communication_region_overlap_percent": 75.49950049950026,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 68.90000000000043,
+      "communication_region_us": 80.08000000000015,
+      "kernel_core_envelope_us": 1339.78,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 614.2075,
+        "vector": 571.29875,
+        "cube": 392.445
+      }
+    },
+    {
+      "case": "checkpoint-dense-replay645",
+      "rank": 8,
+      "tiles": 14,
+      "samples": 1,
+      "communication_region_overlap_percent": 71.71618451915603,
+      "communication_cube_overlap_us": 5.299999999999727,
+      "cube_vector_overlap_us": 71.86000000000104,
+      "communication_region_us": 102.32000000000016,
+      "kernel_core_envelope_us": 2950.56,
+      "communication_cube_region_overlap_percent": 5.179827990617395,
+      "mean_core_stage_wait_us": {
+        "comm": 675.965,
+        "vector": 631.3100000000001,
+        "cube": 433.1458333333333
+      }
+    },
+    {
+      "case": "checkpoint-short-replay989",
+      "rank": 8,
+      "tiles": 2,
+      "samples": 1,
+      "communication_region_overlap_percent": 32.33376792698619,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 10.279999999999745,
+      "communication_region_us": 15.33999999999969,
+      "kernel_core_envelope_us": 2787.3,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 112.6725,
+        "vector": 93.99187500000001,
+        "cube": 69.57916666666667
+      }
+    },
+    {
+      "case": "checkpoint-short-replay1032",
+      "rank": 9,
+      "tiles": 1,
+      "samples": 1,
+      "communication_region_overlap_percent": 0.0,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 0,
+      "communication_region_us": 5.7400000000002365,
+      "kernel_core_envelope_us": 2771.64,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 85.175,
+        "vector": 69.6375,
+        "cube": 53.96083333333333
+      }
+    },
+    {
+      "case": "checkpoint-dense-replay3397",
+      "rank": 9,
+      "tiles": 11,
+      "samples": 1,
+      "communication_region_overlap_percent": 74.55640050697163,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 57.91999999999996,
+      "communication_region_us": 63.120000000000346,
+      "kernel_core_envelope_us": 1406.68,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 546.0875,
+        "vector": 505.0025,
+        "cube": 349.935
+      }
+    },
+    {
+      "case": "checkpoint-dense-replay645",
+      "rank": 9,
+      "tiles": 10,
+      "samples": 1,
+      "communication_region_overlap_percent": 82.08279430789149,
+      "communication_cube_overlap_us": 18.11999999999989,
+      "cube_vector_overlap_us": 61.80000000000064,
+      "communication_region_us": 92.76000000000022,
+      "kernel_core_envelope_us": 2720.8,
+      "communication_cube_region_overlap_percent": 19.534282018111092,
+      "mean_core_stage_wait_us": {
+        "comm": 523.01875,
+        "vector": 501.359375,
+        "cube": 339.1433333333333
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-dense-replay3397",
+      "rank": 10,
+      "tiles": 11,
+      "samples": 1,
+      "communication_region_overlap_percent": 82.09447088978392,
+      "communication_cube_overlap_us": 39.89999999999995,
+      "cube_vector_overlap_us": 109.05999999999983,
+      "communication_region_us": 54.62000000000002,
+      "kernel_core_envelope_us": 431.12,
+      "communication_cube_region_overlap_percent": 73.05016477480764,
+      "mean_core_stage_wait_us": {
+        "comm": 359.06374999999997,
+        "vector": 310.54875,
+        "cube": 184.68583333333333
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-dense-replay645",
+      "rank": 10,
+      "tiles": 13,
+      "samples": 1,
+      "communication_region_overlap_percent": 81.05226359028157,
+      "communication_cube_overlap_us": 80.96000000000049,
+      "cube_vector_overlap_us": 155.0599999999995,
+      "communication_region_us": 114.42000000000007,
+      "kernel_core_envelope_us": 3158.26,
+      "communication_cube_region_overlap_percent": 70.75686068869118,
+      "mean_core_stage_wait_us": {
+        "comm": 447.61875,
+        "vector": 399.195,
+        "cube": 236.91083333333333
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-short-replay989",
+      "rank": 10,
+      "tiles": 1,
+      "samples": 1,
+      "communication_region_overlap_percent": 0.0,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 0,
+      "communication_region_us": 6.380000000000109,
+      "kernel_core_envelope_us": 2728.68,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 83.32375,
+        "vector": 67.624375,
+        "cube": 52.36666666666667
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-dense-replay3397",
+      "rank": 11,
+      "tiles": 8,
+      "samples": 1,
+      "communication_region_overlap_percent": 78.10843864655519,
+      "communication_cube_overlap_us": 32.51999999999995,
+      "cube_vector_overlap_us": 85.40000000000009,
+      "communication_region_us": 49.05999999999993,
+      "kernel_core_envelope_us": 370.38,
+      "communication_cube_region_overlap_percent": 66.28618018752547,
+      "mean_core_stage_wait_us": {
+        "comm": 300.4525,
+        "vector": 267.533125,
+        "cube": 158.305
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-dense-replay645",
+      "rank": 11,
+      "tiles": 10,
+      "samples": 1,
+      "communication_region_overlap_percent": 79.13818722139574,
+      "communication_cube_overlap_us": 47.07999999999811,
+      "cube_vector_overlap_us": 113.95999999999913,
+      "communication_region_us": 67.29999999999882,
+      "kernel_core_envelope_us": 2875.9,
+      "communication_cube_region_overlap_percent": 69.95542347696721,
+      "mean_core_stage_wait_us": {
+        "comm": 374.07625,
+        "vector": 329.3375,
+        "cube": 183.0075
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-short-replay989",
+      "rank": 11,
+      "tiles": 4,
+      "samples": 1,
+      "communication_region_overlap_percent": 59.01360544217738,
+      "communication_cube_overlap_us": 7.400000000000091,
+      "cube_vector_overlap_us": 38.660000000000764,
+      "communication_region_us": 23.519999999999982,
+      "kernel_core_envelope_us": 2722.66,
+      "communication_cube_region_overlap_percent": 31.462585034014015,
+      "mean_core_stage_wait_us": {
+        "comm": 175.69375,
+        "vector": 148.890625,
+        "cube": 92.1
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-dense-replay3397",
+      "rank": 12,
+      "tiles": 13,
+      "samples": 1,
+      "communication_region_overlap_percent": 79.31195881113973,
+      "communication_cube_overlap_us": 60.639999999999986,
+      "cube_vector_overlap_us": 152.01999999999992,
+      "communication_region_us": 85.46000000000002,
+      "kernel_core_envelope_us": 520.26,
+      "communication_cube_region_overlap_percent": 70.95717294640764,
+      "mean_core_stage_wait_us": {
+        "comm": 418.51875,
+        "vector": 375.92125,
+        "cube": 230.80083333333332
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-dense-replay645",
+      "rank": 12,
+      "tiles": 6,
+      "samples": 1,
+      "communication_region_overlap_percent": 61.461187214610746,
+      "communication_cube_overlap_us": 16.83999999999969,
+      "cube_vector_overlap_us": 63.719999999999345,
+      "communication_region_us": 43.80000000000018,
+      "kernel_core_envelope_us": 2906.38,
+      "communication_cube_region_overlap_percent": 38.44748858447402,
+      "mean_core_stage_wait_us": {
+        "comm": 235.93375,
+        "vector": 203.27,
+        "cube": 140.49666666666667
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-short-replay989",
+      "rank": 12,
+      "tiles": 3,
+      "samples": 1,
+      "communication_region_overlap_percent": 36.281588447654066,
+      "communication_cube_overlap_us": 2.2800000000002,
+      "cube_vector_overlap_us": 26.860000000000127,
+      "communication_region_us": 22.160000000000764,
+      "kernel_core_envelope_us": 2873.84,
+      "communication_cube_region_overlap_percent": 10.288808664260475,
+      "mean_core_stage_wait_us": {
+        "comm": 135.08375,
+        "vector": 112.7475,
+        "cube": 79.57166666666667
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-dense-replay3397",
+      "rank": 13,
+      "tiles": 14,
+      "samples": 1,
+      "communication_region_overlap_percent": 86.09073621298563,
+      "communication_cube_overlap_us": 57.42000000000006,
+      "cube_vector_overlap_us": 148.2399999999999,
+      "communication_region_us": 73.6200000000001,
+      "kernel_core_envelope_us": 547.9,
+      "communication_cube_region_overlap_percent": 77.99511002444984,
+      "mean_core_stage_wait_us": {
+        "comm": 464.4625,
+        "vector": 418.91625,
+        "cube": 244.1275
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-dense-replay645",
+      "rank": 13,
+      "tiles": 13,
+      "samples": 1,
+      "communication_region_overlap_percent": 85.19944979367274,
+      "communication_cube_overlap_us": 96.2800000000002,
+      "cube_vector_overlap_us": 161.23999999999978,
+      "communication_region_us": 145.400000000001,
+      "kernel_core_envelope_us": 3152.96,
+      "communication_cube_region_overlap_percent": 66.21733149931192,
+      "mean_core_stage_wait_us": {
+        "comm": 488.21625,
+        "vector": 457.6025,
+        "cube": 254.2575
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-short-replay989",
+      "rank": 13,
+      "tiles": 2,
+      "samples": 1,
+      "communication_region_overlap_percent": 24.469820554649736,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 10.140000000000327,
+      "communication_region_us": 12.259999999999764,
+      "kernel_core_envelope_us": 2757.8,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 110.75,
+        "vector": 97.57875,
+        "cube": 73.10583333333334
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-short-replay1032",
+      "rank": 14,
+      "tiles": 1,
+      "samples": 1,
+      "communication_region_overlap_percent": 0.0,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 0,
+      "communication_region_us": 6.7199999999998,
+      "kernel_core_envelope_us": 2743.2,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 82.76375,
+        "vector": 67.05625,
+        "cube": 50.88
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-dense-replay3397",
+      "rank": 14,
+      "tiles": 14,
+      "samples": 1,
+      "communication_region_overlap_percent": 87.43696557772415,
+      "communication_cube_overlap_us": 58.71999999999993,
+      "cube_vector_overlap_us": 155.56,
+      "communication_region_us": 91.2199999999998,
+      "kernel_core_envelope_us": 583.22,
+      "communication_cube_region_overlap_percent": 64.37184827888628,
+      "mean_core_stage_wait_us": {
+        "comm": 485.01,
+        "vector": 437.736875,
+        "cube": 245.74916666666667
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-dense-replay645",
+      "rank": 14,
+      "tiles": 9,
+      "samples": 1,
+      "communication_region_overlap_percent": 72.3892660847077,
+      "communication_cube_overlap_us": 33.719999999999345,
+      "cube_vector_overlap_us": 98.79999999999973,
+      "communication_region_us": 61.85999999999876,
+      "kernel_core_envelope_us": 3136.76,
+      "communication_cube_region_overlap_percent": 54.51018428709993,
+      "mean_core_stage_wait_us": {
+        "comm": 325.45,
+        "vector": 286.808125,
+        "cube": 177.12333333333333
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-short-replay1204",
+      "rank": 15,
+      "tiles": 1,
+      "samples": 1,
+      "communication_region_overlap_percent": 0.0,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 0,
+      "communication_region_us": 7.639999999999873,
+      "kernel_core_envelope_us": 2739.58,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 86.1525,
+        "vector": 72.79625,
+        "cube": 55.02583333333333
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-dense-replay3397",
+      "rank": 15,
+      "tiles": 17,
+      "samples": 1,
+      "communication_region_overlap_percent": 89.81481481481472,
+      "communication_cube_overlap_us": 81.78000000000026,
+      "cube_vector_overlap_us": 204.3600000000002,
+      "communication_region_us": 101.52000000000027,
+      "kernel_core_envelope_us": 811.72,
+      "communication_cube_region_overlap_percent": 80.5555555555556,
+      "mean_core_stage_wait_us": {
+        "comm": 568.65625,
+        "vector": 510.71875,
+        "cube": 288.98833333333334
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-dense-replay645",
+      "rank": 15,
+      "tiles": 12,
+      "samples": 1,
+      "communication_region_overlap_percent": 85.68149210903859,
+      "communication_cube_overlap_us": 53.29999999999973,
+      "cube_vector_overlap_us": 138.5600000000004,
+      "communication_region_us": 69.69999999999936,
+      "kernel_core_envelope_us": 3114.82,
+      "communication_cube_region_overlap_percent": 76.47058823529443,
+      "mean_core_stage_wait_us": {
+        "comm": 410.75875,
+        "vector": 369.96625,
+        "cube": 213.22916666666666
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-dense-replay3397",
+      "rank": 8,
+      "tiles": 13,
+      "samples": 1,
+      "communication_region_overlap_percent": 85.83679833679838,
+      "communication_cube_overlap_us": 59.34,
+      "cube_vector_overlap_us": 139.7000000000001,
+      "communication_region_us": 76.95999999999998,
+      "kernel_core_envelope_us": 534.78,
+      "communication_cube_region_overlap_percent": 77.10498960498963,
+      "mean_core_stage_wait_us": {
+        "comm": 441.85875,
+        "vector": 404.29625,
+        "cube": 228.79083333333332
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-dense-replay645",
+      "rank": 8,
+      "tiles": 15,
+      "samples": 1,
+      "communication_region_overlap_percent": 87.38229755178897,
+      "communication_cube_overlap_us": 81.25999999999976,
+      "cube_vector_overlap_us": 168.17999999999938,
+      "communication_region_us": 106.19999999999982,
+      "kernel_core_envelope_us": 3013.5,
+      "communication_cube_region_overlap_percent": 76.51600753295659,
+      "mean_core_stage_wait_us": {
+        "comm": 507.40999999999997,
+        "vector": 466.44374999999997,
+        "cube": 259.47083333333336
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-short-replay989",
+      "rank": 8,
+      "tiles": 2,
+      "samples": 1,
+      "communication_region_overlap_percent": 32.42236024844897,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 12.900000000000091,
+      "communication_region_us": 16.09999999999991,
+      "kernel_core_envelope_us": 2727.38,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 109.22875,
+        "vector": 93.224375,
+        "cube": 69.94083333333333
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-short-replay1032",
+      "rank": 9,
+      "tiles": 1,
+      "samples": 1,
+      "communication_region_overlap_percent": 0.0,
+      "communication_cube_overlap_us": 0,
+      "cube_vector_overlap_us": 0,
+      "communication_region_us": 7.080000000000382,
+      "kernel_core_envelope_us": 2711.42,
+      "communication_cube_region_overlap_percent": 0.0,
+      "mean_core_stage_wait_us": {
+        "comm": 74.81875,
+        "vector": 60.37375,
+        "cube": 51.285833333333336
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-dense-replay3397",
+      "rank": 9,
+      "tiles": 9,
+      "samples": 1,
+      "communication_region_overlap_percent": 81.78082191780823,
+      "communication_cube_overlap_us": 30.900000000000034,
+      "cube_vector_overlap_us": 90.47999999999988,
+      "communication_region_us": 43.80000000000004,
+      "kernel_core_envelope_us": 407.1,
+      "communication_cube_region_overlap_percent": 70.54794520547946,
+      "mean_core_stage_wait_us": {
+        "comm": 314.825,
+        "vector": 273.1675,
+        "cube": 163.8425
+      }
+    },
+    {
+      "case": "checkpoint-lookahead-dense-replay645",
+      "rank": 9,
+      "tiles": 10,
+      "samples": 1,
+      "communication_region_overlap_percent": 82.4695121951223,
+      "communication_cube_overlap_us": 60.57999999999993,
+      "cube_vector_overlap_us": 112.64000000000033,
+      "communication_region_us": 91.83999999999878,
+      "kernel_core_envelope_us": 2828.46,
+      "communication_cube_region_overlap_percent": 65.96254355400777,
+      "mean_core_stage_wait_us": {
+        "comm": 358.18875,
+        "vector": 326.590625,
+        "cube": 193.35416666666666
+      }
+    }
+  ],
+  "ownership_and_dependency_checks": 74864,
+  "accuracy": {
+    "samples": 300,
+    "strict_match": 0.9566666666666667,
+    "flexible_extract": 0.9566666666666667,
+    "comparison_to_frozen_run": {
+      "same_documents_and_prompts": true,
+      "changed_text_count": 171,
+      "improved": [
+        37,
+        157,
+        182,
+        201,
+        205
+      ],
+      "worsened": [
+        98
+      ]
+    },
+    "graph": [
+      {
+        "pid": 52785,
+        "rank": 11,
+        "effective_mode": "full",
+        "mega_moe": true,
+        "capture_count": 2,
+        "replay_count": 176128,
+        "event": "_complete_graph",
+        "graph_pending": false
+      },
+      {
+        "pid": 52783,
+        "rank": 14,
+        "effective_mode": "full",
+        "mega_moe": true,
+        "capture_count": 2,
+        "replay_count": 176128,
+        "event": "_complete_graph",
+        "graph_pending": false
+      },
+      {
+        "pid": 52782,
+        "rank": 10,
+        "effective_mode": "full",
+        "mega_moe": true,
+        "capture_count": 2,
+        "replay_count": 176128,
+        "event": "_complete_graph",
+        "graph_pending": false
+      },
+      {
+        "pid": 52787,
+        "rank": 9,
+        "effective_mode": "full",
+        "mega_moe": true,
+        "capture_count": 2,
+        "replay_count": 176128,
+        "event": "_complete_graph",
+        "graph_pending": false
+      },
+      {
+        "pid": 52789,
+        "rank": 8,
+        "effective_mode": "full",
+        "mega_moe": true,
+        "capture_count": 2,
+        "replay_count": 176128,
+        "event": "_complete_graph",
+        "graph_pending": false
+      },
+      {
+        "pid": 52784,
+        "rank": 15,
+        "effective_mode": "full",
+        "mega_moe": true,
+        "capture_count": 2,
+        "replay_count": 176128,
+        "event": "_complete_graph",
+        "graph_pending": false
+      },
+      {
+        "pid": 52786,
+        "rank": 13,
+        "effective_mode": "full",
+        "mega_moe": true,
+        "capture_count": 2,
+        "replay_count": 176128,
+        "event": "_complete_graph",
+        "graph_pending": false
+      },
+      {
+        "pid": 52788,
+        "rank": 12,
+        "effective_mode": "full",
+        "mega_moe": true,
+        "capture_count": 2,
+        "replay_count": 176128,
+        "event": "_complete_graph",
+        "graph_pending": false
+      }
+    ]
+  },
+  "checkpoint_snapshots": 24,
+  "native_tests": "25 pytest plus four eager/FULL tests in lookahead-validation; row-varying TP4 oracle in lookahead-row.log; every timing and phase case checks oracle and guard",
+  "invalid_attempts": {
+    "checkpoint-lookahead-initial/preflight.log": "Preflight rejected reused ports after the preceding accuracy run. No diagnostic kernel launched; retry uses API19480/19481 and AFD8455.",
+    "screen.log": "All sixteen native runs passed. Original CSV parser rejected attention-only CSVs; finish.py verified rank PASS and parsed MegaMoE rows only.",
+    "old-phase-hot1024.log": "Diagnostic binding retained three-slot layout in two-slot probe due copy2/CMake timestamps. No kernel launched; superseded by v2 clones with unchanged validated runtime libraries.",
+    "row-reference.log": "Diagnostic launcher overwrote CANN PYTHONPATH; initialization failed before MegaMoE. V2 preserves CANN environment and constructs row inputs on CPU."
+  },
+  "local_validation": {
+    "pytest": "596 passed, 184 skipped, 33 subtests passed",
+    "precommit": "changed files passed",
+    "workspace_bounds": "C++17 -Wall -Wextra -Werror; three concurrent slots distinct",
+    "artifact_verification": {
+      "archive_sha256": "cb48cfeb58b980f10c24b5ef8bc5888084abb4b3285077c2a612c88dcaea5d44",
+      "manifest_files": 1529,
+      "operator_traces": 132,
+      "dependency_flows": 4074,
+      "clock_matches": 60,
+      "trace_envelope_to_native_task_ratio_range": [
+        0.9752443188508183,
+        0.9930712420499511
+      ],
+      "ownership_checks": 74864,
+      "status": "PASS"
+    }
+  },
+  "branch": "feat/async-cam-megamoe-phase2",
+  "base_commit": "7b3a1d5",
+  "changed_sources_sha256": {
+    "csrc/npu/ascend_kernels/afd_mega_moe_ffn/op_kernel/afd_mega_moe_pipeline.h": "e68307c45a2c99d6b706b8cc6b3da42a5da94d16d19a033259b1d114174d1a88",
+    "csrc/npu/ascend_kernels/utils/op_kernel/mega_moe_workspace.h": "bd2e37d221b841cb7429ee897eb0e92457e66795c1b1b91b7801c88f8ff1b072",
+    "csrc/npu/ascend_kernels/afd_mega_moe_ffn/op_host/afd_mega_moe_ffn.cpp": "b3d2a66199e2b4a5abb8ba1d71b29605339648f94cd73ee4c3b0f32659327b44"
+  },
+  "hardware_pipe_ratios": {
+    "hot1024": {
+      "original_mac_ratio": 0.0754,
+      "final_mac_ratio": 0.1708
+    },
+    "balanced1024": {
+      "original_mac_ratio": 0.03685,
+      "final_mac_ratio": 0.0707
+    },
+    "tp4hot129": {
+      "original_mac_ratio": 0.06595000000000001,
+      "final_mac_ratio": 0.1275
+    },
+    "decode7": {
+      "original_mac_ratio": 0.018449999999999998,
+      "final_mac_ratio": 0.0281
+    }
+  }
+}

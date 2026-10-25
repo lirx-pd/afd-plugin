@@ -101,7 +101,8 @@ public:
         pipe_.Reset();
         const uint32_t metaBytes = (5 + r.tpSize + r.routeExpertNumPerMoe * r.tpSize) * 8;
         pipe_.InitBuffer(metadata_, Align32(metaBytes));
-        pipe_.InitBuffer(buffer_, Align32(r.hiddenSize * 2 + 64 + r.routeExpertNumPerMoe * 8));
+        pipe_.InitBuffer(buffer_, Align32(r.hiddenSize * 2 + 32 + Cam::MEGA_ROUTE_INDEX_BYTES +
+                                           r.routeExpertNumPerMoe * 8));
         auto meta = metadata_.Get<int64_t>();
         GlobalTensor<int64_t> batch;
         batch.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(scratch_ + w_.batch));
@@ -126,9 +127,9 @@ public:
     __aicore__ void Receive(const Tile &tile) {
         auto x = buffer_.Get<int8_t>();
         auto scales = buffer_.Get<float>();
-        auto index = buffer_.GetWithOffset<uint16_t>(16, t_.recv.hiddenSize * 2 + 32);
+        auto index = buffer_.GetWithOffset<uint16_t>(Cam::MEGA_TILE_ROWS, t_.recv.hiddenSize * 2 + 32);
         auto counts = buffer_.GetWithOffset<int64_t>(t_.recv.routeExpertNumPerMoe,
-                                                     t_.recv.hiddenSize * 2 + 64);
+                                                     t_.recv.hiddenSize * 2 + 32 + Cam::MEGA_ROUTE_INDEX_BYTES);
         GlobalTensor<int8_t> dst;
         GlobalTensor<float> dstScale;
         const auto slot = scratch_ + w_.SlotOffset(tile.sequence);
@@ -143,12 +144,21 @@ public:
             GlobalTensor<int8_t> tokens;
             routes.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t *>(source + indices_));
             tokens.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(source + payload_));
+            const uint32_t begin = tile.offset > tpBegin ? tile.offset : tpBegin;
+            const uint32_t end = tile.offset + tile.rows < tpBegin + count
+                                     ? tile.offset + tile.rows : tpBegin + count;
+            if (begin < end) {
+                // Fetch a contiguous route segment once, instead of synchronizing every row.
+                Fence<HardEvent::S_MTE2>();
+                DataCopyPad(index, routes[prefix + begin - tpBegin],
+                            {1U, uint32_t((end - begin) * sizeof(uint16_t)), 0U, 0U, 0U},
+                            {false, 0U, 0U, 0U});
+                Fence<HardEvent::MTE2_S>();
+            }
             for (uint32_t r = GetBlockIdx(); r < tile.rows; r += Cam::MEGA_COMM_AIVS) {
                 const auto row = tile.offset + r;
                 if (row < tpBegin || row >= tpBegin + count) continue;
-                DataCopyPad(index, routes[prefix + row - tpBegin], {1U, 2U, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
-                Fence<HardEvent::MTE2_S>();
-                const uint32_t token = index.GetValue(0);
+                const uint32_t token = index.GetValue(row - begin);
                 Fence<HardEvent::S_MTE2>();
                 DataCopy(x, tokens[token * (t_.recv.hiddenSize + 32)], t_.recv.hiddenSize + 32);
                 Fence<HardEvent::MTE2_MTE3>();
@@ -260,16 +270,18 @@ __aicore__ inline void TransportPipeline(GM_ADDR scratch, const Cam::MegaWorkspa
         next = receive.Next();
     }
     for (auto tile = send.Next(); tile.rows; tile = send.Next()) {
-        flags.Wait(OUTPUT, tile.sequence);
-        transport.Send(tile);
-        flags.Arrive(SENT, tile.sequence, GetBlockIdx(), Cam::MEGA_COMM_AIVS);
-        // All senders have read the slot before any receiver overwrites it.
-        flags.Wait(SENT, tile.sequence);
         if (next.rows) {
+            // G2 releases the slot's inputs; its output occupies a separate region.
+            flags.Wait(G2, tile.sequence);
             transport.Receive(next);
             flags.Arrive(RECEIVED, next.sequence, GetBlockIdx(), Cam::MEGA_COMM_AIVS);
             next = receive.Next();
         }
+        flags.Wait(OUTPUT, tile.sequence);
+        transport.Send(tile);
+        flags.Arrive(SENT, tile.sequence, GetBlockIdx(), Cam::MEGA_COMM_AIVS);
+        // Drain all senders before advancing or releasing the source window.
+        flags.Wait(SENT, tile.sequence);
     }
     transport.Finish();
     pipe.Reset();
@@ -349,10 +361,9 @@ __aicore__ inline void VectorPipeline(GM_ADDR scratch, const Cam::MegaWorkspace 
     const uint32_t id = GetBlockIdx() - Cam::MEGA_COMM_AIVS;
     const uint32_t vectors = t.recv.aivNum - Cam::MEGA_COMM_AIVS;
     PrepareTile(scratch, w, t, flags, tile, w13, s13, b13, layer, true, pipe);
+    auto next = cursor.Next();
+    if (next.rows) PrepareTile(scratch, w, t, flags, next, w13, s13, b13, layer, true, pipe);
     while (tile.rows) {
-        auto next = cursor.Next();
-        // Feed G1(next) before postprocessing this tile so Cube and Vector can overlap.
-        if (next.rows) PrepareTile(scratch, w, t, flags, next, w13, s13, b13, layer, true, pipe);
         const auto slot = scratch + w.SlotOffset(tile.sequence);
         flags.Wait(G1, tile.sequence);
         InvalidateScalarInputs(slot + w.tileCounts);
@@ -367,10 +378,17 @@ __aicore__ inline void VectorPipeline(GM_ADDR scratch, const Cam::MegaWorkspace 
         pipe.Reset();
         // PRE2 reads the same row partition as postprocess, with MTE3 drained before reuse.
         PrepareTile(scratch, w, t, flags, tile, w2, s2, b2, layer, false, pipe);
+        // Feed G1 two tiles ahead while Cube consumes this tile's prepared G2 input.
+        auto ahead = cursor.Next();
+        if (ahead.rows) PrepareTile(scratch, w, t, flags, ahead, w13, s13, b13, layer, true, pipe);
         flags.Wait(G2, tile.sequence);
+        // Refilled inputs do not imply that the old output has been sent.
+        if (tile.sequence > Cam::MEGA_RING_SLOTS)
+            flags.Wait(SENT, tile.sequence - Cam::MEGA_RING_SLOTS);
         OutputTile(slot, w, t, b2, layer, tile.expert, 0, tile.rows, pipe);
         flags.Arrive(OUTPUT, tile.sequence, id, vectors);
         tile = next;
+        next = ahead;
     }
 }
 } // namespace AfdMegaMoe

@@ -4,10 +4,11 @@ Status: experimental A3 implementation. A runnable Phase 2 version is available 
 `feat/async-cam-megamoe-phase2`, based on Phase 1 commit `22334e2`.
 The current functional upgrade fixes small-batch DS/CR at 8 AIVs, batches four
 MegaMoE transactions per FULL graph, and caches immutable chunk metadata.
-It remains disabled by default. The subsequent
-[A3 profiling and optimization](ASYNC_CAM_MEGA_MOE_PERFORMANCE.md) records
-measured control-path improvements against the fresh CANN 9.1 kernel;
-the historical Phase 2 measurements below describe the pre-upgrade implementation.
+It remains disabled by default. The
+[A3 tile pipeline redesign](ASYNC_CAM_MEGA_MOE_TILE_PIPELINE.md) uses three slots,
+separate input/output release conditions, two-tile PRE1 lookahead and
+16 communication / 32 compute AIVs.
+The historical Phase 2 measurements below describe the pre-upgrade implementation.
 
 ## Scope and entry points
 
@@ -16,19 +17,20 @@ the historical Phase 2 measurements below describe the pre-upgrade implementatio
 ```text
 AIV 0: select compact-v2 source/expert chunk and publish metadata
 all cores: validate layer/counts, initialize per-invocation sequence flags
-8 communication AIVs: receive two tiles, then send completed tile / refill freed slot
+16 communication AIVs: receive three tiles, then refill after G2 / send completed output
 remaining AIVs: INT8->INT4 prep, SwiGLU/full-row quantization, BF16 output
 all AICs: G1(0), G1(1), G2(0), G1(2), G2(1), ..., G2(last)
 communication AIV 0: release consumed input and publish final compact-v2 completion
 all cores: drain, write completion status
 ```
 
-Two 128-row slots hold independent G1 and G2 intermediates. A tile belongs to
+Three 128-row slots hold independent G1 and G2 intermediates. A tile belongs to
 one expert and may span multiple Attention TP sources. The producer publishes
 its sequence only after every participating core has drained its writes.
-The communication group reuses a slot only after all senders have consumed it.
+Input staging is refilled after G2; BF16 output is reused only after all senders
+have consumed it. These regions have independent release conditions.
 G1/G2 share the AIC pool; no second mixed kernel competes for AIV resources.
-On a full A3 die the allocation is 24 AIC, 8 communication AIV and 40 compute AIV.
+On a full A3 die the allocation is 24 AIC, 16 communication AIV and 32 compute AIV.
 This is the fixed split used for the current functional qualification.
 
 Attention still runs its existing dispatch, shared experts and weighted combine.
@@ -51,7 +53,7 @@ scheduling with one block per AIC, including its two sibling AIVs.
   The connector owns the HCCL domain and windows. Graph replay reuses the scratch
   on one stream. Shutdown retains the existing receiver-exit and device-completion
   requirements before releasing either owner.
-- Scratch contains metadata, per-core completion flags and two 128-row slots.
+- Scratch contains metadata, per-core completion flags and three 128-row slots.
   Its size is independent of receive capacity. G1 and G2 have separate scratch
   in each slot. There is no duplicate full-model weight conversion or new copy.
 - Input and output preserve compact-v2 expert/TP route order, expert-chunk

@@ -33,8 +33,10 @@ AFD_MEGA_HOST_DEVICE constexpr uint64_t MegaAlign(uint64_t n) {
     return (n + MEGA_ALIGNMENT - 1) / MEGA_ALIGNMENT * MEGA_ALIGNMENT;
 }
 
-constexpr uint32_t MEGA_RING_SLOTS = 2;
-constexpr uint32_t MEGA_COMM_AIVS = 8;
+// One slot computes, one feeds G1 lookahead, and one receives the next tile.
+constexpr uint32_t MEGA_RING_SLOTS = 3;
+constexpr uint32_t MEGA_ROUTE_INDEX_BYTES = MEGA_TILE_ROWS * sizeof(uint16_t);
+constexpr uint32_t MEGA_COMM_AIVS = 16;
 constexpr uint32_t MEGA_MAX_AIVS = 48;
 constexpr uint32_t MEGA_PIPELINE_STAGES = 7;
 

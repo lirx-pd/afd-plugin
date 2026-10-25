@@ -83,7 +83,7 @@ ge::graphStatus Tiling(gert::TilingContext *ctx) {
                              Align32(c[Cam::MEGA_LOCAL_EXPERTS] * 8);
     const uint64_t csFixed = meta + Align32(c[Cam::MEGA_LOCAL_EXPERTS] * c[Cam::MEGA_ATTN_TP] * 4) +
                              Align32(c[Cam::MEGA_ATTN_TP] * 4);
-    const uint64_t transport = meta + Align32(c[Cam::MEGA_HIDDEN_SIZE] * 2 + 64 +
+    const uint64_t transport = meta + Align32(c[Cam::MEGA_HIDDEN_SIZE] * 2 + 32 + Cam::MEGA_ROUTE_INDEX_BYTES +
                                                c[Cam::MEGA_LOCAL_EXPERTS] * 8);
     const uint64_t routeIndices = Align32(
         ((c[Cam::MEGA_MAX_SEQ_LEN] / c[Cam::MEGA_ATTN_TP] * c[Cam::MEGA_TOP_K] +

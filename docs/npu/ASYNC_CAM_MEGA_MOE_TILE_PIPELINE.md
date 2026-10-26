@@ -1,7 +1,7 @@
 # A3 tile pipeline redesign
 
 This report records the historical 128-row implementation and its frozen
-measurements. The current [expert-packing update](ASYNC_CAM_MEGA_MOE_EXPERT_PACKING.md)
+measurements. The current [expert packing](ASYNC_CAM_MEGA_MOE.md#scope-and-entry-points)
 retains this schedule with larger tiles spanning multiple experts.
 
 ## Dependency and buffer ownership

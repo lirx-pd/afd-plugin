@@ -331,8 +331,7 @@ __aicore__ inline void GMMA8W4MidProcess<mmType>::MMCompute(uint32_t groupIdx, M
                 weightScaleGM[groupIdx * gmmSwigluQuantV2BaseParams->N * gmmSwigluQuantV2BaseParams->quantGroupNum +
                               loopK * gmmSwigluQuantV2BaseParams->N + tailN]);
         }
-        mm.Iterate();
-        mm.GetTensorC(mmOutGM[mnConfig.workspaceOffset], loopK == 0 ? 0 : 1);
+        mm.IterateAll(mmOutGM[mnConfig.workspaceOffset], loopK == 0 ? 0 : 1);
     }
 }
 } // namespace GroupedMatmulDequantSwigluQuant

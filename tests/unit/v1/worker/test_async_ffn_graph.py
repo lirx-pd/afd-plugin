@@ -89,6 +89,7 @@ def session_harness(monkeypatch):
     connector.capture_operation = lambda fn: capturing[-1].operations.append(fn)
     session = AsyncNPUFFNModelRunner.__new__(AsyncNPUFFNModelRunner)
     session.model = torch.nn.Linear(1, 1)
+    session.layer_ids = (2, 5)
     session._layered_executor = execute
     session.connector = connector
     session._graph = None
@@ -123,16 +124,13 @@ def mega_session(session_harness):
     return session, pending, consumed, completion, calls
 
 
-@pytest.mark.parametrize("batch_size", [1, 2, 4])
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 43])
 @pytest.mark.parametrize("count", [1, 5, 43])
 def test_mega_graph_consumes_exactly_the_available_transactions(
-    mega_session, monkeypatch, batch_size, count
+    mega_session, batch_size, count
 ):
     session, pending, consumed, completion, _ = mega_session
-    monkeypatch.setattr(
-        "afd_plugin.v1.worker.npu.async_ffn_model_runner.MEGA_GRAPH_BATCH_SIZE",
-        batch_size,
-    )
+    session.layer_ids = tuple(range(batch_size))
     session._capture_graph()
     for _ in range(2):
         # Transactions are chunks selected at replay time, including repeated layers.

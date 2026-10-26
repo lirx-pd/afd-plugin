@@ -2,13 +2,13 @@
 
 Status: experimental A3 implementation. A runnable Phase 2 version is available on
 `feat/async-cam-megamoe-phase2`, based on Phase 1 commit `22334e2`.
-The current functional upgrade fixes small-batch DS/CR at 8 AIVs, batches four
-MegaMoE transactions per FULL graph, and caches immutable chunk metadata.
+The current functional upgrade fixes small-batch DS/CR at 8 AIVs, batches one
+bounded submission per FULL graph, and caches immutable chunk metadata.
 It remains disabled by default. The
 [A3 tile pipeline redesign](ASYNC_CAM_MEGA_MOE_TILE_PIPELINE.md) uses three slots,
 separate input/output release conditions, two-tile PRE1 lookahead and
 16 communication / 32 compute AIVs. The current
-[expert-packed tiles](ASYNC_CAM_MEGA_MOE_EXPERT_PACKING.md) combine adjacent
+[expert-packed tiles](#scope-and-entry-points) combine adjacent
 experts in 512-row tiles to reduce repeated initialization and synchronization.
 The historical Phase 2 measurements below describe the pre-upgrade implementation.
 
@@ -17,8 +17,8 @@ The historical Phase 2 measurements below describe the pre-upgrade implementatio
 `afd_mega_moe_ffn` is a single bounded `MIX_AIC_1_2` kernel:
 
 ```text
-AIV 0: select compact-v2 source/expert chunk and publish metadata
-all cores: validate layer/counts, initialize per-invocation sequence flags
+AIV 0: select compact-v2 chunk, validate layer/counts and publish metadata
+all AIVs: initialize per-invocation sequence flags
 16 communication AIVs: receive three tiles, then refill after G2 / send completed output
 remaining AIVs: INT8->INT4 prep, SwiGLU/full-row quantization, BF16 output
 all AICs: G1(0), G1(1), G2(0), G1(2), G2(1), ..., G2(last)
@@ -73,8 +73,8 @@ scheduling with one block per AIC, including its two sibling AIVs.
   scalar control writes explicitly flush it, and readers invalidate before polling.
   AIV publication waits for MTE3; AIC publication waits for FIX. Replay clears
   flags at entry after the previous invocation has drained on the same stream.
-  Each Cube matmul stage resets its TPipe after `Matmul.End()` so buffer records
-  do not accumulate across experts and tiles.
+  One Matmul context covers both GMMs for each invocation; `Matmul.End()` and
+  TPipe reset run after the Cube pipeline finishes.
   Scratch and window data transfers use MTE; barriers do not substitute for
   cache maintenance.
 - The output tensor is an INT64 status: `0` success, `-1` invalid layer mapping,
@@ -93,9 +93,10 @@ only when both operators partition tokens identically. The reserved 48-row
 window region and compact-v2 wire layout remain unchanged. This rule applies
 to existing Async CAM callers as well as MegaMoE.
 
-FULL captures a single-transaction graph and a graph containing four serial
-transactions. Submission of N chunks uses N // 4 batched replays and N % 4
-single replays, without rounding N upward. A chunk is selected by compact-v2
+FULL captures a single-transaction graph and, when there is more than one MoE
+layer, a graph containing `len(layer_ids)` serial transactions. For batch size
+B, submission of N chunks uses N // B batched replays and N % B single replays,
+without rounding N upward. A chunk is selected by compact-v2
 at runtime; graph position does not identify a fixed model layer. Both graphs
 share the stream, pool and scratch. The graph signature includes the batch size.
 
@@ -112,6 +113,14 @@ the tile cursor reads each expert's aggregate count once. Metadata and payload
 buffers remain live until the communication pipeline finishes. Host tiling
 checks their combined UB footprint. Dynamic stage flags, slot visibility,
 global scalar-cache invalidation and MTE3/FIX fences retain their existing rules.
+
+GMM logical tasks cover up to 512 N columns, clamped to the smaller of H and
+2I so both GMMs can reuse one Matmul context. The physical Cube baseN remains
+256. Each K quantization group uses `IterateAll` to compute every base block
+within the logical task, including the final N tail, before the next group
+accumulates its result. This reduces repeated task setup and permits A reuse
+across internal N iterations. The three GM slots, ACT row size, UB bounds,
+communication protocol and completion conditions remain unchanged.
 
 Device-side multi-transaction polling (P3) is deferred. Each native invocation
 still consumes one compact-v2 chunk. Qualification of the fixed version focuses

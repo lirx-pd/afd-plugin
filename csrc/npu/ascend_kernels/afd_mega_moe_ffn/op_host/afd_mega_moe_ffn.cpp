@@ -13,10 +13,11 @@
 namespace optiling {
 namespace {
 // config: maxSeqLen,H,I,topK,F,A,E,rank,world,TP,capacity,G1groups,G2groups,layers.
+constexpr int64_t MEGA_GMM_TASK_N = 512;
 constexpr uint64_t SYSTEM_WORKSPACE = 16 * 1024 * 1024;
 uint64_t Align32(uint64_t n) { return (n + 31) / 32 * 32; }
 
-bool CubeTiling(platform_ascendc::PlatformAscendC &platform, int64_t k, int64_t n, int64_t groups,
+bool CubeTiling(platform_ascendc::PlatformAscendC &platform, int64_t k, int64_t n, int64_t groups, int64_t taskN,
                 uint8_t *dest) {
     matmul_tiling::MatmulApiTiling mm(platform);
     mm.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
@@ -26,9 +27,9 @@ bool CubeTiling(platform_ascendc::PlatformAscendC &platform, int64_t k, int64_t 
     mm.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
                 matmul_tiling::DataType::DT_FLOAT16);
     mm.SetBias(false);
-    mm.SetShape(128, 256, k / groups);
+    mm.SetShape(128, taskN, k / groups);
     mm.SetOrgShape(2 * Cam::MEGA_TILE_ROWS, n, k);
-    mm.SetFixSplit(128, 256, std::min<int64_t>(256, k / groups));
+    mm.SetFixSplit(128, std::min<int64_t>(256, taskN), std::min<int64_t>(256, k / groups));
     mm.SetBufferSpace(-1, -1, -1);
     TCubeTiling data;
     if (mm.GetTiling(data) == -1 || data.GetDataSize() > Cam::MEGA_CUBE_TILING_BYTES)
@@ -138,6 +139,8 @@ ge::graphStatus Tiling(gert::TilingContext *ctx) {
                   uint32_t(vectors),
                   ub,
                   window};
+    const auto taskN = std::min({MEGA_GMM_TASK_N, c[Cam::MEGA_HIDDEN_SIZE],
+                                2 * c[Cam::MEGA_INTERMEDIATE_SIZE]});
     auto fill = [&](Cam::MegaGmmParams &p, int64_t k, int64_t n, int64_t groups) {
         p = {c[Cam::MEGA_LOCAL_EXPERTS],
              int64_t(cubes),
@@ -145,7 +148,7 @@ ge::graphStatus Tiling(gert::TilingContext *ctx) {
              n,
              Cam::MEGA_TILE_ROWS,
              128,
-             256,
+             taskN,
              Cam::MEGA_TILE_ROWS,
              2 * Cam::MEGA_TILE_ROWS * k,
              8 * Cam::MEGA_TILE_ROWS * n,
@@ -171,9 +174,9 @@ ge::graphStatus Tiling(gert::TilingContext *ctx) {
     if (ctx->GetInputShape(3)->GetStorageShape().GetDim(0) != int64_t(layout.bytes) ||
         data->layerMapSize == 0 ||
         !CubeTiling(platform, c[Cam::MEGA_HIDDEN_SIZE], 2 * c[Cam::MEGA_INTERMEDIATE_SIZE],
-                    c[Cam::MEGA_W13_GROUPS], data->cube1) ||
+                    c[Cam::MEGA_W13_GROUPS], taskN, data->cube1) ||
         !CubeTiling(platform, c[Cam::MEGA_INTERMEDIATE_SIZE], c[Cam::MEGA_HIDDEN_SIZE],
-                    c[Cam::MEGA_W2_GROUPS], data->cube2))
+                    c[Cam::MEGA_W2_GROUPS], taskN, data->cube2))
         return ge::GRAPH_FAILED;
     // MIX 1:2 launches one block per Cube, with both sibling AIVs participating.
     ctx->SetBlockDim(cubes);

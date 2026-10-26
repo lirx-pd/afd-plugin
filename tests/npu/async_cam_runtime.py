@@ -414,11 +414,13 @@ def main():
                         runner._ffn_forward_connector_driven(single=True)
                 return
             connector.graph_startup.service_ready()
-            for start in range(0, len(expected), len(LAYERS)):
+            # Metadata snapshots wrap the single-transaction graph only.
+            batch_size = 1 if args.mega_moe else len(LAYERS)
+            for start in range(0, len(expected), batch_size):
                 batch_index = 0
                 # Test-only finite work count, including the final short batch.
                 # The production loop has no EOS or cross-role stop protocol.
-                count = min(len(LAYERS), len(expected) - start)
+                count = min(batch_size, len(expected) - start)
                 runner._submit_graph(count)
                 runner._complete_graph()
                 session = runner

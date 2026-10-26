@@ -56,7 +56,6 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
-MEGA_GRAPH_BATCH_SIZE = 4
 
 
 class FFNModel(Protocol):
@@ -222,7 +221,7 @@ class AsyncNPUFFNModelRunner:
         signature = ""
         if executor:
             backend_prefix = (
-                f"mega_moe_v2:graph_batch={MEGA_GRAPH_BATCH_SIZE}:"
+                f"mega_moe_v2:graph_batch={len(self.layer_ids)}:"
                 if self._mega_executor
                 else ""
             )
@@ -331,12 +330,13 @@ class AsyncNPUFFNModelRunner:
                         self._graph_output, self._graph_payload.context
                     )
             self._graph_capture_count = 1
-            if self._mega_executor is not None and MEGA_GRAPH_BATCH_SIZE > 1:
+            if self._mega_executor is not None and len(self.layer_ids) > 1:
+                # Capture one complete bounded submission to avoid replay gaps.
                 self._batch_graph = torch.npu.NPUGraph()
                 with torch.npu.graph(
                     self._batch_graph, pool=self._graph_pool, stream=self._graph_stream
                 ):
-                    for _ in range(MEGA_GRAPH_BATCH_SIZE):
+                    for _ in range(len(self.layer_ids)):
                         self._mega_executor(
                             self.connector.comm_args, self.connector.group_name
                         )
@@ -369,10 +369,10 @@ class AsyncNPUFFNModelRunner:
                 if self._mega_executor is not None:
                     self._mega_executor.completion.zero_()
                 if self._batch_graph is not None:
-                    batches, count = divmod(count, MEGA_GRAPH_BATCH_SIZE)
+                    batches, count = divmod(count, len(self.layer_ids))
                     for _ in range(batches):
                         self._batch_graph.replay()
-                        self._graph_replay_count += MEGA_GRAPH_BATCH_SIZE
+                        self._graph_replay_count += len(self.layer_ids)
                 for _ in range(count):
                     self._graph.replay()
                     self._graph_replay_count += 1

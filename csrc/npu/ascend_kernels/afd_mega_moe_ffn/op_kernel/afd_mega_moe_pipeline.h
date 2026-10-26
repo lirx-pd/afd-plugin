@@ -320,10 +320,18 @@ __aicore__ inline void TransportPipeline(GM_ADDR scratch, const Cam::MegaWorkspa
     pipe.Reset();
 }
 
-__aicore__ inline void InvalidateScalarInputs(GM_ADDR address) {
+__aicore__ inline void InvalidateScalarInputs(GM_ADDR address, uint32_t experts) {
     GlobalTensor<int64_t> gm;
     gm.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(address));
-    DataCacheCleanAndInvalid<int64_t, CacheLine::ENTIRE_DATA_CACHE, DcciDst::CACHELINE_OUT>(gm);
+    if ASCEND_IS_AIC {
+        for (uint32_t e = 0; e < experts; e += 64 / sizeof(int64_t)) {
+            DataCacheCleanAndInvalid<int64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(gm[e]);
+        }
+    }
+    if ASCEND_IS_AIV {
+        // ACT also reads token scales through its scalar cache when a slot is reused.
+        DataCacheCleanAndInvalid<int64_t, CacheLine::ENTIRE_DATA_CACHE, DcciDst::CACHELINE_OUT>(gm);
+    }
 }
 
 __aicore__ inline void ComputeStage(GM_ADDR scratch, const Cam::MegaWorkspace &w,
@@ -332,7 +340,7 @@ __aicore__ inline void ComputeStage(GM_ADDR scratch, const Cam::MegaWorkspace &w
                                     int64_t layer, bool first, MM::MT &mm, TPipe &pipe) {
     flags.Wait(first ? PRE1 : PRE2, tile.sequence);
     const auto slot = scratch + w.SlotOffset(tile.sequence);
-    InvalidateScalarInputs(slot + w.tileCounts);
+    InvalidateScalarInputs(slot + w.tileCounts, t.recv.routeExpertNumPerMoe);
     const auto &p = first ? t.g1 : t.g2;
     auto a = Addresses(nullptr, nullptr, slot + w.tileCounts, weight, scale, bias, nullptr, nullptr,
                        slot + (first ? w.compute : w.compute2), p, layer);
@@ -418,7 +426,7 @@ __aicore__ inline void VectorPipeline(GM_ADDR scratch, const Cam::MegaWorkspace 
         // Independent OUTPUT readers must finish before ACT reuses raw output and scales.
         if (outputVectors && tile.sequence > Cam::MEGA_RING_SLOTS)
             flags.Wait(OUTPUT, tile.sequence - Cam::MEGA_RING_SLOTS);
-        InvalidateScalarInputs(slot + w.tileCounts);
+        InvalidateScalarInputs(slot + w.tileCounts, t.recv.routeExpertNumPerMoe);
         auto a = Addresses(slot + w.tileX, slot + w.tileScales, slot + w.tileCounts, w13, s13,
                            b13, slot + w.compute2, slot + w.zScales, slot + w.compute, t.g1, layer);
         auto split = tile.Split();

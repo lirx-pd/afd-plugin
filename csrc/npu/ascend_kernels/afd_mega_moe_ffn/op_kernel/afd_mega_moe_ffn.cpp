@@ -102,7 +102,8 @@ __aicore__ inline void OutputTile(GM_ADDR scratch, const Cam::MegaWorkspace &w,
         auto tmp = buf.GetWithOffset<float>(h, h * 8);
         auto bias = buf.GetWithOffset<float>(h, h * 12);
         auto y = buf.GetWithOffset<bfloat16_t>(h, h * 16);
-        auto scale = buf.GetWithOffset<float>(8, h * 18);
+        constexpr uint32_t SCALE_BATCH_ROWS = 8;
+        auto scale = buf.GetWithOffset<float>(SCALE_BATCH_ROWS, h * 18);
         GlobalTensor<half> raw;
         GlobalTensor<float> biases, scales;
         GlobalTensor<bfloat16_t> output;
@@ -121,9 +122,14 @@ __aicore__ inline void OutputTile(GM_ADDR scratch, const Cam::MegaWorkspace &w,
             }
             DataCopy(hi, raw[2 * r * h], h);
             DataCopy(lo, raw[(2 * r + 1) * h], h);
-            DataCopyPad(scale, scales[r], {1U, 4U, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+            const uint32_t scaleIndex = (r - range.begin) % SCALE_BATCH_ROWS;
+            if (scaleIndex == 0) {
+                const uint32_t scaleRows = range.end - r < SCALE_BATCH_ROWS ? range.end - r : SCALE_BATCH_ROWS;
+                DataCopyPad(scale, scales[r], {1U, uint32_t(scaleRows * sizeof(float)), 0U, 0U, 0U},
+                            {false, 0U, 0U, 0U});
+                Fence<HardEvent::MTE2_S>();
+            }
             Fence<HardEvent::MTE2_V>();
-            Fence<HardEvent::MTE2_S>();
             Cast(v, hi, RoundMode::CAST_NONE, h);
             Cast(tmp, lo, RoundMode::CAST_NONE, h);
             PipeBarrier<PIPE_V>();
@@ -134,7 +140,7 @@ __aicore__ inline void OutputTile(GM_ADDR scratch, const Cam::MegaWorkspace &w,
             Add(v, v, bias, h);
             PipeBarrier<PIPE_V>();
             Fence<HardEvent::S_V>();
-            Muls(v, v, scale.GetValue(0), h);
+            Muls(v, v, scale.GetValue(scaleIndex), h);
             PipeBarrier<PIPE_V>();
             Cast(y, v, RoundMode::CAST_RINT, h);
             if (t.routedScale != 1.0f) {

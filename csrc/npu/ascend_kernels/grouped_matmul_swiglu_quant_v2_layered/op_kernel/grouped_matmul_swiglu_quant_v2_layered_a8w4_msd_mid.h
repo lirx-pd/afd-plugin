@@ -264,11 +264,11 @@ __aicore__ inline void GMMA8W4MidProcess<mmType>::Process(WorkSpaceSplitConfig &
                 continue;
             }
             mnConfig.blockDimM = Ceil(mnConfig.m, mnConfig.singleM);
-            // ### PATCH START: adaptive MSD tile
-            activeMm->SetOrgShape(mnConfig.m, mnConfig.n, mnConfig.k);
-            // ### PATCH END: adaptive MSD tile
             uint32_t curCount = preCount + mnConfig.blockDimN * mnConfig.blockDimM;
             uint32_t curBlock = coreIdx >= preCount ? coreIdx : coreIdx + gmmSwigluQuantV2BaseParams->coreNum;
+            if (curBlock < curCount) {
+                activeMm->SetOrgShape(mnConfig.m, mnConfig.n, mnConfig.k);
+            }
             while (curBlock < curCount) {
                 mnConfig.mIdx = (curBlock - preCount) / mnConfig.blockDimN;
                 mnConfig.nIdx = (curBlock - preCount) % mnConfig.blockDimN;

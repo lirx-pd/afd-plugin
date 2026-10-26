@@ -5,6 +5,9 @@
 
 namespace AfdMegaMoe {
 enum Stage : uint32_t { RECEIVED, PRE1, G1, PRE2, G2, OUTPUT, SENT };
+constexpr uint32_t OUTPUT_AIVS = 8;
+// The validation result and scheduling controls use separate scalar cache lines.
+constexpr uint32_t TOTAL_ROWS = 8;
 
 __aicore__ inline void StoreControl(GM_ADDR base, uint32_t index, int64_t value) {
     GlobalTensor<int64_t> gm;
@@ -366,7 +369,7 @@ __aicore__ inline void ComputePipeline(GM_ADDR scratch, const Cam::MegaWorkspace
 __aicore__ inline void PrepareTile(GM_ADDR scratch, const Cam::MegaWorkspace &w,
                                    const AfdMegaMoeFFNTilingData &t, const PipelineFlags &flags,
                                    const Tile &tile, GM_ADDR weight, GM_ADDR scale, GM_ADDR bias,
-                                   int64_t layer, TPipe &pipe) {
+                                   int64_t layer, TPipe &pipe, uint32_t vectors) {
     const auto slot = scratch + w.SlotOffset(tile.sequence);
     flags.Wait(RECEIVED, tile.sequence);
     const auto &p = t.g1;
@@ -376,27 +379,45 @@ __aicore__ inline void PrepareTile(GM_ADDR scratch, const Cam::MegaWorkspace &w,
     auto split = tile.Split();
     GMMA8W4PreProcess pre;
     pre.Init(a, &p);
-    pre.SetVectorGroup(GetBlockIdx() - Cam::MEGA_COMM_AIVS, t.recv.aivNum - Cam::MEGA_COMM_AIVS);
+    pre.SetVectorGroup(GetBlockIdx() - Cam::MEGA_COMM_AIVS, vectors);
     pre.Process(split, 0, &pipe);
     pipe.Reset();
     flags.Arrive(PRE1, tile.sequence, GetBlockIdx() - Cam::MEGA_COMM_AIVS,
-                 t.recv.aivNum - Cam::MEGA_COMM_AIVS);
+                 vectors);
+}
+
+__aicore__ inline void OutputPipeline(GM_ADDR scratch, const Cam::MegaWorkspace &w,
+                                      const AfdMegaMoeFFNTilingData &t, const PipelineFlags &flags,
+                                      TileCursor cursor, GM_ADDR bias, int64_t layer, TPipe &pipe) {
+    const uint32_t id = GetBlockIdx() - (t.recv.aivNum - OUTPUT_AIVS);
+    for (auto tile = cursor.Next(); tile.rows; tile = cursor.Next()) {
+        flags.Wait(G2, tile.sequence);
+        if (tile.sequence > Cam::MEGA_RING_SLOTS)
+            flags.Wait(SENT, tile.sequence - Cam::MEGA_RING_SLOTS);
+        OutputTile(scratch + w.SlotOffset(tile.sequence), w, t, bias, layer, tile.expert,
+                   tile.offset, tile.rows, scratch + w.counts, pipe, id, OUTPUT_AIVS);
+        flags.Arrive(OUTPUT, tile.sequence, id, OUTPUT_AIVS);
+    }
 }
 
 __aicore__ inline void VectorPipeline(GM_ADDR scratch, const Cam::MegaWorkspace &w,
                                       const AfdMegaMoeFFNTilingData &t, const PipelineFlags &flags,
                                       TileCursor cursor, GM_ADDR w13, GM_ADDR w2, GM_ADDR s13,
-                                      GM_ADDR s2, GM_ADDR b13, GM_ADDR b2, int64_t layer, TPipe &pipe) {
+                                      GM_ADDR s2, GM_ADDR b13, GM_ADDR b2, int64_t layer, TPipe &pipe,
+                                      uint32_t outputVectors = 0) {
     auto tile = cursor.Next();
     if (!tile.rows) return;
     const uint32_t id = GetBlockIdx() - Cam::MEGA_COMM_AIVS;
-    const uint32_t vectors = t.recv.aivNum - Cam::MEGA_COMM_AIVS;
-    PrepareTile(scratch, w, t, flags, tile, w13, s13, b13, layer, pipe);
+    const uint32_t vectors = t.recv.aivNum - Cam::MEGA_COMM_AIVS - outputVectors;
+    PrepareTile(scratch, w, t, flags, tile, w13, s13, b13, layer, pipe, vectors);
     auto next = cursor.Next();
-    if (next.rows) PrepareTile(scratch, w, t, flags, next, w13, s13, b13, layer, pipe);
+    if (next.rows) PrepareTile(scratch, w, t, flags, next, w13, s13, b13, layer, pipe, vectors);
     while (tile.rows) {
         const auto slot = scratch + w.SlotOffset(tile.sequence);
         flags.Wait(G1, tile.sequence);
+        // Independent OUTPUT readers must finish before ACT reuses raw output and scales.
+        if (outputVectors && tile.sequence > Cam::MEGA_RING_SLOTS)
+            flags.Wait(OUTPUT, tile.sequence - Cam::MEGA_RING_SLOTS);
         InvalidateScalarInputs(slot + w.tileCounts);
         auto a = Addresses(slot + w.tileX, slot + w.tileScales, slot + w.tileCounts, w13, s13,
                            b13, slot + w.compute2, slot + w.zScales, slot + w.compute, t.g1, layer);
@@ -412,14 +433,16 @@ __aicore__ inline void VectorPipeline(GM_ADDR scratch, const Cam::MegaWorkspace 
         flags.Arrive(PRE2, tile.sequence, id, vectors);
         // Feed G1 two tiles ahead while Cube consumes this tile's prepared G2 input.
         auto ahead = cursor.Next();
-        if (ahead.rows) PrepareTile(scratch, w, t, flags, ahead, w13, s13, b13, layer, pipe);
-        flags.Wait(G2, tile.sequence);
-        // Refilled inputs do not imply that the old output has been sent.
-        if (tile.sequence > Cam::MEGA_RING_SLOTS)
-            flags.Wait(SENT, tile.sequence - Cam::MEGA_RING_SLOTS);
-        OutputTile(slot, w, t, b2, layer, tile.expert, tile.offset, tile.rows,
-                   scratch + w.counts, pipe);
-        flags.Arrive(OUTPUT, tile.sequence, id, vectors);
+        if (ahead.rows) PrepareTile(scratch, w, t, flags, ahead, w13, s13, b13, layer, pipe, vectors);
+        if (!outputVectors) {
+            flags.Wait(G2, tile.sequence);
+            // Refilled inputs do not imply that the old output has been sent.
+            if (tile.sequence > Cam::MEGA_RING_SLOTS)
+                flags.Wait(SENT, tile.sequence - Cam::MEGA_RING_SLOTS);
+            OutputTile(slot, w, t, b2, layer, tile.expert, tile.offset, tile.rows,
+                       scratch + w.counts, pipe, id, vectors);
+            flags.Arrive(OUTPUT, tile.sequence, id, vectors);
+        }
         tile = next;
         next = ahead;
     }

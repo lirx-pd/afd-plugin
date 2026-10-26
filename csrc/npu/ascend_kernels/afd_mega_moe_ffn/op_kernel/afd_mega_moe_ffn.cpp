@@ -88,10 +88,8 @@ __aicore__ inline GMAddrParams Addresses(GM_ADDR x, GM_ADDR scales, GM_ADDR coun
 __aicore__ inline void OutputTile(GM_ADDR scratch, const Cam::MegaWorkspace &w,
                                   const Cam::AfdMegaMoeFFNTilingData &t, GM_ADDR biasList,
                                   int64_t layer, uint32_t expert, uint32_t offset, uint32_t rows,
-                                  GM_ADDR counts, TPipe &pipe) {
+                                  GM_ADDR counts, TPipe &pipe, uint32_t id, uint32_t vectors) {
     if ASCEND_IS_AIV {
-        const uint32_t id = GetBlockIdx() - Cam::MEGA_COMM_AIVS;
-        const uint32_t vectors = t.recv.aivNum - Cam::MEGA_COMM_AIVS;
         const Cam::MegaRowRange range(rows, id, vectors);
         if (range.begin == range.end) return;
         pipe.Reset();
@@ -182,6 +180,7 @@ __aicore__ inline int64_t ValidateTransaction(GM_ADDR scratch, GM_ADDR layerMap,
         if (count < 0 || uint64_t(count) > t.capacity - total) return -2;
         total += count;
     }
+    StoreControl(scratch + w.validation, TOTAL_ROWS, total);
     return layer;
 }
 } // namespace AfdMegaMoe
@@ -228,14 +227,20 @@ afd_mega_moe_ffn(GM_ADDR anchor, GM_ADDR commArgs, GM_ADDR layerMap, GM_ADDR scr
             DataCacheCleanAndInvalid<int64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(counts[e]);
         }
         TileCursor cursor(scratch + w.counts, t.recv.routeExpertNumPerMoe);
+        const bool splitVectors = t.recv.aivNum == Cam::MEGA_MAX_AIVS &&
+                                  ReadControl(scratch + w.validation, TOTAL_ROWS) >
+                                      Cam::MEGA_RING_SLOTS * Cam::MEGA_TILE_ROWS;
         if ASCEND_IS_AIC {
             ComputePipeline(scratch, w, t, flags, cursor, w13, w2, s13, s2, b13, b2, layer, pipe);
         }
         if ASCEND_IS_AIV {
             if (GetBlockIdx() < Cam::MEGA_COMM_AIVS) {
                 TransportPipeline(scratch, w, t, flags, cursor, pipe);
+            } else if (splitVectors && GetBlockIdx() >= t.recv.aivNum - OUTPUT_AIVS) {
+                OutputPipeline(scratch, w, t, flags, cursor, b2, layer, pipe);
             } else {
-                VectorPipeline(scratch, w, t, flags, cursor, w13, w2, s13, s2, b13, b2, layer, pipe);
+                VectorPipeline(scratch, w, t, flags, cursor, w13, w2, s13, s2, b13, b2, layer, pipe,
+                               splitVectors ? OUTPUT_AIVS : 0);
             }
         }
         SyncAll<false>();

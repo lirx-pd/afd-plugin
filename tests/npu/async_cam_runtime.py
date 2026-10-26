@@ -130,6 +130,7 @@ def main():
     parser.add_argument("--attn-ranks", type=int, choices=(1, 2), default=1)
     parser.add_argument("--boundary", action="store_true")
     parser.add_argument("--tile-boundary", action="store_true")
+    parser.add_argument("--heavy", action="store_true")
     parser.add_argument("--save-outputs")
     parser.add_argument("--reference-outputs")
     args = parser.parse_args()
@@ -138,9 +139,10 @@ def main():
     os.environ["AFD_ASYNC_CAM_MEGA_MOE"] = "1" if args.mega_moe else "0"
     faulthandler.dump_traceback_later(60)
     os.environ["AFD_ASYNC_CAM_LAYERED_GMM"] = "1"
-    capacity = 256 if args.tile_boundary else 16
+    capacity = 8192 if args.heavy else (256 if args.tile_boundary else 16)
     os.environ["BATCH_SIZE_FACTOR"] = str(capacity / 262144)
-    os.environ["HCCL_BUFFSIZE"] = "64"
+    hccl_buffer_size = 64
+    os.environ["HCCL_BUFFSIZE"] = str(hccl_buffer_size)
     ensure_cam_async_ops_available()
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -173,7 +175,7 @@ def main():
                 "connector_extra_config": {
                     "dynamicQuant": 1,
                     "attn_ranks_per_dp": 1,
-                    "hccl_buffer_size": 64,
+                    "hccl_buffer_size": hccl_buffer_size,
                 },
             }
         },
@@ -356,6 +358,17 @@ def main():
         cases.extend(((5, False, 16), (2, True, 16)))
     if args.tile_boundary:
         cases.extend(((5, True, 129), (2, False, 129)))
+    if args.heavy:
+        # Cross the three-slot threshold, wrap the ring, then replay a small batch.
+        cases.extend(
+            (
+                (5, True, 768),
+                (2, True, 769),
+                (5, False, 2048),
+                (2, True, 4096),
+                (5, False, 7),
+            )
+        )
     expected: list[tuple[int, int, int | None]] = []
     for layer_id, sparse, tokens in cases:
         for source in range(args.attn_ranks):

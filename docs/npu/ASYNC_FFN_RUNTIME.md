@@ -193,8 +193,16 @@ Inference results and cleanup are recorded separately; remaining owned processes
 or failed requests block acceptance. Validation evidence must identify the
 source and native artifacts actually deployed.
 
-## Experimental MegaMoE phase 1
+## Experimental MegaMoE
 
-The optional `AFD_ASYNC_CAM_MEGA_MOE=1` FFN backend has a phase-ordered single-kernel
-implementation for A3 compact-v2 W4A8. Native qualification is pending. See
-[the implementation and validation guide](ASYNC_CAM_MEGA_MOE.md) before enabling it.
+On FFN, set `AFD_ASYNC_CAM_MEGA_MOE=1` together with
+`AFD_ASYNC_CAM_LAYERED_GMM=1` to fuse receive, W4A8 expert computation and send
+into one tiled kernel. The backend defaults to disabled and requires A3,
+BF16 activations, compact-v2 INT8/scales transport, `dynamicQuant=1`, FFN TP=1
+and `ffn_two_stream=false`. Attention keeps its existing routing and combine path.
+
+Eager and FFN FULL are supported. FULL reuses fixed-address buffers on one stream
+and batches exactly the requested number of transactions; each invocation
+selects its source and layer from received metadata. Rebuild native components
+and recapture graphs when changing the backend. A failed or blocked invocation
+retains its resources; failed-peer cancellation is not provided.

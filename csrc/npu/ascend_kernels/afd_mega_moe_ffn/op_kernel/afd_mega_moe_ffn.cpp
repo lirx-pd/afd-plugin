@@ -235,7 +235,7 @@ afd_mega_moe_ffn(GM_ADDR anchor, GM_ADDR commArgs, GM_ADDR layerMap, GM_ADDR scr
         TileCursor cursor(scratch + w.counts, t.recv.routeExpertNumPerMoe);
         const bool splitVectors = t.recv.aivNum == Cam::MEGA_MAX_AIVS &&
                                   ReadControl(scratch + w.validation, TOTAL_ROWS) >
-                                      Cam::MEGA_RING_SLOTS * Cam::MEGA_TILE_ROWS;
+                                      Cam::MEGA_TILE_ROWS;
         if ASCEND_IS_AIC {
             ComputePipeline(scratch, w, t, flags, cursor, w13, w2, s13, s2, b13, b2, layer, pipe);
         }

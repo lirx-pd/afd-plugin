@@ -13,7 +13,7 @@
 namespace optiling {
 namespace {
 // config: maxSeqLen,H,I,topK,F,A,E,rank,world,TP,capacity,G1groups,G2groups,layers.
-constexpr int64_t MEGA_GMM_TASK_N = 512;
+constexpr int64_t MEGA_GMM_TASK_N = 1024;
 constexpr uint64_t SYSTEM_WORKSPACE = 16 * 1024 * 1024;
 uint64_t Align32(uint64_t n) { return (n + 31) / 32 * 32; }
 

@@ -2,7 +2,8 @@
 
 This report records the historical 128-row implementation and its frozen
 measurements. The current [expert packing](ASYNC_CAM_MEGA_MOE.md#scope-and-entry-points)
-retains this schedule with larger tiles spanning multiple experts.
+retains the Cube schedule with larger tiles spanning multiple experts and
+separates OUTPUT onto eight AIVs for transactions containing multiple tiles.
 
 ## Dependency and buffer ownership
 

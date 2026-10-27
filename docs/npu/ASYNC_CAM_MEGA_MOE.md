@@ -20,7 +20,8 @@ The historical Phase 2 measurements below describe the pre-upgrade implementatio
 AIV 0: select compact-v2 chunk, validate layer/counts and publish metadata
 all AIVs: initialize per-invocation sequence flags
 16 communication AIVs: receive three tiles, then refill after G2 / send completed output
-remaining AIVs: INT8->INT4 prep, SwiGLU/full-row quantization, BF16 output
+one tile: 32 AIVs perform prep, SwiGLU/full-row quantization and BF16 output
+multiple tiles: 24 AIVs perform prep/activation; 8 AIVs produce BF16 output
 all AICs: G1(0), G1(1), G2(0), G1(2), G2(1), ..., G2(last)
 communication AIV 0: release consumed input and publish final compact-v2 completion
 all cores: drain, write completion status
@@ -33,8 +34,11 @@ its sequence only after every participating core has drained its writes.
 Input staging is refilled after G2; BF16 output is reused only after all senders
 have consumed it. These regions have independent release conditions.
 G1/G2 share the AIC pool; no second mixed kernel competes for AIV resources.
-On a full A3 die the allocation is 24 AIC, 16 communication AIV and 32 compute AIV.
-This is the fixed split used for the current functional qualification.
+On a full A3 die the allocation is 24 AIC and 16 communication AIVs. A single
+tile uses the remaining 32 AIVs for prep, activation and output. More than 512
+routed rows use 24 prep/activation AIVs and 8 independent output AIVs, so output
+does not delay the next tile's PRE2. ACT waits for the old slot's OUTPUT before
+reusing its raw G2 result and scales; BF16 output reuse still waits for SENT.
 
 Attention still runs its existing dispatch, shared experts and weighted combine.
 The wire layout and `cam_async_routed_only_compact_v2` identity are unchanged.
@@ -114,9 +118,13 @@ buffers remain live until the communication pipeline finishes. Host tiling
 checks their combined UB footprint. Dynamic stage flags, slot visibility,
 global scalar-cache invalidation and MTE3/FIX fences retain their existing rules.
 
-GMM logical tasks cover up to 512 N columns, clamped to the smaller of H and
-2I so both GMMs can reuse one Matmul context. The physical Cube baseN remains
-256. Each K quantization group uses `IterateAll` to compute every base block
+GMM logical tasks cover up to 1024 N columns, clamped to the smaller of H and
+2I so both GMMs can reuse one Matmul context. Each stage uses the tile's expert
+counts to estimate its MSD M blocks and the maximum physical N work per AIC.
+It falls back to N512 if a wider task leaves an N tail or increases that work
+bound. This avoids reducing task count at the expense of an extra tail wave.
+The physical Cube baseN remains 256. Each K quantization group uses `IterateAll`
+to compute every base block
 within the logical task, including the final N tail, before the next group
 accumulates its result. This reduces repeated task setup and permits A reuse
 across internal N iterations. The three GM slots, ACT row size, UB bounds,

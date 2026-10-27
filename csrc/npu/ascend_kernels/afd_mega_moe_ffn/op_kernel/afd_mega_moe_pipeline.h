@@ -341,7 +341,22 @@ __aicore__ inline void ComputeStage(GM_ADDR scratch, const Cam::MegaWorkspace &w
     flags.Wait(first ? PRE1 : PRE2, tile.sequence);
     const auto slot = scratch + w.SlotOffset(tile.sequence);
     InvalidateScalarInputs(slot + w.tileCounts, t.recv.routeExpertNumPerMoe);
-    const auto &p = first ? t.g1 : t.g2;
+    auto p = first ? t.g1 : t.g2;
+    constexpr uint32_t NARROW_TASK_N = 512;
+    constexpr uint32_t CUBE_N = 256;
+    if (p.baseN > NARROW_TASK_N) {
+        uint32_t mBlocks = 0;
+        for (uint32_t expert = tile.expert; expert <= tile.lastExpert; ++expert) {
+            const uint32_t rows = ReadImmutableCount(slot + w.tileCounts, expert);
+            mBlocks += (2 * rows + p.baseM - 1) / p.baseM;
+        }
+        const uint32_t wideJobs = mBlocks * ((p.N + p.baseN - 1) / p.baseN);
+        const uint32_t narrowJobs = mBlocks * ((p.N + NARROW_TASK_N - 1) / NARROW_TASK_N);
+        const uint32_t wideWork = ((wideJobs + p.coreNum - 1) / p.coreNum) * (p.baseN / CUBE_N);
+        const uint32_t narrowWork = ((narrowJobs + p.coreNum - 1) / p.coreNum) * (NARROW_TASK_N / CUBE_N);
+        // Wider jobs must not increase the longest AIC's number of physical N blocks.
+        if (p.N % p.baseN != 0 || wideWork > narrowWork) p.baseN = NARROW_TASK_N;
+    }
     auto a = Addresses(nullptr, nullptr, slot + w.tileCounts, weight, scale, bias, nullptr, nullptr,
                        slot + (first ? w.compute : w.compute2), p, layer);
     auto split = tile.Split();

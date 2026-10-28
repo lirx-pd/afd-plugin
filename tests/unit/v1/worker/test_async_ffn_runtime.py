@@ -7,6 +7,7 @@ from __future__ import annotations
 import threading
 from collections import deque
 from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -168,3 +169,28 @@ def test_full_receiver_exit_requires_success_even_during_shutdown(harness, fail)
     assert not worker._ffn_thread.is_alive()
     assert harness.runner._graph_receiver_exited is not fail
     assert (worker._ffn_loop_error is not None) is fail
+
+
+@pytest.mark.parametrize("drains", [True, False])
+def test_pull_shutdown_finishes_only_selected_source(harness, monkeypatch, drains):
+    h = harness
+    monkeypatch.setenv("BATCH_SIZE_FACTOR", str(8 / 262144))
+    h.connector.extra_info = replace(
+        h.connector.extra_info, dispatch_mode="pull_v1", dynamic_quant=1
+    )
+    active = iter((True, True, False) if drains else (True,) * 8)
+    monkeypatch.setattr(h.connector, "pull_has_active_source", lambda: next(active))
+    monkeypatch.setattr(h.connector, "check_pull_status", lambda: None)
+    monkeypatch.setattr(torch.npu, "synchronize", lambda: None)
+    calls = []
+    monkeypatch.setattr(
+        h.runner,
+        "_ffn_forward_connector_driven",
+        lambda *, single: calls.append(single),
+    )
+    if drains:
+        h.runner.drain_pull_source()
+    else:
+        with pytest.raises(RuntimeError, match="retain resources"):
+            h.runner.drain_pull_source()
+    assert calls == [True, True]

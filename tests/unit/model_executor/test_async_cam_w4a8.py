@@ -17,6 +17,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from afd_plugin.model_executor.npu.async_cam_mega import (  # noqa: E402
+    AsyncCAMMegaExecutor,
+)
 from afd_plugin.model_executor.npu.async_cam_w4a8 import (  # noqa: E402
     AsyncCAMW4A8Executor,
     W4A8LayerWeights,
@@ -44,6 +47,69 @@ def weights(layer_idx=0, per_channel=True):
         swiglu_limit=0.0,
         routed_scaling_factor=2.0,
     )
+
+
+def test_native_executor_reuses_weights_state_and_workspace(monkeypatch, operators):
+    layers = []
+    for layer in (5, 2):
+        layers.append(
+            W4A8LayerWeights(
+                layer,
+                torch.empty(2, 256, 64, dtype=torch.int32),
+                torch.empty(2, 256, 32, dtype=torch.int32),
+                torch.empty(2, 512, dtype=torch.int64),
+                torch.empty(2, 1, 256, dtype=torch.int64),
+                torch.empty(2, 512),
+                torch.empty(2, 256),
+                True,
+                0.0,
+                1.0,
+            )
+        )
+    weights_executor = AsyncCAMW4A8Executor(layers)
+    calls = []
+
+    def execute(*args):
+        calls.append(args)
+        return torch.empty(1, dtype=torch.int64)
+
+    monkeypatch.setenv("BATCH_SIZE_FACTOR", str(16 / 262144))
+    monkeypatch.setattr(
+        torch.ops.afd_ascend,
+        "afd_mega_moe_pull_workspace_size",
+        lambda *args: 65536,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.afd_ascend, "afd_mega_moe_pull_native", execute, raising=False
+    )
+    connector = SimpleNamespace(
+        max_num_batched_tokens=8,
+        topk=2,
+        ffn_size=2,
+        attn_size=1,
+        world_rank=1,
+        topology=SimpleNamespace(world_size=3),
+        tp_size=1,
+        comm_args=torch.empty(512, dtype=torch.float16),
+        group_name="test-pull",
+    )
+    executor = AsyncCAMMegaExecutor(weights_executor, connector)
+    assert executor.layer_map.tolist() == [-1, -1, 0, -1, -1, 1]
+    for _ in range(2):
+        executor()
+    assert calls[0][1] is calls[1][1] is connector.comm_args
+    assert calls[0][3] is calls[1][3] is executor.scratch
+    assert calls[0][4] is weights_executor.w13
+    assert calls[0][10] == [8, 256, 256, 2, 2, 1, 2, 1, 3, 1, 16, 1, 1, 2]
+    assert executor.batch_info.numel() == 10
+    assert executor.group_list.data_ptr() == executor.scratch.data_ptr() + 512
+
+
+def test_native_rejects_grouped_scale_before_receiving(operators):
+    executor = AsyncCAMW4A8Executor([weights(per_channel=False)])
+    with pytest.raises(ValueError, match="per-channel"):
+        AsyncCAMMegaExecutor(executor, None)
 
 
 @pytest.fixture
@@ -213,6 +279,7 @@ def test_runner_preserves_raw_context_and_chunk_capacity():
         model=object(),
         connector=connector,
         _two_stream=None,
+        _mega_executor=None,
         _layered_executor=compute,
         layer_ids=(2, 5),
     )
@@ -232,7 +299,11 @@ def test_runner_preserves_raw_context_and_chunk_capacity():
 
 
 def test_runner_switch_off_does_not_touch_model_or_ops():
-    runner = SimpleNamespace(model=object(), _layered_gmm_requested=False)
+    runner = SimpleNamespace(
+        model=object(),
+        _layered_gmm_requested=False,
+        connector=SimpleNamespace(extra_info=SimpleNamespace(ffn_mega_moe=False)),
+    )
     method = runner_method(
         "_initialize_layered_executor",
         {"logger": SimpleNamespace(info=lambda *args: None)},

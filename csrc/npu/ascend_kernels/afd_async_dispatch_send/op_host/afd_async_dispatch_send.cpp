@@ -196,7 +196,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 
     uint32_t blockDim = 1U;
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    uint64_t aivNum = DispatchAivs(batchSize, ascendcPlatform.GetCoreNumAiv());
+    uint64_t aivNum = AttentionAivs(batchSize, ascendcPlatform.GetCoreNumAiv());
     uint64_t ubSize = 0UL;
     ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
     blockDim = ascendcPlatform.CalcTschBlockDim(aivNum, 0, aivNum);

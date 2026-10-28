@@ -360,7 +360,8 @@ __aicore__ inline void ComputeStage(GM_ADDR scratch, const Cam::MegaWorkspace &w
     auto a = Addresses(nullptr, nullptr, slot + w.tileCounts, weight, scale, bias, nullptr, nullptr,
                        slot + (first ? w.compute : w.compute2), p, layer);
     auto split = tile.Split();
-    GMMA8W4MidProcess<MM> mid(mm);
+    // Equal baseM keeps the shared GMM on MegaMoE's single Matmul context.
+    GMMA8W4MidProcess<MM> mid(mm, mm, reinterpret_cast<const TCubeTiling *>(first ? t.cube1 : t.cube2));
     mid.Init(a, &p);
     mid.Process(split, 0);
     flags.Arrive(first ? G1 : G2, tile.sequence, GetBlockIdx(), t.g1.coreNum);

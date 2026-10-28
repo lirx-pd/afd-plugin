@@ -25,7 +25,6 @@ struct AfdAsyncCombineRecvInfo {
     uint32_t attnRankId;
     uint32_t worldSize;
     uint32_t aivNum;
-    uint32_t dispatchAivNum;
     uint64_t totalUbSize;
     uint64_t totalWorkspaceSize;
 };

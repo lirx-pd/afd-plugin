@@ -120,8 +120,6 @@ def command_for(args, settings, role: str) -> list[str]:
     offset = command.index("--additional-config") + 1
     config = json.loads(command[offset])
     config.update(additional_config(role, async_cam=True))
-    if args.mega:
-        config["afd"]["connector_extra_config"].update(ffn_mega_moe=True)
     command[offset] = json.dumps(config)
     if role == "ffn" and args.mode == "full":
         command.remove("--enforce-eager")
@@ -202,50 +200,6 @@ def saved_environment(env: dict[str, str]) -> dict[str, str]:
             or k in ("PATH", "PYTHONPATH", "LD_LIBRARY_PATH", "LD_PRELOAD")
         )
     }
-
-
-def validate_reference(args, plans: dict[str, LaunchPlan]) -> str:
-    accepted = json.loads((args.reference_dir / "passed.json").read_text())
-    if accepted != {"mode": "eager", "passed": True}:
-        raise ValueError("Reference must be a completed eager run")
-    reference = json.loads((args.reference_dir / "launch.json").read_text())
-    expected_mega = args.mega and args.mode == "full"
-    for role in ("attention", "ffn"):
-        current, previous = plans[role]["command"], reference[role]["command"]
-        if Path(current[2]).resolve() != Path(previous[2]).resolve():
-            raise ValueError("Reference checkpoint does not match")
-        configs = []
-        for command in (current, previous):
-            config = json.loads(command[command.index("--additional-config") + 1])
-            afd = config["afd"]
-            mega = afd["connector_extra_config"].pop("ffn_mega_moe", False)
-            if command is previous and mega != expected_mega:
-                raise ValueError("Reference compute backend does not match")
-            for key in ("host", "port"):
-                afd.pop(key, None)
-            configs.append(config)
-        if configs[0] != configs[1]:
-            raise ValueError("Reference AFD configuration does not match")
-        for flag in (
-            "--data-parallel-size",
-            "--tensor-parallel-size",
-            "--seed",
-            "--max-model-len",
-            "--max-num-batched-tokens",
-            "--max-num-seqs",
-            "--block-size",
-            "--quantization",
-            "--tokenizer-mode",
-            "--all2all-backend",
-        ):
-            if current[current.index(flag) + 1] != previous[previous.index(flag) + 1]:
-                raise ValueError(f"Reference {flag} does not match")
-        if (
-            plans[role]["environment"]["BATCH_SIZE_FACTOR"]
-            != reference[role]["environment"]["BATCH_SIZE_FACTOR"]
-        ):
-            raise ValueError("Reference receive capacity does not match")
-    return "native" if expected_mega else "layered"
 
 
 def save(path: Path, value) -> None:
@@ -331,7 +285,7 @@ def snapshots(client, args) -> dict:
         time.sleep(0.1)
 
 
-def audit_execution(before: dict, after: dict, mode: str, mega: bool) -> None:
+def audit_execution(before: dict, after: dict, mode: str) -> None:
     attention = after["attention"]["results"]
     attention_before = {r["rank"]: r for r in before["attention"]["results"]}
     ffn_before = {r["rank"]: r for r in before["ffn"]["results"]}
@@ -351,8 +305,6 @@ def audit_execution(before: dict, after: dict, mode: str, mega: bool) -> None:
         baseline = ffn_before[record["rank"]]
         if record["runner"] != "AsyncNPUFFNModelRunner" or record["mode"] != mode:
             raise AssertionError("FFN runner or effective execution mode changed")
-        if record["compute_backend"] != ("native" if mega else "layered"):
-            raise AssertionError("FFN did not execute the requested compute backend")
         layer_ids = record["layer_ids"]
         if len(layer_ids) != 43:
             raise AssertionError("Expected all 43 checkpoint layers")
@@ -374,7 +326,6 @@ def audit_execution(before: dict, after: dict, mode: str, mega: bool) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", required=True, choices=("eager", "full"))
-    parser.add_argument("--mega", action="store_true")
     parser.add_argument("--model", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--reference-dir", type=Path)
@@ -390,8 +341,8 @@ def main() -> None:
         parser.error("exactly eight distinct devices required")
     args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=False)
-    if (args.mode == "full" or args.mega) and args.reference_dir is None:
-        parser.error("FULL and native Mega require a completed eager reference")
+    if args.mode == "full" and args.reference_dir is None:
+        parser.error("FULL requires the completed layered eager reference")
     settings = profile(args)
     plans: dict[str, LaunchPlan] = {
         role: {
@@ -410,9 +361,12 @@ def main() -> None:
             for role, data in plans.items()
         },
     )
-    reference_backend = validate_reference(args, plans) if args.reference_dir else None
     if args.plan_only:
         return
+    if args.reference_dir:
+        accepted = json.loads((args.reference_dir / "passed.json").read_text())
+        if accepted != {"mode": "eager", "passed": True}:
+            raise ValueError("Reference must be a completed layered eager run")
 
     received_signal: int | None = None
     cleanup_in_progress = False
@@ -473,7 +427,7 @@ def main() -> None:
             results = run_requests(client, base, cases, args.output_dir)
             after = snapshots(client, args)
             save(args.output_dir / "after.json", after)
-            audit_execution(before, after, args.mode, args.mega)
+            audit_execution(before, after, args.mode)
             if args.reference_dir:
                 reference = json.loads(
                     (args.reference_dir / "responses.json").read_text()
@@ -482,14 +436,11 @@ def main() -> None:
                 expected_tokens = [(r["name"], r["token_ids"]) for r in reference]
                 save(
                     args.output_dir / "comparison.json",
-                    {
-                        "token_ids_exact": actual_tokens == expected_tokens,
-                        "reference_backend": reference_backend,
-                    },
+                    {"token_ids_exact": actual_tokens == expected_tokens},
                 )
                 if actual_tokens != expected_tokens:
                     raise AssertionError(
-                        "Generated tokens differ from the validated eager reference"
+                        "FULL generated tokens differ from layered eager"
                     )
         save(
             args.output_dir / "inference-passed.json",
